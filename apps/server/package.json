@@ -1,6 +1,6 @@
 {
   "name": "t3",
-  "version": "0.0.28",
+  "version": "0.0.32",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -16,7 +16,7 @@
   "type": "module",
   "scripts": {
     "dev": "node --watch src/bin.ts",
-    "build:bundle": "vp pack",
+    "build:bundle": "vp pack && vp pack src/service-launcher.ts --out-dir dist --no-clean",
     "start": "node dist/bin.mjs",
     "typecheck": "tsgo --noEmit",
     "test": "vp test run"
@@ -33,7 +33,8 @@
     "croner": "^9.0.0",
     "effect": "catalog:",
     "node-pty": "^1.1.0",
-    "web-push": "^3.6.7"
+    "web-push": "^3.6.7",
+    "yaml": "catalog:"
   },
   "devDependencies": {
     "@effect/vitest": "catalog:",

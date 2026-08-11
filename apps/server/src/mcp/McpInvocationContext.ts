@@ -31,6 +31,8 @@ export interface ProviderMcpInvocationScope extends McpInvocationScopeBase {
   readonly providerSessionId: string;
   readonly providerInstanceId: ProviderInstanceId;
   readonly expiresAt: number;
+  readonly capabilities: ReadonlySet<McpCapability>;
+  readonly issuedAt: number;
 }
 
 export interface PeerMcpInvocationScope extends McpInvocationScopeBase {

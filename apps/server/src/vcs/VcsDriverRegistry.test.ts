@@ -93,8 +93,8 @@ describe("VcsDriverRegistry", () => {
     }).pipe(Effect.provide(layer));
   });
 
-  it.effect("bypasses cached repository detection when requested", () => {
-    const calls: VcsProcess.VcsProcessInput[] = [];
+  it.effect("detects a repository created after a negative lookup", () => {
+    let insideWorkTreeChecks = 0;
     const layer = Layer.effect(VcsDriverRegistry.VcsDriverRegistry, VcsDriverRegistry.make).pipe(
       Layer.provide(NodeServices.layer),
       Layer.provide(
@@ -106,10 +106,16 @@ describe("VcsDriverRegistry", () => {
         Layer.mock(VcsProcess.VcsProcess)({
           run: (input) =>
             Effect.sync(() => {
-              calls.push(input);
               const command = normalizeGitArgs(input.args).join(" ");
               if (command === "rev-parse --is-inside-work-tree") {
-                return processOutput("true\n");
+                insideWorkTreeChecks += 1;
+                return insideWorkTreeChecks === 1
+                  ? {
+                      ...processOutput(""),
+                      exitCode: ChildProcessSpawner.ExitCode(128),
+                      stderr: "fatal: not a git repository",
+                    }
+                  : processOutput("true\n");
               }
               if (command === "rev-parse --show-toplevel") {
                 return processOutput("/repo\n");
@@ -125,20 +131,10 @@ describe("VcsDriverRegistry", () => {
 
     return Effect.gen(function* () {
       const registry = yield* VcsDriverRegistry.VcsDriverRegistry;
-      yield* registry.detect({ cwd: "/repo", requestedKind: "git" });
-      yield* registry.detect({ cwd: "/repo", requestedKind: "git", cache: "bypass" });
 
-      assert.deepStrictEqual(
-        calls.map((call) => normalizeGitArgs(call.args).join(" ")),
-        [
-          "rev-parse --is-inside-work-tree",
-          "rev-parse --show-toplevel",
-          "rev-parse --git-common-dir",
-          "rev-parse --is-inside-work-tree",
-          "rev-parse --show-toplevel",
-          "rev-parse --git-common-dir",
-        ],
-      );
+      assert.equal(yield* registry.detect({ cwd: "/repo" }), null);
+      assert.equal((yield* registry.detect({ cwd: "/repo" }))?.repository.rootPath, "/repo");
+      assert.equal(insideWorkTreeChecks, 2);
     }).pipe(Effect.provide(layer));
   });
 });

@@ -9,7 +9,6 @@ import {
 import { isRpcMethodAllowedForAudienceCeiling } from "./audienceScopePolicy.ts";
 
 it.each([
-  [ORCHESTRATION_WS_METHODS.replayEvents, AuthOrchestrationReadScope, "factory", true],
   [ORCHESTRATION_WS_METHODS.subscribeScheduledTasks, AuthOrchestrationReadScope, "factory", true],
   [WS_METHODS.subscribeNotificationEvents, AuthOrchestrationReadScope, "factory", true],
   [WS_METHODS.serverAckNotification, AuthOrchestrationReadScope, "factory", true],

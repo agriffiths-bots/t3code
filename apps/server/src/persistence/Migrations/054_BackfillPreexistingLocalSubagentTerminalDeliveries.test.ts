@@ -12,7 +12,7 @@ const layer = it.layer(Layer.mergeAll(NodeSqliteClient.layerMemory()));
 
 const parentThreadId = "terminal-backfill-parent";
 const timestamp = "2000-01-01T08:00:00.000Z";
-const encodeUnknownJson = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
+const encodeUnknownJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 
 layer("054_BackfillPreexistingLocalSubagentTerminalDeliveries", (it) => {
   it.effect("backfills every delivered pre-existing terminal local child and is idempotent", () =>

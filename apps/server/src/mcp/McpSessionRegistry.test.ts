@@ -205,6 +205,29 @@ it.effect("refreshes the idle fallback expiry when a live credential is used", (
   }),
 );
 
+it.effect("refreshes provider-session expiry when its thread sends a turn", () =>
+  Effect.gen(function* () {
+    let timestamp = 1_000;
+    const registry = yield* makeRegistry(() => timestamp, fakeHttpServer, {
+      idleTimeoutMs: 1_000,
+    });
+    const threadId = ThreadId.make("thread-turn-activity");
+    const issued = yield* registry.issue({
+      threadId,
+      providerInstanceId: ProviderInstanceId.make("claude"),
+    });
+    const token = issued.config.authorizationHeader.replace(/^Bearer\s+/, "");
+
+    timestamp = 1_900;
+    yield* registry.touchThread(threadId);
+    timestamp = 2_500;
+
+    const resolved = yield* registry.resolve(token);
+    expect(resolved?.credentialKind).toBe("provider-session");
+    expect(resolved?.expiresAt).toBe(3_500);
+  }),
+);
+
 it.effect("rejects idle credentials after the fallback expiry", () =>
   Effect.gen(function* () {
     let timestamp = 1_000;

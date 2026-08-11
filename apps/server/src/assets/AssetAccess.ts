@@ -35,8 +35,10 @@ import {
 } from "@t3tools/shared/filePreview";
 import { PROJECT_FAVICON_FALLBACK_MARKER } from "@t3tools/shared/projectFavicon";
 import * as Clock from "effect/Clock";
+import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Encoding from "effect/Encoding";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
@@ -84,6 +86,8 @@ export function assetSurfaceCookieName(
 
 const SIGNING_SECRET_NAME = "asset-access-signing-key";
 const ASSET_TOKEN_TTL_MS = 60 * 60 * 1000;
+const PROJECT_FAVICON_TOKEN_BUCKET_MS = 30 * 60 * 1000;
+const PROJECT_FAVICON_VERSION_PREFIX = "v";
 const PREVIEW_ASSET_EXTENSIONS = new Set([
   ...WORKSPACE_BROWSER_PREVIEW_EXTENSIONS,
   ...WORKSPACE_IMAGE_PREVIEW_EXTENSIONS,
@@ -353,6 +357,7 @@ const resolveCanonicalWorkspaceFileForRequest = (input: {
 export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (input: {
   readonly resource: AssetResource;
   readonly workspaceRoot?: string;
+  readonly projectFaviconPath?: string;
   readonly dataAudience?: DataAudience;
   readonly issuingAudience?: AuthAudienceCeiling;
   readonly clientCapabilities?: ReadonlyArray<AssetClientCapability>;
@@ -370,6 +375,7 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
   const issuingAudience = input.issuingAudience ?? ("private" as const);
   let claims: AssetClaim;
   let fileName: string;
+  let sourcePath: string | undefined;
 
   switch (input.resource._tag) {
     case "workspace-file": {
@@ -507,16 +513,22 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
         ),
       );
       const faviconResolver = yield* ProjectFaviconResolver.ProjectFaviconResolver;
-      const faviconPath = yield* faviconResolver.resolvePath(workspaceRoot).pipe(
-        Effect.mapError(
-          (cause) =>
-            new AssetProjectFaviconResolutionError({
-              resource: input.resource,
-              cause,
-            }),
-        ),
-      );
+      const faviconPath = yield* faviconResolver
+        .resolvePath(workspaceRoot, input.projectFaviconPath ?? undefined)
+        .pipe(
+          Effect.mapError(
+            (cause) =>
+              new AssetProjectFaviconResolutionError({
+                resource: input.resource,
+                cause,
+              }),
+          ),
+        );
       const relativePath = faviconPath ? path.relative(workspaceRoot, faviconPath) : null;
+      if (relativePath && !isWorkspaceImagePreviewPath(relativePath)) {
+        return yield* new AssetPreviewTypeValidationError({ resource: input.resource });
+      }
+      sourcePath = relativePath ?? undefined;
       const canonicalFaviconPath = relativePath
         ? yield* resolveCanonicalWorkspaceFile({ workspaceRoot, relativePath }).pipe(
             Effect.mapError(
@@ -557,7 +569,31 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
         surfaceBindingId: null,
         ...audienceClaims,
       };
-      fileName = relativePath ? path.basename(relativePath) : PROJECT_FAVICON_FALLBACK_MARKER;
+      if (relativePath && canonicalFaviconPath) {
+        const crypto = yield* Crypto.Crypto;
+        const faviconBytes = yield* fileSystem.readFile(canonicalFaviconPath).pipe(
+          Effect.mapError(
+            (cause) =>
+              new AssetProjectFaviconInspectionError({
+                resource: input.resource,
+                cause,
+              }),
+          ),
+        );
+        const revision = yield* crypto.digest("SHA-256", faviconBytes).pipe(
+          Effect.map(Encoding.encodeHex),
+          Effect.mapError(
+            (cause) =>
+              new AssetProjectFaviconInspectionError({
+                resource: input.resource,
+                cause,
+              }),
+          ),
+        );
+        fileName = `${PROJECT_FAVICON_VERSION_PREFIX}${revision}-${path.basename(relativePath)}`;
+      } else {
+        fileName = PROJECT_FAVICON_FALLBACK_MARKER;
+      }
       break;
     }
   }
@@ -591,6 +627,13 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
         }),
     ),
   );
+  if (claims.kind === "project-favicon") {
+    const issuedAt = yield* Clock.currentTimeMillis;
+    expiresAt =
+      (Math.floor(issuedAt / PROJECT_FAVICON_TOKEN_BUCKET_MS) + 2) *
+      PROJECT_FAVICON_TOKEN_BUCKET_MS;
+    claims = { ...claims, expiresAt };
+  }
   let surfaceSessionId: AuthSessionId | null = null;
   let surfaceBindingId: string | null = null;
   let surfaceCredentialExpiresAt: number | null = null;
@@ -627,6 +670,7 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
   return {
     relativeUrl: `${surfaceBindingId === null ? ASSET_ROUTE_PREFIX : ASSET_SURFACE_RELAY_PREFIX}/${token}/${encodeURIComponent(fileName)}`,
     expiresAt,
+    ...(sourcePath !== undefined ? { sourcePath } : {}),
     surfaceCredential,
   };
 });

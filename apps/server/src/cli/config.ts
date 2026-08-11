@@ -93,7 +93,7 @@ const EnvServerConfig = Config.all({
   ),
   traceMaxBytes: Config.int("T3CODE_TRACE_MAX_BYTES").pipe(Config.withDefault(10 * 1024 * 1024)),
   traceMaxFiles: Config.int("T3CODE_TRACE_MAX_FILES").pipe(Config.withDefault(10)),
-  traceBatchWindowMs: Config.int("T3CODE_TRACE_BATCH_WINDOW_MS").pipe(Config.withDefault(200)),
+  traceBatchWindowMs: Config.int("T3CODE_TRACE_BATCH_WINDOW_MS").pipe(Config.withDefault(1_000)),
   otlpTracesUrl: Config.string("T3CODE_OTLP_TRACES_URL").pipe(
     Config.option,
     Config.map(Option.getOrUndefined),
@@ -121,6 +121,15 @@ const EnvServerConfig = Config.all({
   hostedAppUrl: Config.url("VITE_HOSTED_APP_URL").pipe(
     Config.option,
     Config.map(Option.getOrUndefined),
+  ),
+  devAllowedOrigins: Config.string("T3CODE_DEV_ALLOWED_ORIGINS").pipe(
+    Config.withDefault(""),
+    Config.map((value) =>
+      value
+        .split(",")
+        .map((entry) => entry.trim())
+        .filter((entry) => entry.length > 0),
+    ),
   ),
   noBrowser: Config.boolean("T3CODE_NO_BROWSER").pipe(
     Config.option,
@@ -322,6 +331,9 @@ export const resolveServerConfig = (
       () => mode === "desktop",
     );
     const desktopBootstrapToken = bootstrap?.desktopBootstrapToken;
+    const desktopTelemetryFd = bootstrap?.desktopTelemetryFd;
+    const desktopTelemetryControlFd = bootstrap?.desktopTelemetryControlFd;
+    const resourceMonitorPath = bootstrap?.resourceMonitorPath;
     const autoBootstrapProjectFromCwd = Option.getOrElse(
       resolveOptionPrecedence(
         Option.fromUndefinedOr(options?.forceAutoBootstrapProjectFromCwd),
@@ -402,9 +414,13 @@ export const resolveServerConfig = (
       staticDir,
       devUrl,
       hostedAppUrl: env.hostedAppUrl,
+      devAllowedOrigins: env.devAllowedOrigins,
       noBrowser,
       startupPresentation,
       desktopBootstrapToken,
+      desktopTelemetryFd,
+      desktopTelemetryControlFd,
+      resourceMonitorPath,
       autoBootstrapProjectFromCwd,
       logWebSocketEvents,
       tailscaleServeEnabled,
@@ -491,7 +507,7 @@ export const DurationFromString = Schema.String.pipe(
           return Effect.succeed(duration);
         }
         return Effect.fail(
-          new SchemaIssue.InvalidValue(Option.some(value), {
+          new SchemaIssue.InvalidValue({
             message: "Invalid duration. Use values like 5m, 1h, 30d, or 15 minutes.",
           }),
         );

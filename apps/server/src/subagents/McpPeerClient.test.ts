@@ -7,7 +7,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
-import { McpSchema, McpServer } from "effect/unstable/ai";
+import { McpProtocol, McpSchema, McpServer } from "effect/unstable/ai";
 import { HttpBody, HttpClient, HttpClientResponse, HttpRouter } from "effect/unstable/http";
 
 import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
@@ -29,7 +29,7 @@ type JsonRpcRequest = typeof JsonRpcRequest.Type;
 type CapturedHttpRequest = Parameters<Parameters<typeof HttpClient.make>[0]>[0];
 
 const decodeJsonRpcRequest = Schema.decodeUnknownSync(Schema.fromJsonString(JsonRpcRequest));
-const encodeUnknownJson = Schema.encodeSync(Schema.UnknownFromJsonString);
+const encodeUnknownJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
 const bearerPeer: SubagentPeerRegistry.SubagentPeer = {
   alias: "vps",
@@ -137,12 +137,14 @@ const unauthenticatedTestMcpTransportLayer = McpServer.layerHttp({
   name: "peer-test",
   version: "1.0.0",
   path: "/mcp",
+  protocols: [McpProtocol.v2025_06_18],
 });
 
 const authenticatedTestMcpTransportLayer = McpServer.layerHttp({
   name: "peer-auth-test",
   version: "1.0.0",
   path: "/mcp",
+  protocols: [McpProtocol.v2025_06_18],
 }).pipe(Layer.provide(McpHttpServer.__testing.McpAuthMiddlewareLive));
 
 const decodeRequestBody = (request: CapturedHttpRequest) => {
@@ -485,7 +487,6 @@ it.effect("calls a tool on a real ephemeral MCP /mcp server", () =>
     Effect.gen(function* () {
       const serverLayer = Layer.mergeAll(
         registerPeerPingTool.pipe(Layer.provideMerge(unauthenticatedTestMcpTransportLayer)),
-        McpHttpServer.McpGetMethodNotAllowedLive,
       );
       yield* HttpRouter.serve(serverLayer, {
         disableListenLog: true,
@@ -521,7 +522,6 @@ it.effect("uses route-minted peer tokens for authenticated MCP calls", () =>
       const serverLayer = Layer.mergeAll(
         mcpPeerTokenRouteLayer,
         registerPeerPingTool.pipe(Layer.provideMerge(authenticatedTestMcpTransportLayer)),
-        McpHttpServer.McpGetMethodNotAllowedLive,
       ).pipe(Layer.provide(McpSessionRegistry.layer));
       yield* HttpRouter.serve(serverLayer, {
         disableListenLog: true,
@@ -631,7 +631,6 @@ it.effect("rejects route-minted peer tokens when source session confirmation fai
       const serverLayer = Layer.mergeAll(
         mcpPeerTokenRouteLayer,
         registerPeerPingTool.pipe(Layer.provideMerge(authenticatedTestMcpTransportLayer)),
-        McpHttpServer.McpGetMethodNotAllowedLive,
       ).pipe(Layer.provide(McpSessionRegistry.layer));
       yield* HttpRouter.serve(serverLayer, {
         disableListenLog: true,
@@ -686,7 +685,6 @@ it.effect("authenticates route-minted peer token requests before validating bodi
       const serverLayer = Layer.mergeAll(
         mcpPeerTokenRouteLayer,
         registerPeerPingTool.pipe(Layer.provideMerge(authenticatedTestMcpTransportLayer)),
-        McpHttpServer.McpGetMethodNotAllowedLive,
       ).pipe(Layer.provide(McpSessionRegistry.layer));
       yield* HttpRouter.serve(serverLayer, {
         disableListenLog: true,
@@ -733,7 +731,6 @@ it.effect("rejects unauthenticated peer-token requests before parsing invalid JS
       const serverLayer = Layer.mergeAll(
         mcpPeerTokenRouteLayer,
         registerPeerPingTool.pipe(Layer.provideMerge(authenticatedTestMcpTransportLayer)),
-        McpHttpServer.McpGetMethodNotAllowedLive,
       ).pipe(Layer.provide(McpSessionRegistry.layer));
       yield* HttpRouter.serve(serverLayer, {
         disableListenLog: true,

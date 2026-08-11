@@ -180,6 +180,7 @@ const mcpSessionRegistryLayer = Layer.succeed(
     issue: () => Effect.die("unused"),
     issuePeerToken: () => Effect.die("unused"),
     resolve: (rawToken) => Effect.succeed(rawToken === bearerToken ? invocation : undefined),
+    touchThread: () => Effect.void,
     revokeProviderSession: () => Effect.void,
     revokeThread: () => Effect.void,
     revokePeerTokensBySourceSession: () => Effect.void,

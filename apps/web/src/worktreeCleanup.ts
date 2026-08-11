@@ -1,8 +1,37 @@
-/**
- * Formats a worktree path for compact status-indicator display.
- *
- * Worktree removal itself is owned by the server-side thread lifecycle.
- */
+import type { ThreadShell } from "./types";
+
+function normalizeWorktreePath(path: string | null): string | null {
+  const trimmed = path?.trim();
+  if (!trimmed) {
+    return null;
+  }
+  return trimmed;
+}
+
+export function getOrphanedWorktreePathForThread(
+  threads: ReadonlyArray<Pick<ThreadShell, "id" | "worktreePath">>,
+  threadId: ThreadShell["id"],
+): string | null {
+  const targetThread = threads.find((thread) => thread.id === threadId);
+  if (!targetThread) {
+    return null;
+  }
+
+  const targetWorktreePath = normalizeWorktreePath(targetThread.worktreePath);
+  if (!targetWorktreePath) {
+    return null;
+  }
+
+  const isShared = threads.some((thread) => {
+    if (thread.id === threadId) {
+      return false;
+    }
+    return normalizeWorktreePath(thread.worktreePath) === targetWorktreePath;
+  });
+
+  return isShared ? null : targetWorktreePath;
+}
+
 export function formatWorktreePathForDisplay(worktreePath: string): string {
   const trimmed = worktreePath.trim();
   if (!trimmed) {

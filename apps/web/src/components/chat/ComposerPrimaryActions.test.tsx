@@ -14,12 +14,11 @@ function renderActions(props: Partial<Parameters<typeof ComposerPrimaryActions>[
       showPlanFollowUpPrompt={false}
       promptHasText={false}
       isSendBusy={false}
+      sendDisabledReason={null}
       isConnecting={false}
       isEnvironmentUnavailable={false}
       isPreparingWorktree={false}
       hasSendableContent
-      hasImageAttachments={false}
-      sessionOnlySendReason={null}
       onPreviousPendingQuestion={noop}
       onInterrupt={noop}
       onImplementPlanInNewThread={noop}
@@ -29,87 +28,59 @@ function renderActions(props: Partial<Parameters<typeof ComposerPrimaryActions>[
 }
 
 describe("ComposerPrimaryActions", () => {
-  it("keeps text sends enabled while the environment is disconnected", () => {
+  it("disables sends while the environment is unavailable", () => {
     const markup = renderActions({ isEnvironmentUnavailable: true });
 
-    expect(markup).toContain('aria-label="Queue text message"');
-    expect(markup).not.toContain(' disabled=""');
+    expect(markup).toContain('aria-label="Environment disconnected"');
+    expect(markup).toContain(' disabled=""');
   });
 
-  it("labels disconnected image sends as session-only queued work", () => {
-    const markup = renderActions({
-      isEnvironmentUnavailable: true,
-      hasImageAttachments: true,
-    });
+  it("surfaces the explicit send-disabled reason", () => {
+    const markup = renderActions({ sendDisabledReason: "Choose a model" });
 
-    expect(markup).toContain('aria-label="Queue attachments for this session"');
-    expect(markup).not.toContain(' disabled=""');
+    expect(markup).toContain('aria-label="Choose a model"');
+    expect(markup).toContain(' disabled=""');
   });
 
-  it("labels disconnected thread setup sends as session-only queued work", () => {
-    const markup = renderActions({
-      isEnvironmentUnavailable: true,
-      sessionOnlySendReason: "thread-setup",
-    });
+  it("labels and disables sends while connecting", () => {
+    const markup = renderActions({ isConnecting: true });
 
-    expect(markup).toContain('aria-label="Queue thread setup for this session"');
-    expect(markup).not.toContain(' disabled=""');
+    expect(markup).toContain('aria-label="Connecting"');
+    expect(markup).toContain(' disabled=""');
   });
 
-  it("labels disconnected dependent sends as waiting on earlier queued work", () => {
-    const markup = renderActions({
-      isEnvironmentUnavailable: true,
-      sessionOnlySendReason: "dependent",
-    });
+  it("labels worktree preparation without disabling sendable content", () => {
+    const markup = renderActions({ isPreparingWorktree: true });
 
-    expect(markup).toContain('aria-label="Queue send after earlier queued work for this session"');
+    expect(markup).toContain('aria-label="Preparing worktree"');
     expect(markup).not.toContain(' disabled=""');
-  });
-
-  it("can render an explicit send label for mobile", () => {
-    const markup = renderActions({ showSendLabel: true });
-
-    expect(markup).toContain(">Send</span>");
   });
 
   it("keeps the default send button icon-only", () => {
     const markup = renderActions();
 
+    expect(markup).toContain('aria-label="Send message"');
     expect(markup).not.toContain(">Send</span>");
   });
 
-  it("shows stop only while running with an empty draft", () => {
-    const markup = renderActions({
-      isRunning: true,
-      hasSendableContent: false,
-      showSendLabel: true,
-    });
+  it("shows stop while a turn is running with an empty draft", () => {
+    const markup = renderActions({ isRunning: true, hasSendableContent: false });
 
     expect(markup).toContain('aria-label="Stop generation"');
-    expect(markup).toContain("min-w-16");
-    expect(markup).toContain(">Stop</span>");
     expect(markup).not.toContain('aria-label="Send message"');
   });
 
-  it("shows send for a steering draft while running", () => {
-    const markup = renderActions({
-      isRunning: true,
-      hasSendableContent: true,
-      showSendLabel: true,
-    });
+  it("keeps stop available while a turn is running with a steering draft", () => {
+    const markup = renderActions({ isRunning: true, hasSendableContent: true });
 
-    expect(markup).toContain('aria-label="Send message"');
-    expect(markup).toContain("min-w-16");
-    expect(markup).toContain(">Send</span>");
-    expect(markup).not.toContain('aria-label="Stop generation"');
+    expect(markup).toContain('aria-label="Stop generation"');
+    expect(markup).not.toContain('aria-label="Send message"');
   });
 
-  it("shows send while idle regardless of draft content", () => {
-    expect(renderActions({ isRunning: false, hasSendableContent: false })).toContain(
-      'aria-label="Send message"',
-    );
-    expect(renderActions({ isRunning: false, hasSendableContent: true })).toContain(
-      'aria-label="Send message"',
-    );
+  it("disables an idle send when there is no sendable content", () => {
+    const markup = renderActions({ hasSendableContent: false });
+
+    expect(markup).toContain('aria-label="Send message"');
+    expect(markup).toContain(' disabled=""');
   });
 });

@@ -1,5 +1,6 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, it, assert } from "@effect/vitest";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -31,12 +32,8 @@ import { createModelCapabilities } from "@t3tools/shared/model";
 import { applyServerSettingsPatch } from "@t3tools/shared/serverSettings";
 
 import { checkCodexProviderStatus, type CodexAppServerProviderSnapshot } from "./CodexProvider.ts";
-import {
-  checkClaudeProviderStatus,
-  getClaudeModelCapabilities,
-  makePendingClaudeProvider,
-  reconcileKnownClaudeModelsAfterVersionProbe,
-} from "./ClaudeProvider.ts";
+import { checkClaudeProviderStatus } from "./ClaudeProvider.ts";
+import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
 import * as OpenCodeRuntime from "../opencodeRuntime.ts";
 import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
 import { ProviderInstanceRegistryHydrationLive } from "./ProviderInstanceRegistryHydration.ts";
@@ -70,6 +67,7 @@ process.env.T3CODE_CURSOR_ENABLED = "1";
 // ── Test helpers ────────────────────────────────────────────────────
 
 const encoder = new TextEncoder();
+const TEST_EPOCH = DateTime.makeUnsafe("1970-01-01T00:00:00.000Z");
 
 const TestHttpClientLive = Layer.succeed(
   HttpClient.HttpClient,
@@ -77,6 +75,35 @@ const TestHttpClientLive = Layer.succeed(
     Effect.succeed(HttpClientResponse.fromWeb(request, Response.json({ version: "0.0.0" }))),
   ),
 );
+
+const BackgroundPolicyAlwaysRunLayer = Layer.mock(BackgroundPolicy.BackgroundPolicy)({
+  reportClientActivity: () => Effect.void,
+  removeRpcClient: () => Effect.void,
+  reportHostPowerState: () => Effect.void,
+  snapshot: Effect.succeed({
+    hostPower: {
+      source: "unknown",
+      idle: "unknown",
+      idleSeconds: null,
+      locked: "unknown",
+      suspended: false,
+      onBattery: "unknown",
+      lowPowerMode: "unknown",
+      thermalState: "unknown",
+      stale: true,
+      updatedAt: TEST_EPOCH,
+    },
+    leases: [],
+    activeForegroundLeaseCount: 0,
+    activeScopeKeys: [],
+    shouldRunOpportunisticWork: true,
+    updatedAt: TEST_EPOCH,
+  }),
+  streamChanges: Stream.empty,
+  hasDemand: () => Effect.succeed(true),
+  shouldRunScopeWork: () => Effect.succeed(true),
+  shouldRunOpportunisticWork: Effect.succeed(true),
+});
 
 function selectDescriptor(
   id: string,
@@ -301,6 +328,11 @@ function makeMutableServerSettingsService(
         }),
       get streamChanges() {
         return Stream.fromPubSub(changes);
+      },
+      get subscribeChanges() {
+        return PubSub.subscribe(changes).pipe(
+          Effect.map((subscription) => Stream.fromSubscription(subscription)),
+        );
       },
     } satisfies ServerSettingsModule.ServerSettingsService["Service"];
   });
@@ -568,22 +600,30 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
         ]);
       });
 
-      it("prunes retired Claude built-ins from cached provider models", () => {
+      it("drops stale OpenCode models missing from a successful refresh", () => {
         const previousProvider = {
-          instanceId: ProviderInstanceId.make("claudeAgent"),
-          driver: ProviderDriverKind.make("claudeAgent"),
+          instanceId: ProviderInstanceId.make("opencode"),
+          driver: ProviderDriverKind.make("opencode"),
           status: "ready",
           enabled: true,
           installed: true,
           auth: { status: "authenticated" },
-          checkedAt: "2026-08-03T00:00:00.000Z",
-          version: "2.1.218",
+          checkedAt: "2026-07-17T00:00:00.000Z",
+          version: "1.0.0",
           models: [
             {
-              slug: "claude-opus-4-8",
-              name: "Claude Opus 4.8",
+              slug: "github/gpt-5",
+              name: "GPT-5",
+              subProvider: "GitHub",
               isCustom: false,
-              capabilities: getClaudeModelCapabilities("claude-opus-4-8"),
+              capabilities: null,
+            },
+            {
+              slug: "removed-plugin/model",
+              name: "Removed Plugin Model",
+              subProvider: "Removed Plugin",
+              isCustom: false,
+              capabilities: null,
             },
           ],
           slashCommands: [],
@@ -591,116 +631,143 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
         } as const satisfies ServerProvider;
         const refreshedProvider = {
           ...previousProvider,
-          checkedAt: "2026-08-03T00:01:00.000Z",
-          version: "2.1.219",
+          checkedAt: "2026-07-17T00:01:00.000Z",
           models: [
             {
-              slug: "claude-opus-5",
-              name: "Claude Opus 5",
+              slug: "github/gpt-5",
+              name: "GPT-5",
+              subProvider: "GitHub",
               isCustom: false,
-              capabilities: getClaudeModelCapabilities("claude-opus-5"),
+              capabilities: null,
             },
           ],
         } satisfies ServerProvider;
 
-        assert.deepStrictEqual(
-          mergeProviderSnapshot(previousProvider, refreshedProvider).models.map(
-            (model) => model.slug,
-          ),
-          ["claude-opus-5"],
-        );
+        assert.deepStrictEqual(mergeProviderSnapshot(previousProvider, refreshedProvider).models, [
+          ...refreshedProvider.models,
+        ]);
+      });
 
-        const olderClaudeProvider = {
-          ...refreshedProvider,
-          checkedAt: "2026-08-03T00:02:00.000Z",
-          version: "2.1.218",
+      it("retains stale OpenCode models when a refresh fails", () => {
+        const previousProvider = {
+          instanceId: ProviderInstanceId.make("opencode"),
+          driver: ProviderDriverKind.make("opencode"),
+          status: "ready",
+          enabled: true,
+          installed: true,
+          auth: { status: "authenticated" },
+          checkedAt: "2026-07-17T00:00:00.000Z",
+          version: "1.0.0",
           models: [
             {
-              slug: "claude-opus-4-7",
-              name: "Claude Opus 4.7",
+              slug: "github/gpt-5",
+              name: "GPT-5",
+              subProvider: "GitHub",
               isCustom: false,
-              capabilities: getClaudeModelCapabilities("claude-opus-4-7"),
+              capabilities: null,
             },
           ],
-        } satisfies ServerProvider;
-
-        assert.deepStrictEqual(
-          mergeProviderSnapshot(refreshedProvider, olderClaudeProvider).models.map(
-            (model) => model.slug,
-          ),
-          ["claude-opus-4-7"],
-        );
-
-        const transientFailureProvider = {
-          ...olderClaudeProvider,
-          checkedAt: "2026-08-03T00:03:00.000Z",
-          version: null,
+          slashCommands: [],
+          skills: [],
+        } as const satisfies ServerProvider;
+        const refreshedProvider = {
+          ...previousProvider,
           status: "error",
-          message: "Failed to execute Claude Agent CLI health check.",
+          auth: { status: "unknown" },
+          checkedAt: "2026-07-17T00:01:00.000Z",
+          models: [],
+          message: "Failed to refresh OpenCode models.",
         } satisfies ServerProvider;
 
-        assert.deepStrictEqual(
-          mergeProviderSnapshot(refreshedProvider, transientFailureProvider).models.map(
-            (model) => model.slug,
-          ),
-          ["claude-opus-4-7", "claude-opus-5"],
-        );
+        assert.deepStrictEqual(mergeProviderSnapshot(previousProvider, refreshedProvider).models, [
+          ...previousProvider.models,
+        ]);
+      });
 
-        const missingClaudeProvider = {
-          ...transientFailureProvider,
+      it("classifies pending, logout, uninstall, and reconnect OpenCode inventories", () => {
+        const previousProvider = {
+          instanceId: ProviderInstanceId.make("opencode"),
+          driver: ProviderDriverKind.make("opencode"),
+          status: "ready",
+          enabled: true,
+          installed: true,
+          auth: { status: "authenticated" },
+          checkedAt: "2026-07-17T00:00:00.000Z",
+          version: "1.0.0",
+          models: [
+            {
+              slug: "github/gpt-5",
+              name: "GPT-5",
+              subProvider: "GitHub",
+              isCustom: false,
+              capabilities: null,
+            },
+            {
+              slug: "removed-plugin/model",
+              name: "Removed Plugin Model",
+              subProvider: "Removed Plugin",
+              isCustom: false,
+              capabilities: null,
+            },
+          ],
+          slashCommands: [],
+          skills: [],
+        } as const satisfies ServerProvider;
+        const pendingProvider = {
+          ...previousProvider,
+          status: "warning",
           installed: false,
-          checkedAt: "2026-08-03T00:03:30.000Z",
-          models: [
-            {
-              slug: "claude-sonnet-4-6",
-              name: "Claude Sonnet 4.6",
-              isCustom: false,
-              capabilities: getClaudeModelCapabilities("claude-sonnet-4-6"),
-            },
-          ],
+          auth: { status: "unknown" },
+          checkedAt: "2026-07-17T00:01:00.000Z",
+          version: null,
+          models: [],
+          message: "OpenCode provider status has not been checked in this session yet.",
         } satisfies ServerProvider;
-        assert.deepStrictEqual(
-          mergeProviderSnapshot(refreshedProvider, missingClaudeProvider).models.map(
-            (model) => model.slug,
-          ),
-          ["claude-sonnet-4-6"],
-        );
-
-        const firstFailureSnapshot = mergeProviderSnapshot(
-          refreshedProvider,
-          transientFailureProvider,
-        );
-        const secondFailureProvider = {
-          ...transientFailureProvider,
-          checkedAt: "2026-08-03T00:04:00.000Z",
+        const loggedOutProvider = {
+          ...previousProvider,
+          status: "warning",
+          auth: { status: "unknown" },
+          checkedAt: "2026-07-17T00:02:00.000Z",
+          models: [],
+          message: "OpenCode is available, but it did not report any connected upstream providers.",
         } satisfies ServerProvider;
-
-        assert.deepStrictEqual(
-          mergeProviderSnapshot(firstFailureSnapshot, secondFailureProvider).models.map(
-            (model) => model.slug,
-          ),
-          ["claude-opus-4-7", "claude-opus-5"],
-        );
-
-        const previousCodexProvider = {
-          ...refreshedProvider,
-          driver: ProviderDriverKind.make("codex"),
-          models: [
-            {
-              slug: "gpt-5.5",
-              name: "GPT-5.5",
-              isCustom: false,
-              capabilities: createModelCapabilities({ optionDescriptors: [] }),
-            },
-          ],
+        const missingProvider = {
+          ...previousProvider,
+          status: "error",
+          installed: false,
+          auth: { status: "unknown" },
+          checkedAt: "2026-07-17T00:03:00.000Z",
+          version: null,
+          models: [],
+          message: "OpenCode CLI (`opencode`) is not installed or not on PATH.",
+        } satisfies ServerProvider;
+        const authoritativeProvider = {
+          ...previousProvider,
+          checkedAt: "2026-07-17T00:04:00.000Z",
+          models: [previousProvider.models[0]!],
+        } satisfies ServerProvider;
+        const failedProvider = {
+          ...authoritativeProvider,
+          status: "error",
+          auth: { status: "unknown" },
+          checkedAt: "2026-07-17T00:05:00.000Z",
+          models: [],
+          message: "Failed to refresh OpenCode models.",
         } satisfies ServerProvider;
 
+        assert.deepStrictEqual(mergeProviderSnapshot(previousProvider, pendingProvider).models, [
+          ...previousProvider.models,
+        ]);
         assert.deepStrictEqual(
-          mergeProviderSnapshot(previousCodexProvider, transientFailureProvider).models.map(
-            (model) => model.slug,
-          ),
-          ["claude-opus-4-7"],
+          mergeProviderSnapshot(previousProvider, loggedOutProvider).models,
+          [],
         );
+        assert.deepStrictEqual(mergeProviderSnapshot(previousProvider, missingProvider).models, []);
+
+        const afterRemoval = mergeProviderSnapshot(previousProvider, authoritativeProvider);
+        const afterFailure = mergeProviderSnapshot(afterRemoval, failedProvider);
+
+        assert.deepStrictEqual(afterFailure.models, [authoritativeProvider.models[0]!]);
       });
 
       it("fills missing capabilities from the previous provider snapshot", () => {
@@ -970,6 +1037,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
                   prefix: "t3-provider-registry-merged-persist-",
                 }),
               ),
+              Layer.provideMerge(BackgroundPolicyAlwaysRunLayer),
               Layer.provideMerge(NodeServices.layer),
             ),
           ).pipe(Scope.provide(scope));
@@ -1004,6 +1072,144 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
             });
           }).pipe(Effect.provide(runtimeServices));
         }),
+      );
+
+      it.effect(
+        "persists authoritative OpenCode removals without resurrecting them on a failed live refresh",
+        () =>
+          Effect.gen(function* () {
+            const openCodeDriver = ProviderDriverKind.make("opencode");
+            const openCodeInstanceId = ProviderInstanceId.make("opencode");
+            const initialProvider = {
+              instanceId: openCodeInstanceId,
+              driver: openCodeDriver,
+              status: "ready",
+              enabled: true,
+              installed: true,
+              auth: { status: "authenticated" },
+              checkedAt: "2026-07-17T00:00:00.000Z",
+              version: "1.0.0",
+              models: [
+                {
+                  slug: "github/gpt-5",
+                  name: "GPT-5",
+                  subProvider: "GitHub",
+                  isCustom: false,
+                  capabilities: null,
+                },
+                {
+                  slug: "removed-plugin/model",
+                  name: "Removed Plugin Model",
+                  subProvider: "Removed Plugin",
+                  isCustom: false,
+                  capabilities: null,
+                },
+              ],
+              slashCommands: [],
+              skills: [],
+            } as const satisfies ServerProvider;
+            const authoritativeProvider = {
+              ...initialProvider,
+              checkedAt: "2026-07-17T00:01:00.000Z",
+              models: [initialProvider.models[0]!],
+            } satisfies ServerProvider;
+            const failedProvider = {
+              ...authoritativeProvider,
+              status: "error",
+              auth: { status: "unknown" },
+              checkedAt: "2026-07-17T00:02:00.000Z",
+              models: [],
+              message: "Failed to refresh OpenCode models.",
+            } satisfies ServerProvider;
+            const changes = yield* PubSub.unbounded<ServerProvider>();
+            const instance = {
+              instanceId: openCodeInstanceId,
+              driverKind: openCodeDriver,
+              continuationIdentity: {
+                driverKind: openCodeDriver,
+                continuationKey: "opencode:instance:opencode",
+              },
+              displayName: undefined,
+              enabled: true,
+              snapshot: {
+                maintenanceCapabilities: makeManualOnlyProviderMaintenanceCapabilities({
+                  provider: openCodeDriver,
+                  packageName: null,
+                }),
+                getSnapshot: Effect.succeed(initialProvider),
+                refresh: Effect.succeed(authoritativeProvider),
+                streamChanges: Stream.fromPubSub(changes),
+              },
+              adapter: {} as ProviderInstance["adapter"],
+              textGeneration: {} as ProviderInstance["textGeneration"],
+            } satisfies ProviderInstance;
+            const instanceRegistryLayer = Layer.succeed(
+              ProviderInstanceRegistry.ProviderInstanceRegistry,
+              {
+                getInstance: (instanceId) =>
+                  Effect.succeed(instanceId === openCodeInstanceId ? instance : undefined),
+                listInstances: Effect.succeed([instance]),
+                listUnavailable: Effect.succeed([]),
+                streamChanges: Stream.empty,
+                subscribeChanges: Effect.flatMap(PubSub.unbounded<void>(), (pubsub) =>
+                  PubSub.subscribe(pubsub),
+                ),
+              },
+            );
+            const scope = yield* Scope.make();
+            yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+            const runtimeServices = yield* Layer.build(
+              ProviderRegistryLive.pipe(
+                Layer.provideMerge(instanceRegistryLayer),
+                Layer.provideMerge(
+                  ServerConfig.layerTest(process.cwd(), {
+                    prefix: "t3-provider-registry-opencode-authoritative-persist-",
+                  }),
+                ),
+                Layer.provideMerge(NodeServices.layer),
+              ),
+            ).pipe(Scope.provide(scope));
+
+            yield* Effect.gen(function* () {
+              const registry = yield* ProviderRegistry.ProviderRegistry;
+              const config = yield* ServerConfig.ServerConfig;
+              const filePath = yield* resolveProviderStatusCachePath({
+                cacheDir: config.providerStatusCacheDir,
+                instanceId: openCodeInstanceId,
+              });
+
+              yield* PubSub.publish(changes, authoritativeProvider);
+
+              let cachedProvider = yield* readProviderStatusCache(filePath);
+              for (
+                let attempt = 0;
+                attempt < 50 && cachedProvider?.checkedAt !== authoritativeProvider.checkedAt;
+                attempt += 1
+              ) {
+                yield* TestClock.adjust("10 millis");
+                yield* Effect.yieldNow;
+                cachedProvider = yield* readProviderStatusCache(filePath);
+              }
+
+              assert.deepStrictEqual(cachedProvider?.models, [authoritativeProvider.models[0]!]);
+
+              yield* PubSub.publish(changes, failedProvider);
+              for (
+                let attempt = 0;
+                attempt < 50 && cachedProvider?.checkedAt !== failedProvider.checkedAt;
+                attempt += 1
+              ) {
+                yield* TestClock.adjust("10 millis");
+                yield* Effect.yieldNow;
+                cachedProvider = yield* readProviderStatusCache(filePath);
+              }
+
+              assert.deepStrictEqual(cachedProvider?.models, [authoritativeProvider.models[0]!]);
+              assert.deepStrictEqual((yield* registry.getProviders)[0]?.models, [
+                authoritativeProvider.models[0]!,
+              ]);
+            }).pipe(Effect.provide(runtimeServices));
+          }),
       );
 
       it.effect("returns the cached provider list when a manual refresh fails", () =>
@@ -1067,6 +1273,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
                   prefix: "t3-provider-registry-refresh-failure-",
                 }),
               ),
+              Layer.provideMerge(BackgroundPolicyAlwaysRunLayer),
               Layer.provideMerge(NodeServices.layer),
             ),
           ).pipe(Scope.provide(scope));
@@ -1174,6 +1381,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
                   prefix: "t3-provider-registry-sync-failure-",
                 }),
               ),
+              Layer.provideMerge(BackgroundPolicyAlwaysRunLayer),
               Layer.provideMerge(NodeServices.layer),
             ),
           ).pipe(Scope.provide(scope));
@@ -1278,6 +1486,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
               ),
             ),
             Layer.provideMerge(OpenCodeRuntime.OpenCodeRuntimeLive),
+            Layer.provideMerge(BackgroundPolicyAlwaysRunLayer),
             // NO spawner mock — `ChildProcessSpawner` is supplied by the
             // outer `NodeServices.layer` on `it.layer(...)` and will
             // genuinely spawn a subprocess. The missing-binary ENOENT is
@@ -1377,6 +1586,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
               }),
             ),
             Layer.provideMerge(NodeServices.layer),
+            Layer.provideMerge(BackgroundPolicyAlwaysRunLayer),
           );
           const runtimeServices = yield* Layer.build(providerRegistryLayer).pipe(
             Scope.provide(scope),
@@ -1492,6 +1702,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
             ),
             Layer.provideMerge(OpenCodeRuntime.OpenCodeRuntimeLive),
             Layer.provideMerge(NodeServices.layer),
+            Layer.provideMerge(BackgroundPolicyAlwaysRunLayer),
           );
           const runtimeServices = yield* Layer.build(providerRegistryLayer).pipe(
             Scope.provide(scope),
@@ -1552,6 +1763,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
                 ),
               ),
               Layer.provideMerge(OpenCodeRuntime.OpenCodeRuntimeLive),
+              Layer.provideMerge(BackgroundPolicyAlwaysRunLayer),
               Layer.provideMerge(
                 mockCommandSpawnerLayer((command, args) => {
                   if (command === "cursor-agent") {
@@ -1674,120 +1886,6 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
         ),
       );
 
-      it.effect("keeps version-gated Claude models out of pending snapshots", () =>
-        Effect.gen(function* () {
-          const status = yield* makePendingClaudeProvider({
-            ...defaultClaudeSettings,
-            customModels: ["claude-opus-5", "claude-opus-4-8", "my-custom-model"],
-          });
-          assert.strictEqual(
-            status.models.some((model) => model.slug === "claude-opus-5"),
-            false,
-          );
-          assert.strictEqual(
-            status.models.some((model) => model.slug === "claude-fable-5"),
-            false,
-          );
-          assert.strictEqual(
-            status.models.some((model) => model.slug === "claude-opus-4-7"),
-            false,
-          );
-          assert.strictEqual(
-            status.models.some((model) => model.slug === "claude-opus-4-8"),
-            false,
-          );
-          assert.strictEqual(
-            status.models.some((model) => model.slug === "my-custom-model"),
-            true,
-          );
-        }),
-      );
-
-      it("preserves proven models on transient failures but clears them across uninstall", () => {
-        const knownModels = [
-          {
-            slug: "claude-opus-5",
-            name: "Claude Opus 5",
-            isCustom: false,
-            capabilities: getClaudeModelCapabilities("claude-opus-5"),
-          },
-          {
-            slug: "claude-sonnet-4-6",
-            name: "Claude Sonnet 4.6",
-            isCustom: false,
-            capabilities: getClaudeModelCapabilities("claude-sonnet-4-6"),
-          },
-          {
-            slug: "removed-custom-opus",
-            name: "Removed Custom Opus",
-            isCustom: true,
-            capabilities: getClaudeModelCapabilities("claude-opus-5"),
-          },
-        ] as const;
-        const failureModels = [
-          {
-            slug: "claude-sonnet-4-6",
-            name: "Claude Sonnet 4.6",
-            isCustom: false,
-            capabilities: getClaudeModelCapabilities("claude-sonnet-4-6"),
-          },
-        ] as const;
-        const readySnapshot = {
-          instanceId: ProviderInstanceId.make("claudeAgent"),
-          driver: ProviderDriverKind.make("claudeAgent"),
-          status: "ready",
-          enabled: true,
-          installed: true,
-          auth: { status: "authenticated" },
-          checkedAt: "2026-08-03T00:00:00.000Z",
-          version: "2.1.219",
-          models: knownModels,
-          slashCommands: [],
-          skills: [],
-        } as const satisfies ServerProvider;
-        const learned = reconcileKnownClaudeModelsAfterVersionProbe([], readySnapshot);
-        assert.deepStrictEqual(
-          learned.knownModels.map((model) => model.slug),
-          ["claude-opus-5"],
-        );
-        const transientFailure = reconcileKnownClaudeModelsAfterVersionProbe(learned.knownModels, {
-          ...readySnapshot,
-          status: "error",
-          checkedAt: "2026-08-03T00:01:00.000Z",
-          version: null,
-          models: failureModels,
-        });
-        assert.deepStrictEqual(
-          transientFailure.snapshot.models.map((model) => model.slug),
-          ["claude-sonnet-4-6", "claude-opus-5"],
-        );
-
-        const missing = reconcileKnownClaudeModelsAfterVersionProbe(transientFailure.knownModels, {
-          ...readySnapshot,
-          status: "error",
-          installed: false,
-          checkedAt: "2026-08-03T00:02:00.000Z",
-          version: null,
-          models: failureModels,
-        });
-        assert.deepStrictEqual(missing.knownModels, []);
-
-        const replacementFailure = reconcileKnownClaudeModelsAfterVersionProbe(
-          missing.knownModels,
-          {
-            ...readySnapshot,
-            status: "error",
-            checkedAt: "2026-08-03T00:03:00.000Z",
-            version: null,
-            models: failureModels,
-          },
-        );
-        assert.deepStrictEqual(
-          replacementFailure.snapshot.models.map((model) => model.slug),
-          ["claude-sonnet-4-6"],
-        );
-      });
-
       it.effect("includes Claude Opus 5 on supported Claude Code versions", () =>
         Effect.gen(function* () {
           const status = yield* checkClaudeProviderStatus(
@@ -1795,24 +1893,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
             claudeCapabilities(),
           );
           const opus5 = status.models.find((model) => model.slug === "claude-opus-5");
-          if (!opus5?.capabilities) {
-            assert.fail("Expected Claude Opus 5 capabilities on supported Claude Code versions.");
-          }
           assert.strictEqual(opus5?.name, "Claude Opus 5");
-          assert.deepStrictEqual(
-            opus5.capabilities.optionDescriptors?.map((descriptor) => descriptor.id),
-            ["effort", "fastMode"],
-          );
-          assert.strictEqual(
-            status.models.some((model) => model.slug === "claude-opus-4-8"),
-            false,
-          );
-          assert.deepStrictEqual(
-            getClaudeModelCapabilities("claude-opus-4-8").optionDescriptors?.map(
-              (descriptor) => descriptor.id,
-            ),
-            ["effort", "fastMode"],
-          );
         }).pipe(
           Effect.provide(
             mockSpawnerLayer((args) => {
@@ -1833,23 +1914,12 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
       it.effect("hides Claude Opus 5 on older Claude Code versions", () =>
         Effect.gen(function* () {
           const status = yield* checkClaudeProviderStatus(
-            {
-              ...defaultClaudeSettings,
-              customModels: ["claude-opus-5", "claude-opus-4-8", "my-custom-model"],
-            },
+            defaultClaudeSettings,
             claudeCapabilities(),
           );
           assert.strictEqual(
             status.models.some((model) => model.slug === "claude-opus-5"),
             false,
-          );
-          assert.strictEqual(
-            status.models.some((model) => model.slug === "claude-opus-4-8"),
-            false,
-          );
-          assert.strictEqual(
-            status.models.some((model) => model.slug === "my-custom-model"),
-            true,
           );
           assert.strictEqual(
             status.message,

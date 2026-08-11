@@ -14,9 +14,7 @@ import {
   ThreadId,
   type ModelSelection,
   type ProviderOptionSelection,
-  type ServerProvider,
 } from "@t3tools/contracts";
-import { DEFAULT_UNIFIED_SETTINGS } from "@t3tools/contracts/settings";
 import { createModelSelection } from "@t3tools/shared/model";
 
 // The composer draft's `modelSelectionByProvider` and
@@ -62,7 +60,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 import {
   COMPOSER_DRAFT_STORAGE_KEY,
   clearComposerDraftsEnvironment,
-  deriveEffectiveComposerModelState,
   finalizePromotedDraftThreadByRef,
   markPromotedDraftThread,
   markPromotedDraftThreadByRef,
@@ -839,10 +836,9 @@ describe("composerDraftStore project draft thread mapping", () => {
     }
   });
 
-  it("clears orphaned composer drafts when remapping a project to a new draft thread", () => {
+  it("clears empty composer drafts when remapping a project to a new draft thread", () => {
     const store = useComposerDraftStore.getState();
     store.setProjectDraftThreadId(projectRef, draftId, { threadId });
-    store.setPrompt(draftId, "orphan me");
 
     store.setProjectDraftThreadId(projectRef, otherDraftId, { threadId: otherThreadId });
 
@@ -850,6 +846,39 @@ describe("composerDraftStore project draft thread mapping", () => {
       otherThreadId,
     );
     expect(useComposerDraftStore.getState().getDraftThread(draftId)).toBeNull();
+    expect(draftByKey(draftId)).toBeUndefined();
+  });
+
+  it("keeps invested composer drafts alive unmapped when remapping a project to a new draft thread", () => {
+    const store = useComposerDraftStore.getState();
+    store.setProjectDraftThreadId(projectRef, draftId, { threadId });
+    store.setPrompt(draftId, "keep me around");
+
+    store.setProjectDraftThreadId(projectRef, otherDraftId, { threadId: otherThreadId });
+
+    // The mapping moved to the fresh draft...
+    expect(useComposerDraftStore.getState().getDraftThreadByProjectRef(projectRef)?.threadId).toBe(
+      otherThreadId,
+    );
+    // ...but the invested draft survives with its content for the sidebar
+    // draft rows to surface.
+    expect(useComposerDraftStore.getState().getDraftThread(draftId)?.threadId).toBe(threadId);
+    expect(draftByKey(draftId)?.prompt).toBe("keep me around");
+  });
+
+  it("clears every session for a project, including unmapped invested drafts", () => {
+    const store = useComposerDraftStore.getState();
+    store.setProjectDraftThreadId(projectRef, draftId, { threadId });
+    store.setPrompt(draftId, "invested");
+    // The remap leaves the invested draft alive unmapped; project removal
+    // must still sweep it, or its sidebar row outlives the project.
+    store.setProjectDraftThreadId(projectRef, otherDraftId, { threadId: otherThreadId });
+
+    store.clearProjectDraftThreadId(projectRef);
+
+    expect(useComposerDraftStore.getState().getDraftThreadByProjectRef(projectRef)).toBeNull();
+    expect(useComposerDraftStore.getState().getDraftThread(draftId)).toBeNull();
+    expect(useComposerDraftStore.getState().getDraftThread(otherDraftId)).toBeNull();
     expect(draftByKey(draftId)).toBeUndefined();
   });
 
@@ -1106,13 +1135,14 @@ describe("composerDraftStore project draft thread mapping", () => {
     });
   });
 
-  it("clears branch and worktree context when remapping a draft to another environment", () => {
+  it("clears branch and worktree but keeps env mode when remapping a draft to another environment", () => {
     const store = useComposerDraftStore.getState();
     store.setProjectDraftThreadId(projectRef, draftId, {
       threadId,
       branch: "feature/local-only",
       worktreePath: "/tmp/local-worktree",
       envMode: "worktree",
+      startFromOrigin: true,
     });
 
     store.setLogicalProjectDraftThreadId(scopedProjectKey(projectRef), remoteProjectRef, draftId, {
@@ -1124,17 +1154,19 @@ describe("composerDraftStore project draft thread mapping", () => {
       projectId,
       branch: null,
       worktreePath: null,
-      envMode: "local",
+      envMode: "worktree",
+      startFromOrigin: true,
     });
   });
 
-  it("clears branch and worktree context when changing a draft thread project ref", () => {
+  it("clears branch and worktree but keeps env mode when changing a draft thread project ref", () => {
     const store = useComposerDraftStore.getState();
     store.setProjectDraftThreadId(projectRef, draftId, {
       threadId,
       branch: "feature/local-only",
       worktreePath: "/tmp/local-worktree",
       envMode: "worktree",
+      startFromOrigin: true,
     });
 
     store.setDraftThreadContext(draftId, {
@@ -1146,93 +1178,9 @@ describe("composerDraftStore project draft thread mapping", () => {
       projectId,
       branch: null,
       worktreePath: null,
-      envMode: "local",
+      envMode: "worktree",
+      startFromOrigin: true,
     });
-  });
-});
-
-describe("deriveEffectiveComposerModelState", () => {
-  const providers: ReadonlyArray<ServerProvider> = [
-    {
-      instanceId: CLAUDE_AGENT_INSTANCE,
-      driver: CLAUDE_AGENT_DRIVER,
-      enabled: true,
-      installed: true,
-      version: "2.1.219",
-      status: "ready",
-      auth: { status: "authenticated" },
-      checkedAt: "2026-08-03T00:00:00.000Z",
-      models: [
-        {
-          slug: "claude-opus-5",
-          name: "Claude Opus 5",
-          isCustom: false,
-          capabilities: {},
-        },
-        {
-          slug: "claude-sonnet-4-6",
-          name: "Claude Sonnet 4.6",
-          isCustom: false,
-          isDefault: true,
-          capabilities: {},
-        },
-      ],
-      slashCommands: [],
-      skills: [],
-    },
-  ];
-
-  const resolve = (input: {
-    hasEstablishedProviderBinding: boolean;
-    threadModelSelection: ModelSelection | null;
-    projectModelSelection: ModelSelection | null;
-  }) =>
-    deriveEffectiveComposerModelState({
-      draft: null,
-      providers,
-      selectedProvider: CLAUDE_AGENT_DRIVER,
-      selectedInstanceId: CLAUDE_AGENT_INSTANCE,
-      settings: DEFAULT_UNIFIED_SETTINGS,
-      ...input,
-    }).selectedModel;
-
-  it("preserves exact retired Opus for an existing thread session", () => {
-    expect(
-      resolve({
-        hasEstablishedProviderBinding: true,
-        threadModelSelection: {
-          instanceId: CLAUDE_AGENT_INSTANCE,
-          model: "claude-opus-4-8",
-        },
-        projectModelSelection: null,
-      }),
-    ).toBe("claude-opus-4-8");
-  });
-
-  it("migrates exact retired Opus for a new thread project selection", () => {
-    expect(
-      resolve({
-        hasEstablishedProviderBinding: false,
-        threadModelSelection: null,
-        projectModelSelection: {
-          instanceId: CLAUDE_AGENT_INSTANCE,
-          model: "claude-opus-4-8",
-        },
-      }),
-    ).toBe("claude-opus-5");
-  });
-
-  it("migrates exact retired Opus for an unstarted thread selection", () => {
-    expect(
-      resolve({
-        hasEstablishedProviderBinding: false,
-        threadModelSelection: {
-          instanceId: CLAUDE_AGENT_INSTANCE,
-          model: "claude-opus-4-8",
-        },
-        projectModelSelection: null,
-      }),
-    ).toBe("claude-opus-5");
   });
 });
 

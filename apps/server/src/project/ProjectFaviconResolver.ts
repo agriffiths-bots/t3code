@@ -16,6 +16,7 @@ import * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
 
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
+import * as T3ProjectFileLoader from "./T3ProjectFileLoader.ts";
 
 // Well-known favicon paths checked in order.
 const FAVICON_CANDIDATES = [
@@ -90,6 +91,7 @@ export class ProjectFaviconResolver extends Context.Service<
      */
     readonly resolvePath: (
       cwd: string,
+      faviconPath?: string,
     ) => Effect.Effect<string | null, ProjectFaviconResolutionError>;
   }
 >()("t3/project/ProjectFaviconResolver") {}
@@ -117,6 +119,7 @@ export const make = Effect.gen(function* () {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const workspacePaths = yield* WorkspacePaths.WorkspacePaths;
+  const projectFileLoader = yield* T3ProjectFileLoader.T3ProjectFileLoader;
 
   const resolveIconHref = (href: string): ReadonlyArray<string> => {
     const clean = href.replace(/^\//, "");
@@ -166,7 +169,7 @@ export const make = Effect.gen(function* () {
 
   const resolvePath: ProjectFaviconResolver["Service"]["resolvePath"] = Effect.fn(
     "ProjectFaviconResolver.resolvePath",
-  )(function* (cwd) {
+  )(function* (cwd, faviconPath) {
     const projectCwd = yield* workspacePaths.normalizeWorkspaceRoot(cwd).pipe(
       Effect.mapError(
         (cause) =>
@@ -177,6 +180,24 @@ export const make = Effect.gen(function* () {
           }),
       ),
     );
+    // A grouped project's saved path can be absent from one checkout. Use it
+    // where it exists and retain automatic discovery for the other checkouts.
+    if (faviconPath !== undefined) {
+      const existing = yield* findExistingFile(projectCwd, [faviconPath]);
+      if (existing) {
+        return existing;
+      }
+    }
+
+    // A t3.json iconPath takes precedence over the well-known locations.
+    const projectFile = yield* projectFileLoader.load(projectCwd);
+    if (Option.isSome(projectFile) && projectFile.value.iconPath !== undefined) {
+      const existing = yield* findExistingFile(projectCwd, [projectFile.value.iconPath]);
+      if (existing) {
+        return existing;
+      }
+    }
+
     for (const candidate of FAVICON_CANDIDATES) {
       const existing = yield* findExistingFile(projectCwd, [candidate]);
       if (existing) {

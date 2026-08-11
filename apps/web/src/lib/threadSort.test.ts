@@ -24,7 +24,6 @@ function makeThread(overrides: Partial<Thread> = {}): Thread {
     interactionMode: "default",
     session: null,
     messages: [],
-    turns: [],
     proposedPlans: [],
     createdAt: "2026-03-09T10:00:00.000Z",
     archivedAt: null,
@@ -38,6 +37,7 @@ function makeThread(overrides: Partial<Thread> = {}): Thread {
     checkpoints: [],
     activities: [],
     ...overrides,
+    turns: overrides.turns ?? [],
   };
 }
 
@@ -69,48 +69,6 @@ describe("sortThreads", () => {
               id: "message-2" as never,
               role: "user",
               text: "newer",
-              turnId: null,
-              createdAt: "2026-03-09T10:06:00.000Z",
-              updatedAt: "2026-03-09T10:06:00.000Z",
-              streaming: false,
-            },
-          ],
-        }),
-      ],
-      "updated_at",
-    );
-
-    expect(sorted.map((thread) => thread.id)).toEqual([
-      ThreadId.make("thread-2"),
-      ThreadId.make("thread-1"),
-    ]);
-  });
-
-  it("sorts sub-agent wake system messages as recency-driving prompts", () => {
-    const sorted = sortThreads(
-      [
-        makeThread({
-          id: ThreadId.make("thread-1"),
-          messages: [
-            {
-              id: "message-1" as never,
-              role: "user",
-              text: "older",
-              turnId: null,
-              createdAt: "2026-03-09T10:01:00.000Z",
-              updatedAt: "2026-03-09T10:01:00.000Z",
-              streaming: false,
-            },
-          ],
-        }),
-        makeThread({
-          id: ThreadId.make("thread-2"),
-          updatedAt: "2026-03-09T10:00:00.000Z",
-          messages: [
-            {
-              id: "message-2" as never,
-              role: "system",
-              text: "[sub-agent child-1 completed] done",
               turnId: null,
               createdAt: "2026-03-09T10:06:00.000Z",
               updatedAt: "2026-03-09T10:06:00.000Z",

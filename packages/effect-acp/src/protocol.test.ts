@@ -48,8 +48,8 @@ const decodeExtRequest = Schema.decodeEffect(Schema.fromJsonString(ExtRequest));
 const decodeRequestPermissionResponse = Schema.decodeEffect(
   Schema.fromJsonString(RequestPermissionResponse),
 );
-const encodeUnknownJsonString = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
-const decodeUnknownJsonString = Schema.decodeUnknownEffect(Schema.UnknownFromJsonString);
+const encodeUnknownJsonString = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
+const decodeUnknownJsonString = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
 const encoder = new TextEncoder();
 const mockPeerPath = Effect.map(Effect.service(Path.Path), (path) =>
   path.join(import.meta.dirname, "../test/fixtures/acp-mock-peer.ts"),
@@ -326,7 +326,7 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
       assert.deepInclude(requestError, {
         operation: "encode-message",
         method: "x/request",
-        requestId: "1",
+        requestId: 1,
       });
     }),
   );
@@ -511,7 +511,7 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
         code: -32602,
         errorMessage: "Invalid params",
         method: "x/private",
-        requestId: "1",
+        requestId: 1,
         operation: "receive-response",
       });
     }),
@@ -551,7 +551,7 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
       const message = yield* Deferred.await(inboundRequest);
       assert.deepEqual(message, {
         _tag: "Request",
-        id: "-1",
+        id: -1,
         tag: "session/request_permission",
         payload: {
           sessionId: "session-1",
@@ -566,7 +566,7 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
 
       yield* transport.serverProtocol.send(0, {
         _tag: "Exit",
-        requestId: "-1",
+        requestId: -1,
         exit: {
           _tag: "Success",
           value: {
@@ -633,7 +633,7 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
         const message = yield* Deferred.await(inboundRequest);
         assert.deepEqual(message, {
           _tag: "Request",
-          id: "-1",
+          id: -1,
           tag: "session/request_permission",
           payload: permissionParams,
           headers: [],
@@ -641,7 +641,7 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
 
         yield* transport.serverProtocol.send(0, {
           _tag: "Exit",
-          requestId: "-1",
+          requestId: -1,
           exit: {
             _tag: "Success",
             value: {
@@ -741,7 +741,7 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
       assert.deepEqual(inboundMessages, [
         {
           _tag: "Request",
-          id: "-1",
+          id: -1,
           tag: "session/request_permission",
           payload: params,
           headers: [],
@@ -752,7 +752,7 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
 
       yield* transport.serverProtocol.send(0, {
         _tag: "Exit",
-        requestId: "-1",
+        requestId: -1,
         exit: { _tag: "Success", value: { outcome: { outcome: "cancelled" } } },
       });
       yield* Queue.take(output);
@@ -821,7 +821,7 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
         stdio,
         serverRequestMethods: new Set(["session/request_permission"]),
       });
-      const inboundRequest = yield* Deferred.make<{ readonly id: string }>();
+      const inboundRequest = yield* Deferred.make<{ readonly id: string | number }>();
 
       yield* transport.serverProtocol
         .run((_clientId, message) =>
@@ -847,7 +847,7 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
         ),
       );
       const request = yield* Deferred.await(inboundRequest);
-      assert.equal(request.id, "-1");
+      assert.equal(request.id, -1);
 
       yield* transport.serverProtocol.send(0, {
         _tag: "Chunk",
@@ -935,12 +935,12 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
               ? message.requestId
               : null,
         ),
-        ["-1", "-2", "-2"],
+        [-1, -2, "-2"],
       );
 
       yield* transport.serverProtocol.send(0, {
         _tag: "Exit",
-        requestId: "-2",
+        requestId: -2,
         exit: { _tag: "Success", value: { outcome: { outcome: "cancelled" } } },
       });
       yield* Queue.take(output);
@@ -1032,7 +1032,7 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
               : message.requestId
             : null,
         ),
-        ["42", "-1", "42", "-1"],
+        [42, -1, 42, "-1"],
       );
     }),
   );
@@ -1083,23 +1083,23 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
       assert.deepEqual(inboundMessages, [
         {
           _tag: "Request",
-          id: "-1",
+          id: -1,
           tag: "session/request_permission",
           payload: params,
           headers: [],
         },
         {
           _tag: "Request",
-          id: "1",
+          id: 1,
           tag: "session/request_permission",
           payload: params,
           headers: [],
         },
-        { _tag: "Ack", requestId: "-1" },
-        { _tag: "Interrupt", requestId: "-1" },
+        { _tag: "Ack", requestId: -1 },
+        { _tag: "Interrupt", requestId: -1 },
       ]);
 
-      const sendReply = (requestId: string, optionId: string) =>
+      const sendReply = (requestId: number, optionId: string) =>
         transport.serverProtocol.send(0, {
           _tag: "Exit",
           requestId,
@@ -1108,8 +1108,8 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
             value: { outcome: { outcome: "selected", optionId } },
           },
         });
-      yield* sendReply("-1", "zero");
-      yield* sendReply("1", "one");
+      yield* sendReply(-1, "zero");
+      yield* sendReply(1, "one");
       const responses = yield* Effect.forEach(
         (yield* Queue.take(output)).split("\n").filter((line) => line.length > 0),
         (line) => decodeUnknownJsonString(line),
@@ -1133,7 +1133,7 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
           stdio,
           serverRequestMethods: new Set(["session/request_permission"]),
         });
-        const inboundRequests: Array<{ readonly id: string }> = [];
+        const inboundRequests: Array<{ readonly id: string | number }> = [];
         const receivedBatch = yield* Deferred.make<void>();
 
         yield* transport.serverProtocol
@@ -1181,12 +1181,12 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
         yield* Deferred.await(receivedBatch);
         assert.deepEqual(
           inboundRequests.map((request) => request.id),
-          ["-1", "7"],
+          [-1, 7],
         );
 
         yield* transport.serverProtocol.send(0, {
           _tag: "Chunk",
-          requestId: "-1",
+          requestId: -1,
           values: ["partial"],
         });
         assert.deepEqual(yield* decodeUnknownJsonString(yield* Queue.take(output)), {
@@ -1196,7 +1196,7 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
           result: ["partial"],
         });
 
-        const sendReply = (requestId: string, optionId: string) =>
+        const sendReply = (requestId: number, optionId: string) =>
           transport.serverProtocol.send(0, {
             _tag: "Exit",
             requestId,
@@ -1206,11 +1206,11 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
             },
           });
         if (aliasFirst) {
-          yield* sendReply("-1", "alias");
-          yield* sendReply("7", "numeric");
+          yield* sendReply(-1, "alias");
+          yield* sendReply(7, "numeric");
         } else {
-          yield* sendReply("7", "numeric");
-          yield* sendReply("-1", "alias");
+          yield* sendReply(7, "numeric");
+          yield* sendReply(-1, "alias");
         }
 
         const outbound = yield* Queue.take(output);
@@ -1241,7 +1241,7 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
         stdio,
         serverRequestMethods: new Set(["session/request_permission"]),
       });
-      const inboundRequests: Array<{ readonly id: string }> = [];
+      const inboundRequests: Array<{ readonly id: string | number }> = [];
       const received = yield* Deferred.make<void>();
       yield* transport.serverProtocol
         .run((_clientId, message) => {
@@ -1277,10 +1277,10 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
       yield* Deferred.await(received);
       assert.deepEqual(
         inboundRequests.map((request) => request.id),
-        ["-1", "101", "-2", "201"],
+        [-1, 101, -2, 201],
       );
 
-      const sendReply = (requestId: string, optionId: string) =>
+      const sendReply = (requestId: number, optionId: string) =>
         transport.serverProtocol.send(0, {
           _tag: "Exit",
           requestId,
@@ -1289,14 +1289,14 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
             value: { outcome: { outcome: "selected", optionId } },
           },
         });
-      yield* sendReply("-1", "a-alias");
-      yield* sendReply("-2", "b-alias");
-      yield* sendReply("101", "a-numeric");
+      yield* sendReply(-1, "a-alias");
+      yield* sendReply(-2, "b-alias");
+      yield* sendReply(101, "a-numeric");
       const batchA = yield* Effect.forEach(
         (yield* Queue.take(output)).split("\n").filter((line) => line.length > 0),
         (line) => decodeUnknownJsonString(line),
       );
-      yield* sendReply("201", "b-numeric");
+      yield* sendReply(201, "b-numeric");
       const batchB = yield* Effect.forEach(
         (yield* Queue.take(output)).split("\n").filter((line) => line.length > 0),
         (line) => decodeUnknownJsonString(line),
@@ -1329,7 +1329,7 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
           stdio,
           serverRequestMethods: new Set(["session/request_permission"]),
         });
-        const inboundRequests: Array<{ readonly id: string }> = [];
+        const inboundRequests: Array<{ readonly id: string | number }> = [];
         const received = yield* Deferred.make<void>();
         yield* transport.serverProtocol
           .run((_clientId, message) => {
@@ -1362,10 +1362,10 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
         yield* Deferred.await(received);
         assert.deepEqual(
           inboundRequests.map((request) => request.id),
-          ["42", "-1"],
+          [42, -1],
         );
 
-        const sendReply = (requestId: string, optionId: string) =>
+        const sendReply = (requestId: number, optionId: string) =>
           transport.serverProtocol.send(0, {
             _tag: "Exit",
             requestId,
@@ -1375,11 +1375,11 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
             },
           });
         if (aliasFirst) {
-          yield* sendReply("-1", "string");
-          yield* sendReply("42", "number");
+          yield* sendReply(-1, "string");
+          yield* sendReply(42, "number");
         } else {
-          yield* sendReply("42", "number");
-          yield* sendReply("-1", "string");
+          yield* sendReply(42, "number");
+          yield* sendReply(-1, "string");
         }
         const responses = (yield* Effect.forEach(
           (yield* Queue.take(output)).split("\n").filter((line) => line.length > 0),
@@ -1448,16 +1448,16 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
       const inboundIds = inboundRequests.map((message) =>
         typeof message === "object" && message !== null && "id" in message ? message.id : null,
       );
-      assert.deepEqual(inboundIds, ["-1", "-2"]);
+      assert.deepEqual(inboundIds, [-1, -2]);
 
       yield* transport.serverProtocol.send(0, {
         _tag: "Exit",
-        requestId: "-1",
+        requestId: -1,
         exit: { _tag: "Success", value: { outcome: { outcome: "cancelled" } } },
       });
       yield* transport.serverProtocol.send(0, {
         _tag: "Exit",
-        requestId: "-2",
+        requestId: -2,
         exit: { _tag: "Success", value: { outcome: { outcome: "cancelled" } } },
       });
 
@@ -1512,11 +1512,11 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
       const message = yield* Deferred.await(inboundRequest);
       const forwardedId =
         typeof message === "object" && message !== null && "id" in message ? message.id : null;
-      assert.equal(forwardedId, "-1");
+      assert.equal(forwardedId, -1);
 
       yield* transport.serverProtocol.send(0, {
         _tag: "Exit",
-        requestId: "-1",
+        requestId: -1,
         exit: { _tag: "Success", value: { outcome: { outcome: "cancelled" } } },
       });
 
@@ -1576,7 +1576,7 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
       const message = yield* Deferred.await(lateResponse);
       assert.deepEqual(message, {
         _tag: "Exit",
-        requestId: "1",
+        requestId: 1,
         exit: {
           _tag: "Success",
           value: {

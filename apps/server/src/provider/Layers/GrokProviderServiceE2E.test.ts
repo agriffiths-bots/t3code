@@ -56,9 +56,9 @@ const adapterLayer = Layer.effect(
     instanceId: GROK_INSTANCE_ID,
   }),
 ).pipe(
-  Layer.provideMerge(serverConfigLayer),
-  Layer.provideMerge(serverSettingsLayer),
-  Layer.provideMerge(NodeServices.layer),
+  Layer.provide(serverConfigLayer),
+  Layer.provide(serverSettingsLayer),
+  Layer.provide(NodeServices.layer),
 );
 const adapterRegistryLayer = Layer.effect(
   ProviderAdapterRegistry.ProviderAdapterRegistry,
@@ -68,6 +68,7 @@ const adapterRegistryLayer = Layer.effect(
   }),
 ).pipe(Layer.provide(adapterLayer));
 const providerServiceLayer = makeProviderServiceLive().pipe(
+  Layer.provide(serverConfigLayer),
   Layer.provide(adapterRegistryLayer),
   Layer.provide(directoryLayer),
   Layer.provide(serverSettingsLayer),
@@ -79,16 +80,8 @@ const providerServiceLayer = makeProviderServiceLive().pipe(
     ),
   ),
 );
-const recordedGrokProviderLayer = Layer.mergeAll(
-  adapterLayer,
-  providerServiceLayer,
-  directoryLayer,
-  runtimeRepositoryLayer,
-).pipe(
-  Layer.provideMerge(sqliteLayer),
-  Layer.provideMerge(serverConfigLayer),
-  Layer.provideMerge(serverSettingsLayer),
-  Layer.provideMerge(NodeServices.layer),
+const recordedGrokProviderLayer = Layer.merge(adapterLayer, providerServiceLayer).pipe(
+  Layer.provide(NodeServices.layer),
 );
 
 it.layer(recordedGrokProviderLayer)("ProviderService recorded Grok ACP session", (it) => {

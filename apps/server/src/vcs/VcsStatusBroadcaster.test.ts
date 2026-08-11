@@ -2,6 +2,7 @@ import { assert, it, describe } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
+import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -14,6 +15,7 @@ import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import type {
+  BackgroundScope,
   VcsStatusLocalResult,
   VcsStatusRemoteResult,
   VcsStatusResult,
@@ -22,7 +24,10 @@ import type {
 import { GitManagerError } from "@t3tools/contracts";
 
 import * as VcsStatusBroadcaster from "./VcsStatusBroadcaster.ts";
+import * as BackgroundPolicy from "../background/BackgroundPolicy.ts";
 import * as GitWorkflowService from "../git/GitWorkflowService.ts";
+
+const TEST_EPOCH = DateTime.makeUnsafe("1970-01-01T00:00:00.000Z");
 
 const baseLocalStatus: VcsStatusLocalResult = {
   isRepo: true,
@@ -73,6 +78,7 @@ function makeTestLayer(state: {
 }) {
   return VcsStatusBroadcaster.layer.pipe(
     Layer.provideMerge(NodeServices.layer),
+    Layer.provide(makeBackgroundPolicyLayer(() => true)),
     Layer.provide(
       Layer.mock(GitWorkflowService.GitWorkflowService)({
         localStatus: () =>
@@ -94,9 +100,45 @@ function makeTestLayer(state: {
           Effect.sync(() => {
             state.remoteInvalidationCalls += 1;
           }),
+        invalidateStatus: () =>
+          Effect.sync(() => {
+            state.localInvalidationCalls += 1;
+            state.remoteInvalidationCalls += 1;
+          }),
       }),
     ),
   );
+}
+
+function makeBackgroundPolicyLayer(shouldRunScopeWork: (scope: BackgroundScope) => boolean) {
+  return Layer.mock(BackgroundPolicy.BackgroundPolicy)({
+    reportClientActivity: () => Effect.void,
+    removeRpcClient: () => Effect.void,
+    reportHostPowerState: () => Effect.void,
+    snapshot: Effect.succeed({
+      hostPower: {
+        source: "unknown",
+        idle: "unknown",
+        idleSeconds: null,
+        locked: "unknown",
+        suspended: false,
+        onBattery: "unknown",
+        lowPowerMode: "unknown",
+        thermalState: "unknown",
+        stale: true,
+        updatedAt: TEST_EPOCH,
+      },
+      leases: [],
+      activeForegroundLeaseCount: 0,
+      activeScopeKeys: [],
+      shouldRunOpportunisticWork: false,
+      updatedAt: TEST_EPOCH,
+    }),
+    streamChanges: Stream.empty,
+    hasDemand: () => Effect.succeed(true),
+    shouldRunScopeWork: (scope) => Effect.sync(() => shouldRunScopeWork(scope)),
+    shouldRunOpportunisticWork: Effect.succeed(true),
+  });
 }
 
 describe("VcsStatusBroadcaster", () => {
@@ -178,6 +220,7 @@ describe("VcsStatusBroadcaster", () => {
     };
     const testLayer = VcsStatusBroadcaster.layer.pipe(
       Layer.provideMerge(NodeServices.layer),
+      Layer.provide(makeBackgroundPolicyLayer(() => true)),
       Layer.provide(
         Layer.mock(GitWorkflowService.GitWorkflowService)({
           localStatus: () =>
@@ -204,6 +247,11 @@ describe("VcsStatusBroadcaster", () => {
             }),
           invalidateRemoteStatus: () =>
             Effect.sync(() => {
+              state.remoteInvalidationCalls += 1;
+            }),
+          invalidateStatus: () =>
+            Effect.sync(() => {
+              state.localInvalidationCalls += 1;
               state.remoteInvalidationCalls += 1;
             }),
         }),
@@ -280,6 +328,7 @@ describe("VcsStatusBroadcaster", () => {
     };
     const testLayer = VcsStatusBroadcaster.layer.pipe(
       Layer.provideMerge(NodeServices.layer),
+      Layer.provide(makeBackgroundPolicyLayer(() => true)),
       Layer.provide(
         Layer.mock(GitWorkflowService.GitWorkflowService)({
           localStatus: (input) =>
@@ -443,6 +492,7 @@ describe("VcsStatusBroadcaster", () => {
     let firstRemoteAttemptDeferred: Deferred.Deferred<void> | null = null;
     const testLayer = VcsStatusBroadcaster.layer.pipe(
       Layer.provideMerge(NodeServices.layer),
+      Layer.provide(makeBackgroundPolicyLayer(() => true)),
       Layer.provide(
         Layer.mock(GitWorkflowService.GitWorkflowService)({
           localStatus: () =>
@@ -631,7 +681,7 @@ describe("VcsStatusBroadcaster", () => {
     });
   });
 
-  it.effect("stops the remote poller when stream visibility is revoked", () => {
+  it.effect("does not start automatic remote refreshes without foreground client demand", () => {
     const state = {
       currentLocalStatus: baseLocalStatus,
       currentRemoteStatus: baseRemoteStatus,
@@ -640,11 +690,9 @@ describe("VcsStatusBroadcaster", () => {
       localInvalidationCalls: 0,
       remoteInvalidationCalls: 0,
     };
-    let remoteInterruptedDeferred: Deferred.Deferred<void, never> | null = null;
-    let remoteStartedDeferred: Deferred.Deferred<void, never> | null = null;
-    let visible = true;
     const testLayer = VcsStatusBroadcaster.layer.pipe(
       Layer.provideMerge(NodeServices.layer),
+      Layer.provide(makeBackgroundPolicyLayer(() => false)),
       Layer.provide(
         Layer.mock(GitWorkflowService.GitWorkflowService)({
           localStatus: () =>
@@ -655,19 +703,8 @@ describe("VcsStatusBroadcaster", () => {
           remoteStatus: () =>
             Effect.sync(() => {
               state.remoteStatusCalls += 1;
-            }).pipe(
-              Effect.andThen(
-                remoteStartedDeferred
-                  ? Deferred.succeed(remoteStartedDeferred, undefined).pipe(Effect.ignore)
-                  : Effect.void,
-              ),
-              Effect.andThen(Effect.never as Effect.Effect<VcsStatusRemoteResult | null, never>),
-              Effect.onInterrupt(() =>
-                remoteInterruptedDeferred
-                  ? Deferred.succeed(remoteInterruptedDeferred, undefined).pipe(Effect.ignore)
-                  : Effect.void,
-              ),
-            ),
+              return state.currentRemoteStatus;
+            }),
           invalidateLocalStatus: () =>
             Effect.sync(() => {
               state.localInvalidationCalls += 1;
@@ -681,36 +718,17 @@ describe("VcsStatusBroadcaster", () => {
     );
 
     return Effect.gen(function* () {
-      const remoteInterrupted = yield* Deferred.make<void>();
-      const remoteStarted = yield* Deferred.make<void>();
-      remoteInterruptedDeferred = remoteInterrupted;
-      remoteStartedDeferred = remoteStarted;
-
       const broadcaster = yield* VcsStatusBroadcaster.VcsStatusBroadcaster;
-      const firstSnapshot = yield* Deferred.make<VcsStatusStreamEvent>();
-      const streamScope = yield* Scope.make();
-      yield* Stream.runForEach(
+      const snapshot = yield* Stream.runHead(
         broadcaster.streamStatus(
           { cwd: "/repo" },
-          {
-            isVisible: Effect.sync(() => visible),
-            visibilityRecheckInterval: Duration.millis(10),
-          },
+          { automaticRemoteRefreshInterval: Effect.succeed(Duration.seconds(1)) },
         ),
-        (event) =>
-          event._tag === "snapshot"
-            ? Deferred.succeed(firstSnapshot, event).pipe(Effect.ignore)
-            : Effect.void,
-      ).pipe(Effect.forkIn(streamScope));
+      );
 
-      yield* Deferred.await(firstSnapshot);
-      yield* Deferred.await(remoteStarted);
-      assert.equal(state.remoteStatusCalls, 1);
-
-      visible = false;
-      yield* TestClock.adjust(Duration.millis(10));
-      yield* Deferred.await(remoteInterrupted);
-      yield* Scope.close(streamScope, Exit.void);
+      assert.isTrue(Option.isSome(snapshot));
+      assert.equal(state.remoteStatusCalls, 0);
+      assert.equal(state.remoteInvalidationCalls, 0);
     }).pipe(Effect.provide(testLayer));
   });
 
@@ -727,6 +745,7 @@ describe("VcsStatusBroadcaster", () => {
     let remoteStartedDeferred: Deferred.Deferred<void, never> | null = null;
     const testLayer = VcsStatusBroadcaster.layer.pipe(
       Layer.provideMerge(NodeServices.layer),
+      Layer.provide(makeBackgroundPolicyLayer(() => true)),
       Layer.provide(
         Layer.mock(GitWorkflowService.GitWorkflowService)({
           localStatus: () =>

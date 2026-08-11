@@ -1,6 +1,6 @@
 import {
-  DEFAULT_GIT_TEXT_GENERATION_MODEL,
-  DEFAULT_GIT_TEXT_GENERATION_MODEL_BY_PROVIDER,
+  DEFAULT_TEXT_GENERATION_MODEL,
+  DEFAULT_TEXT_GENERATION_MODEL_BY_PROVIDER,
   defaultInstanceIdForDriver,
   type ModelSelection,
   ProviderDriverKind,
@@ -8,7 +8,6 @@ import {
   type ServerProvider,
 } from "@t3tools/contracts";
 import {
-  CLAUDE_RESERVED_MODEL_SLUGS,
   createModelSelection,
   normalizeCustomModelSlug,
   resolveSelectableModel,
@@ -77,6 +76,7 @@ export interface AppModelOption {
   subProvider?: string;
   isCustom: boolean;
   isDefault?: boolean;
+  isLegacy?: boolean;
 }
 
 function toAppModelOption(model: ServerProvider["models"][number]): AppModelOption {
@@ -88,6 +88,7 @@ function toAppModelOption(model: ServerProvider["models"][number]): AppModelOpti
   if (model.shortName) option.shortName = model.shortName;
   if (model.subProvider) option.subProvider = model.subProvider;
   if (model.isDefault) option.isDefault = true;
+  if (model.isLegacy) option.isLegacy = true;
   return option;
 }
 
@@ -115,16 +116,6 @@ function applyInstanceModelPreferences(
     options.filter((option) => option.isCustom || !hiddenModels.has(option.slug)),
     { modelOrder: preferences.modelOrder },
   );
-}
-
-function customModelExclusions(
-  provider: ProviderDriverKind,
-  builtInModelSlugs: ReadonlySet<string>,
-): ReadonlySet<string> {
-  if (provider !== ProviderDriverKind.make("claudeAgent")) {
-    return builtInModelSlugs;
-  }
-  return new Set([...builtInModelSlugs, ...CLAUDE_RESERVED_MODEL_SLUGS]);
 }
 
 export function normalizeCustomModelSlugs(
@@ -175,10 +166,7 @@ export function getAppModelOptions(
   // see the user's authored custom models.
   const defaultInstanceId = defaultInstanceIdForDriver(provider);
   const customModels = readInstanceCustomModels(settings, defaultInstanceId, provider);
-  for (const slug of normalizeCustomModelSlugs(
-    customModels,
-    customModelExclusions(provider, builtInModelSlugs),
-  )) {
+  for (const slug of normalizeCustomModelSlugs(customModels, builtInModelSlugs)) {
     if (seen.has(slug)) {
       continue;
     }
@@ -221,10 +209,7 @@ export function getAppModelOptionsForInstance(
   );
 
   const customModels = readInstanceCustomModels(settings, entry.instanceId, entry.driverKind);
-  for (const slug of normalizeCustomModelSlugs(
-    customModels,
-    customModelExclusions(entry.driverKind, builtInModelSlugs),
-  )) {
+  for (const slug of normalizeCustomModelSlugs(customModels, builtInModelSlugs)) {
     if (seen.has(slug)) {
       continue;
     }
@@ -298,7 +283,7 @@ export function resolveAppModelSelectionState(
 ): ModelSelection {
   const selection = settings.textGenerationModelSelection ?? {
     instanceId: DEFAULT_TEXT_GENERATION_INSTANCE_ID,
-    model: DEFAULT_GIT_TEXT_GENERATION_MODEL,
+    model: DEFAULT_TEXT_GENERATION_MODEL,
   };
   const entries = deriveProviderInstanceEntries(providers);
   const selectedEntry = entries.find(
@@ -313,7 +298,7 @@ export function resolveAppModelSelectionState(
     const model =
       resolveAppModelSelectionForInstance(entry.instanceId, settings, providers, selectedModel) ??
       entry.models[0]?.slug ??
-      DEFAULT_GIT_TEXT_GENERATION_MODEL_BY_PROVIDER[entry.driverKind];
+      DEFAULT_TEXT_GENERATION_MODEL_BY_PROVIDER[entry.driverKind];
     if (!model) {
       return createModelSelection(entry.instanceId, "", []);
     }

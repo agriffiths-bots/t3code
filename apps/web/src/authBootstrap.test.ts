@@ -350,7 +350,6 @@ describe("resolveInitialServerAuthGateState", () => {
     expect(error).toMatchObject({
       _tag: "PrimaryEnvironmentPairingCredentialRejectedError",
       providedLength: 9,
-      reason: "invalid_credential",
       message: "Invalid pairing token. Check the token and try again.",
     });
     expect(isPrimaryEnvironmentPairingCredentialRejectedError(error)).toBe(true);
@@ -364,41 +363,6 @@ describe("resolveInitialServerAuthGateState", () => {
       traceId: "trace-invalid-credential",
     });
     expect(testApi.calls.browserSession).toEqual([{ credential: "bad-token" }]);
-  });
-
-  it.each([
-    {
-      reason: "expired_credential" as const,
-      message: "That pairing token has expired. Create a new pairing token and try again.",
-    },
-    {
-      reason: "consumed_credential" as const,
-      message: "That pairing token was already used. Create a new pairing token and try again.",
-    },
-  ])("keeps $reason pairing token failures structured", async ({ reason, message }) => {
-    const cause = new EnvironmentAuthInvalidError({
-      code: "auth_invalid",
-      reason,
-      traceId: `trace-${reason}`,
-    });
-    await installAuthApi({
-      browserSession: () => Effect.fail(cause),
-    });
-
-    const { isPrimaryEnvironmentPairingCredentialRejectedError, submitServerAuthCredential } =
-      await import("./environments/primary");
-
-    const error = await submitServerAuthCredential("used-token").then(
-      () => null,
-      (failure: unknown) => failure,
-    );
-    expect(error).toMatchObject({
-      _tag: "PrimaryEnvironmentPairingCredentialRejectedError",
-      providedLength: 10,
-      reason,
-      message,
-    });
-    expect(isPrimaryEnvironmentPairingCredentialRejectedError(error)).toBe(true);
   });
 
   it("derives primary request messages from structural request context", async () => {

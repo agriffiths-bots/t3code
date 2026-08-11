@@ -4,6 +4,7 @@ import {
   workEntryIndicatesToolNeutralStatus,
   workLogEntryIsToolLike,
   type TimelineEntry,
+  type TurnPlanEntry,
   type WorkLogEntry,
 } from "../../session-logic";
 import { type ChatMessage, type ProposedPlan, type TurnDiffSummary } from "../../types";
@@ -18,11 +19,37 @@ export const TIMELINE_MINIMAP_PERSISTENT_GUTTER = 48;
 
 export interface TimelineEndState {
   readonly isAtEnd?: boolean;
-  readonly isNearEnd?: boolean;
+  readonly contentLength?: number;
+  readonly scroll?: number;
+  readonly scrollLength?: number;
 }
 
-export function resolveTimelineIsAtEnd(state: TimelineEndState | undefined): boolean | undefined {
-  return state?.isNearEnd ?? state?.isAtEnd;
+/**
+ * Follow re-arm band above the hard bottom. Strict on purpose: LegendList's
+ * isNearEnd fires within half a viewport, which re-armed live-follow while the
+ * user was reading history and yanked them back down on the next stream chunk.
+ * A small pixel band (instead of the 1px isAtEnd epsilon alone) keeps re-arming
+ * reliable while streaming content is still growing under the viewport.
+ */
+export const TIMELINE_FOLLOW_REARM_THRESHOLD_PX = 40;
+
+export function resolveTimelineIsAtEnd(
+  state: TimelineEndState | undefined,
+  endInset = 0,
+): boolean | undefined {
+  if (!state) {
+    return undefined;
+  }
+  if (state.isAtEnd) {
+    return true;
+  }
+  const { contentLength, scroll, scrollLength } = state;
+  if (contentLength === undefined || scroll === undefined || scrollLength === undefined) {
+    return state.isAtEnd;
+  }
+  // contentLength includes the end inset (composer overlay), so subtract it to
+  // measure the distance to the real content bottom.
+  return contentLength - scroll - scrollLength - endInset <= TIMELINE_FOLLOW_REARM_THRESHOLD_PX;
 }
 
 export function resolveTimelineMinimapHeightStyle(itemCount: number): string {
@@ -123,7 +150,6 @@ function maxIsoTimestamp(a: string | null, b: string | null): string | null {
 export interface TimelineDurationMessage {
   id: string;
   role: "user" | "assistant" | "system";
-  text?: string | null | undefined;
   createdAt: string;
   updatedAt: string;
   streaming: boolean;
@@ -131,9 +157,8 @@ export interface TimelineDurationMessage {
 
 export type TimelineLatestTurn = Pick<
   OrchestrationLatestTurn,
-  "turnId" | "state" | "startedAt" | "completedAt" | "effectiveModel"
-> &
-  Partial<Pick<OrchestrationLatestTurn, "assistantMessageId">>;
+  "turnId" | "state" | "startedAt" | "completedAt"
+>;
 
 export type MessagesTimelineRow =
   | {
@@ -168,7 +193,6 @@ export type MessagesTimelineRow =
       showAssistantMeta: boolean;
       showAssistantCopyButton: boolean;
       assistantCopyStreaming: boolean;
-      effectiveModel?: string | undefined;
       assistantTurnDiffSummary?: TurnDiffSummary | undefined;
       revertTurnCount?: number | undefined;
     }
@@ -177,6 +201,12 @@ export type MessagesTimelineRow =
       id: string;
       createdAt: string;
       proposedPlan: ProposedPlan;
+    }
+  | {
+      kind: "turn-plan";
+      id: string;
+      createdAt: string;
+      turnPlan: TurnPlanEntry;
     }
   | { kind: "working"; id: string; createdAt: string | null };
 
@@ -192,7 +222,7 @@ export function computeMessageDurationStart(
   let lastBoundary: string | null = null;
 
   for (const message of messages) {
-    if (isTurnPromptMessage(message)) {
+    if (message.role === "user") {
       lastBoundary = message.createdAt;
     }
     result.set(message.id, lastBoundary ?? message.createdAt);
@@ -202,77 +232,6 @@ export function computeMessageDurationStart(
   }
 
   return result;
-}
-
-export function isSubAgentWakeSystemMessageText(text: string | null | undefined): boolean {
-  return text?.trimStart().startsWith("[sub-agent ") ?? false;
-}
-
-export function isTurnPromptMessage(
-  message: Pick<TimelineDurationMessage, "role" | "text">,
-): boolean {
-  return (
-    message.role === "user" ||
-    (message.role === "system" && isSubAgentWakeSystemMessageText(message.text))
-  );
-}
-
-export function deriveRevertTurnCountByPromptMessageId(input: {
-  readonly timelineEntries: ReadonlyArray<TimelineEntry>;
-  readonly turnDiffSummaryByAssistantMessageId: ReadonlyMap<MessageId, TurnDiffSummary>;
-  readonly turnDiffSummaryByTurnId: ReadonlyMap<TurnId, TurnDiffSummary>;
-  readonly inferredCheckpointTurnCountByTurnId: Readonly<Record<TurnId, number>>;
-}): Map<MessageId, number> {
-  const byPromptMessageId = new Map<MessageId, number>();
-
-  const resolveTurnCount = (
-    summary: TurnDiffSummary | undefined,
-    turnId: TurnId,
-  ): number | null => {
-    const turnCount =
-      summary?.checkpointTurnCount ?? input.inferredCheckpointTurnCountByTurnId[turnId];
-    return typeof turnCount === "number" ? turnCount : null;
-  };
-
-  for (let index = 0; index < input.timelineEntries.length; index += 1) {
-    const entry = input.timelineEntries[index];
-    if (!entry || entry.kind !== "message" || !isTurnPromptMessage(entry.message)) {
-      continue;
-    }
-
-    if (entry.message.turnId !== null) {
-      const turnCount = resolveTurnCount(
-        input.turnDiffSummaryByTurnId.get(entry.message.turnId),
-        entry.message.turnId,
-      );
-      if (turnCount !== null) {
-        byPromptMessageId.set(entry.message.id, Math.max(0, turnCount - 1));
-        continue;
-      }
-    }
-
-    for (let nextIndex = index + 1; nextIndex < input.timelineEntries.length; nextIndex += 1) {
-      const nextEntry = input.timelineEntries[nextIndex];
-      if (!nextEntry || nextEntry.kind !== "message") {
-        continue;
-      }
-      if (isTurnPromptMessage(nextEntry.message)) {
-        break;
-      }
-      const summary = input.turnDiffSummaryByAssistantMessageId.get(nextEntry.message.id);
-      if (!summary) {
-        continue;
-      }
-      const turnCount = resolveTurnCount(summary, summary.turnId);
-      if (turnCount === null) {
-        break;
-      }
-      byPromptMessageId.set(entry.message.id, Math.max(0, turnCount - 1));
-      break;
-    }
-  }
-
-  return byPromptMessageId;
 }
 
 export function normalizeCompactToolLabel(value: string): string {
@@ -295,197 +254,30 @@ export function resolveAssistantMessageCopyState({
   };
 }
 
-function deriveFinalAssistantBoundariesByTurnId(input: {
-  readonly latestTurn: TimelineLatestTurn | null;
-  readonly turns: ReadonlyArray<TimelineLatestTurn>;
-  readonly turnDiffSummaryByAssistantMessageId: ReadonlyMap<MessageId, TurnDiffSummary>;
-  readonly turnDiffSummaryByTurnId: ReadonlyMap<TurnId, TurnDiffSummary>;
-}): ReadonlyMap<string, ReadonlySet<string>> {
-  const boundariesByTurnId = new Map<string, Set<string>>();
-  const ensureBoundary = (turnId: TurnId): Set<string> => {
-    const key = String(turnId);
-    let boundary = boundariesByTurnId.get(key);
-    if (!boundary) {
-      boundary = new Set<string>();
-      boundariesByTurnId.set(key, boundary);
-    }
-    return boundary;
-  };
-
-  const addTurnBoundary = (turn: TimelineLatestTurn): void => {
-    if (
-      turn.completedAt === null ||
-      turn.state === "running" ||
-      turn.assistantMessageId === undefined
-    ) {
-      return;
-    }
-    const boundary = ensureBoundary(turn.turnId);
-    if (turn.assistantMessageId !== null) {
-      boundary.add(String(turn.assistantMessageId));
-    }
-  };
-
-  for (const turn of input.turns) {
-    addTurnBoundary(turn);
-  }
-
-  for (const summary of input.turnDiffSummaryByTurnId.values()) {
-    const boundary = ensureBoundary(summary.turnId);
-    if (summary.assistantMessageId !== null) {
-      boundary.add(String(summary.assistantMessageId));
-    }
-  }
-
-  for (const [assistantMessageId, summary] of input.turnDiffSummaryByAssistantMessageId) {
-    ensureBoundary(summary.turnId).add(String(assistantMessageId));
-  }
-
-  const latestTurn = input.latestTurn;
-  if (latestTurn) {
-    addTurnBoundary(latestTurn);
-  }
-
-  return boundariesByTurnId;
-}
-
-function deriveEffectiveFinalAssistantBoundariesByTurnId(
-  timelineEntries: ReadonlyArray<TimelineEntry>,
-  boundariesByTurnId: ReadonlyMap<string, ReadonlySet<string>>,
-): ReadonlyMap<string, ReadonlySet<string>> {
-  const entriesByTurnId = new Map<string, TimelineEntry[]>();
-  for (const entry of timelineEntries) {
-    const turnId =
-      entry.kind === "message" && entry.message.role === "assistant"
-        ? (entry.message.turnId ?? null)
-        : entry.kind === "work"
-          ? (entry.entry.turnId ?? null)
-          : null;
-    if (turnId === null) {
-      continue;
-    }
-    const key = String(turnId);
-    const entries = entriesByTurnId.get(key);
-    if (entries) {
-      entries.push(entry);
-    } else {
-      entriesByTurnId.set(key, [entry]);
-    }
-  }
-
-  const effectiveBoundariesByTurnId = new Map<string, ReadonlySet<string>>(boundariesByTurnId);
-  for (const [turnId, boundary] of boundariesByTurnId) {
-    const entries = entriesByTurnId.get(turnId) ?? [];
-    if (boundary.size === 0) {
-      const fallbackAssistantMessageId = findTerminalAssistantAfterLastWork(entries);
-      if (fallbackAssistantMessageId !== null) {
-        effectiveBoundariesByTurnId.set(turnId, new Set([fallbackAssistantMessageId]));
-      }
-      continue;
-    }
-    const lastAssistantMessageId = findLastAssistantMessageId(entries);
-    if (lastAssistantMessageId === null) {
-      continue;
-    }
-    if (boundary.has(lastAssistantMessageId)) {
-      continue;
-    }
-    const terminalAssistantMessageId = findTerminalAssistantAfterLastWork(entries);
-    if (terminalAssistantMessageId !== null) {
-      effectiveBoundariesByTurnId.set(turnId, new Set([terminalAssistantMessageId]));
-      continue;
-    }
-    effectiveBoundariesByTurnId.set(turnId, new Set());
-  }
-
-  return effectiveBoundariesByTurnId;
-}
-
-function findLastAssistantMessageId(entries: ReadonlyArray<TimelineEntry>): string | null {
-  for (let index = entries.length - 1; index >= 0; index -= 1) {
-    const entry = entries[index];
-    if (entry?.kind === "message" && entry.message.role === "assistant") {
-      return String(entry.message.id);
-    }
-  }
-  return null;
-}
-
-function findTerminalAssistantAfterLastWork(entries: ReadonlyArray<TimelineEntry>): string | null {
-  let lastWorkIndex = -1;
-  for (let index = entries.length - 1; index >= 0; index -= 1) {
-    if (entries[index]?.kind === "work") {
-      lastWorkIndex = index;
-      break;
-    }
-  }
-  for (let index = entries.length - 1; index > lastWorkIndex; index -= 1) {
-    const entry = entries[index];
-    if (entry?.kind === "message" && entry.message.role === "assistant") {
-      return String(entry.message.id);
-    }
-  }
-  return null;
-}
-
-function deriveTerminalNullTurnAssistantMessageIds(
-  timelineEntries: ReadonlyArray<TimelineEntry>,
-): ReadonlySet<string> {
-  const terminalAssistantMessageIdByResponseIndex = new Map<number, string>();
-  let responseIndex = 0;
+function deriveTerminalAssistantMessageIds(timelineEntries: ReadonlyArray<TimelineEntry>) {
+  const lastAssistantMessageIdByResponseKey = new Map<string, string>();
+  let nullTurnResponseIndex = 0;
 
   for (const timelineEntry of timelineEntries) {
     if (timelineEntry.kind !== "message") {
       continue;
     }
     const { message } = timelineEntry;
-    if (isTurnPromptMessage(message)) {
-      responseIndex += 1;
+    if (message.role === "user") {
+      nullTurnResponseIndex += 1;
       continue;
     }
-    if (message.role === "assistant" && message.turnId === null) {
-      terminalAssistantMessageIdByResponseIndex.set(responseIndex, message.id);
+    if (message.role !== "assistant") {
+      continue;
     }
+
+    const responseKey = message.turnId
+      ? `turn:${message.turnId}`
+      : `unkeyed:${nullTurnResponseIndex}`;
+    lastAssistantMessageIdByResponseKey.set(responseKey, message.id);
   }
 
-  return new Set(terminalAssistantMessageIdByResponseIndex.values());
-}
-
-function deriveFinalAssistantEntryIds(
-  entries: ReadonlyArray<TimelineEntry>,
-  finalAssistantMessageIds: ReadonlySet<string>,
-): ReadonlySet<string> {
-  const finalEntryIds = new Set<string>();
-  let foundTerminalAssistant = false;
-
-  for (let index = entries.length - 1; index >= 0; index -= 1) {
-    const entry = entries[index];
-    if (!entry) continue;
-
-    if (entry.kind === "work") {
-      if (foundTerminalAssistant) {
-        break;
-      }
-      continue;
-    }
-
-    if (entry.kind === "message" && entry.message.role === "assistant") {
-      if (!foundTerminalAssistant) {
-        if (!finalAssistantMessageIds.has(String(entry.message.id))) {
-          continue;
-        }
-        foundTerminalAssistant = true;
-      }
-      finalEntryIds.add(entry.id);
-      continue;
-    }
-
-    if (foundTerminalAssistant) {
-      break;
-    }
-  }
-
-  return finalEntryIds;
+  return new Set(lastAssistantMessageIdByResponseKey.values());
 }
 
 interface TurnFold {
@@ -519,13 +311,13 @@ function deriveUnsettledTurnId(
 }
 
 /**
- * Settled turns fold work activity behind a "Worked for ..." row anchored at
- * the turn's first work entry. Assistant text remains visible in chronological
- * order, including commentary emitted between tool calls.
+ * Settled turns fold their commentary and tool activity behind a
+ * "Worked for ..." row anchored at the turn's first foldable entry; the
+ * terminal assistant message stays visible below the fold.
  */
 function deriveTurnFolds(input: {
   timelineEntries: ReadonlyArray<TimelineEntry>;
-  finalAssistantBoundariesByTurnId: ReadonlyMap<string, ReadonlySet<string>>;
+  terminalAssistantMessageIds: ReadonlySet<string>;
   latestTurn: TimelineLatestTurn | null;
   unsettledTurnId: TurnId | null;
 }): ReadonlyMap<string, TurnFold> {
@@ -545,7 +337,7 @@ function deriveTurnFolds(input: {
 
   let pendingUserBoundary: string | null = null;
   for (const entry of input.timelineEntries) {
-    if (entry.kind === "message" && isTurnPromptMessage(entry.message)) {
+    if (entry.kind === "message" && entry.message.role === "user") {
       pendingUserBoundary = entry.message.createdAt;
       continue;
     }
@@ -574,6 +366,9 @@ function deriveTurnFolds(input: {
     }
     group.entries.push(entry);
     if (entry.kind === "message") {
+      if (input.terminalAssistantMessageIds.has(entry.message.id)) {
+        group.terminalEntry = entry;
+      }
       if (entry.message.streaming) {
         group.hasStreamingMessage = true;
       }
@@ -588,36 +383,24 @@ function deriveTurnFolds(input: {
     if (group.hasStreamingMessage) {
       continue;
     }
-    const finalAssistantBoundary = input.finalAssistantBoundariesByTurnId.get(String(turnId));
-    const hasExplicitFinalBoundary = finalAssistantBoundary !== undefined;
-    const finalAssistantEntryIds = hasExplicitFinalBoundary
-      ? deriveFinalAssistantEntryIds(group.entries, finalAssistantBoundary)
-      : new Set<string>();
     const hiddenEntryIds = new Set<string>();
     for (const entry of group.entries) {
-      if (
-        entry.kind === "work" ||
-        (hasExplicitFinalBoundary &&
-          entry.kind === "message" &&
-          entry.message.role === "assistant" &&
-          !finalAssistantEntryIds.has(entry.id))
-      ) {
-        hiddenEntryIds.add(entry.id);
+      if (entry.id === group.terminalEntry?.id) {
         continue;
       }
-      if (
-        entry.kind === "message" &&
-        entry.message.role === "assistant" &&
-        finalAssistantEntryIds.has(entry.id)
-      ) {
-        group.terminalEntry = entry;
+      // Agent-spawn CTA rows never fold: workflows outlive their launching
+      // turn (dynamic spawns, background execution), and folding the CTA
+      // when the turn settles makes a still-running fleet invisible.
+      if (entry.kind === "work" && entry.entry.agentSpawn !== undefined) {
+        continue;
       }
+      hiddenEntryIds.add(entry.id);
     }
     if (hiddenEntryIds.size === 0) {
       continue;
     }
 
-    const firstEntry = group.entries.find((entry) => hiddenEntryIds.has(entry.id));
+    const firstEntry = group.entries[0];
     const lastEntry = group.entries.at(-1);
     if (!firstEntry || !lastEntry) {
       continue;
@@ -663,48 +446,25 @@ export function deriveMessagesTimelineRows(input: {
   timelineEntries: ReadonlyArray<TimelineEntry>;
   latestTurn?: TimelineLatestTurn | null;
   runningTurnId?: TurnId | null;
-  turns?: ReadonlyArray<TimelineLatestTurn>;
   expandedTurnIds?: ReadonlySet<TurnId>;
   expandedWorkGroupIds?: ReadonlySet<string>;
   isWorking: boolean;
   activeTurnStartedAt: string | null;
   turnDiffSummaryByAssistantMessageId: ReadonlyMap<MessageId, TurnDiffSummary>;
-  turnDiffSummaryByTurnId?: ReadonlyMap<TurnId, TurnDiffSummary>;
   revertTurnCountByUserMessageId: ReadonlyMap<MessageId, number>;
 }): MessagesTimelineRow[] {
   const nextRows: MessagesTimelineRow[] = [];
   const durationStartByMessageId = computeMessageDurationStart(
     input.timelineEntries.flatMap((entry) => (entry.kind === "message" ? [entry.message] : [])),
   );
-  const explicitFinalAssistantBoundariesByTurnId = deriveFinalAssistantBoundariesByTurnId({
-    latestTurn: input.latestTurn ?? null,
-    turns: input.turns ?? [],
-    turnDiffSummaryByAssistantMessageId: input.turnDiffSummaryByAssistantMessageId,
-    turnDiffSummaryByTurnId: input.turnDiffSummaryByTurnId ?? new Map(),
-  });
-  const finalAssistantBoundariesByTurnId = deriveEffectiveFinalAssistantBoundariesByTurnId(
-    input.timelineEntries,
-    explicitFinalAssistantBoundariesByTurnId,
-  );
-  const effectiveModelByTurnId = new Map<string, string>();
-  for (const turn of input.turns ?? []) {
-    if (turn.effectiveModel) {
-      effectiveModelByTurnId.set(String(turn.turnId), turn.effectiveModel);
-    }
-  }
-  if (input.latestTurn?.effectiveModel) {
-    effectiveModelByTurnId.set(String(input.latestTurn.turnId), input.latestTurn.effectiveModel);
-  }
-  const terminalNullTurnAssistantMessageIds = deriveTerminalNullTurnAssistantMessageIds(
-    input.timelineEntries,
-  );
+  const terminalAssistantMessageIds = deriveTerminalAssistantMessageIds(input.timelineEntries);
   const unsettledTurnId = deriveUnsettledTurnId(
     input.latestTurn ?? null,
     input.runningTurnId ?? null,
   );
   const foldsByAnchorEntryId = deriveTurnFolds({
     timelineEntries: input.timelineEntries,
-    finalAssistantBoundariesByTurnId,
+    terminalAssistantMessageIds,
     latestTurn: input.latestTurn ?? null,
     unsettledTurnId,
   });
@@ -769,9 +529,21 @@ export function deriveMessagesTimelineRows(input: {
         } else {
           const groupId = `work-group:${timelineEntry.id}`;
           const expanded = input.expandedWorkGroupIds?.has(groupId) ?? false;
-          const hiddenEntries = visibleGroupedEntries.slice(0, -MAX_VISIBLE_WORK_LOG_ENTRIES);
-          const visibleEntries = visibleGroupedEntries.slice(-MAX_VISIBLE_WORK_LOG_ENTRIES);
-          const renderedEntries = expanded ? [...hiddenEntries, ...visibleEntries] : visibleEntries;
+          // Agent-spawn CTA rows are always visible: a running fleet must
+          // never hide behind a "+N tool calls" toggle. Selection is by
+          // membership (spawn OR recent-tail), preserving the group's
+          // chronological order in both collapsed and expanded states
+          // (review finding: concatenating two filtered lists moved a
+          // mid-group spawn row above earlier tool rows).
+          const overflowCandidates = visibleGroupedEntries.filter(
+            (entry) => entry.agentSpawn === undefined,
+          );
+          const hiddenEntries = overflowCandidates.slice(0, -MAX_VISIBLE_WORK_LOG_ENTRIES);
+          const hiddenIds = new Set(hiddenEntries.map((entry) => entry.id));
+          const visibleEntries = visibleGroupedEntries.filter(
+            (entry) => entry.agentSpawn !== undefined || !hiddenIds.has(entry.id),
+          );
+          const renderedEntries = expanded ? visibleGroupedEntries : visibleEntries;
 
           for (const workEntry of renderedEntries) {
             nextRows.push({
@@ -782,15 +554,19 @@ export function deriveMessagesTimelineRows(input: {
             });
           }
 
-          nextRows.push({
-            kind: "work-toggle",
-            id: `work-toggle:${timelineEntry.id}`,
-            createdAt: timelineEntry.createdAt,
-            groupId,
-            hiddenCount: hiddenEntries.length,
-            expanded,
-            onlyToolEntries: visibleGroupedEntries.every((entry) => workLogEntryIsToolLike(entry)),
-          });
+          if (hiddenEntries.length > 0) {
+            nextRows.push({
+              kind: "work-toggle",
+              id: `work-toggle:${timelineEntry.id}`,
+              createdAt: timelineEntry.createdAt,
+              groupId,
+              hiddenCount: hiddenEntries.length,
+              expanded,
+              onlyToolEntries: visibleGroupedEntries.every((entry) =>
+                workLogEntryIsToolLike(entry),
+              ),
+            });
+          }
         }
       }
       index = cursor - 1;
@@ -807,6 +583,16 @@ export function deriveMessagesTimelineRows(input: {
       continue;
     }
 
+    if (timelineEntry.kind === "turn-plan") {
+      nextRows.push({
+        kind: "turn-plan",
+        id: timelineEntry.id,
+        createdAt: timelineEntry.createdAt,
+        turnPlan: timelineEntry.turnPlan,
+      });
+      continue;
+    }
+
     const assistantTurnStillInProgress =
       timelineEntry.message.role === "assistant" &&
       unsettledTurnId !== null &&
@@ -814,22 +600,13 @@ export function deriveMessagesTimelineRows(input: {
 
     const durationStart =
       durationStartByMessageId.get(timelineEntry.message.id) ?? timelineEntry.message.createdAt;
-    const finalAssistantBoundary =
-      timelineEntry.message.turnId !== null
-        ? finalAssistantBoundariesByTurnId.get(String(timelineEntry.message.turnId))
-        : undefined;
-    const isFinalAssistantMessage =
-      timelineEntry.message.turnId === null
-        ? terminalNullTurnAssistantMessageIds.has(String(timelineEntry.message.id))
-        : finalAssistantBoundary !== undefined &&
-          finalAssistantBoundary.has(String(timelineEntry.message.id));
 
     // While the turn is still running, the latest assistant message is only
     // provisionally terminal — withhold the metadata row until the turn
     // settles so commentary doesn't flash timestamps mid-work.
     const showAssistantMeta =
       timelineEntry.message.role === "assistant" &&
-      isFinalAssistantMessage &&
+      terminalAssistantMessageIds.has(timelineEntry.message.id) &&
       !assistantTurnStillInProgress;
 
     nextRows.push({
@@ -841,20 +618,14 @@ export function deriveMessagesTimelineRows(input: {
       showAssistantMeta,
       showAssistantCopyButton: showAssistantMeta,
       assistantCopyStreaming: timelineEntry.message.streaming || assistantTurnStillInProgress,
-      effectiveModel:
-        isFinalAssistantMessage && timelineEntry.message.turnId !== null
-          ? effectiveModelByTurnId.get(String(timelineEntry.message.turnId))
-          : undefined,
       assistantTurnDiffSummary:
         timelineEntry.message.role === "assistant"
-          ? (input.turnDiffSummaryByAssistantMessageId.get(timelineEntry.message.id) ??
-            (isFinalAssistantMessage && timelineEntry.message.turnId !== null
-              ? input.turnDiffSummaryByTurnId?.get(timelineEntry.message.turnId)
-              : undefined))
+          ? input.turnDiffSummaryByAssistantMessageId.get(timelineEntry.message.id)
           : undefined,
-      revertTurnCount: isTurnPromptMessage(timelineEntry.message)
-        ? input.revertTurnCountByUserMessageId.get(timelineEntry.message.id)
-        : undefined,
+      revertTurnCount:
+        timelineEntry.message.role === "user"
+          ? input.revertTurnCountByUserMessageId.get(timelineEntry.message.id)
+          : undefined,
     });
   }
 
@@ -905,6 +676,13 @@ function isRowUnchanged(a: MessagesTimelineRow, b: MessagesTimelineRow): boolean
     case "proposed-plan":
       return a.proposedPlan === (b as typeof a).proposedPlan;
 
+    case "turn-plan": {
+      const bp = b as typeof a;
+      // Plans rewrite in place: compare the snapshot's identity fields so an
+      // unchanged plan keeps its row reference (virtualization stability).
+      return a.createdAt === bp.createdAt && a.turnPlan.plan === bp.turnPlan.plan;
+    }
+
     case "work":
       return Equal.equals(a.groupedEntries, (b as typeof a).groupedEntries);
 
@@ -927,7 +705,6 @@ function isRowUnchanged(a: MessagesTimelineRow, b: MessagesTimelineRow): boolean
         a.showAssistantMeta === bm.showAssistantMeta &&
         a.showAssistantCopyButton === bm.showAssistantCopyButton &&
         a.assistantCopyStreaming === bm.assistantCopyStreaming &&
-        a.effectiveModel === bm.effectiveModel &&
         a.assistantTurnDiffSummary === bm.assistantTurnDiffSummary &&
         a.revertTurnCount === bm.revertTurnCount
       );

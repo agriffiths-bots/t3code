@@ -1,7 +1,4 @@
-// @effect-diagnostics nodeBuiltinImport:off - Expo config runs in Node and reads a generated release version file.
 import type { ExpoConfig } from "expo/config";
-import * as NodeFS from "node:fs";
-import * as NodePath from "node:path";
 
 import { BRAND_ASSET_PATHS } from "../../scripts/lib/brand-assets.ts";
 import { loadRepoEnv } from "../../scripts/lib/public-config.ts";
@@ -104,43 +101,6 @@ const variant = VARIANT_CONFIG[APP_VARIANT];
 const iosBundleIdentifier = isIosPersonalTeamBuild
   ? personalTeamBundleIdentifier!
   : variant.iosBundleIdentifier;
-const firstNonEmpty = (...values: ReadonlyArray<string | undefined>): string | undefined =>
-  values.find((value) => value !== undefined && value.trim().length > 0);
-const easProjectId =
-  firstNonEmpty(repoEnv.EXPO_PROJECT_ID, repoEnv.EXPO_PUBLIC_EAS_PROJECT_ID) ??
-  "d763fcb8-d37c-41ea-a773-b54a0ab4a454";
-const mobileAppVersion =
-  firstNonEmpty(
-    repoEnv.MOBILE_APP_VERSION,
-    repoEnv.EXPO_PUBLIC_APP_VERSION,
-    readReleaseVersion(),
-  ) ?? "0.1.0";
-const widgets = [
-  {
-    name: "AgentActivity",
-    displayName: "Agent Activity",
-    description: "Shows the current state of active T3 Code agents.",
-    supportedFamilies: ["systemSmall", "systemMedium", "accessoryRectangular"],
-  },
-] as const;
-
-function readReleaseVersion(): string | undefined {
-  const releaseVersionPath = NodePath.resolve(process.cwd(), "release-version.json");
-
-  try {
-    const parsed: unknown = JSON.parse(NodeFS.readFileSync(releaseVersionPath, "utf8"));
-    const version =
-      typeof parsed === "object" && parsed !== null && "version" in parsed
-        ? parsed.version
-        : undefined;
-    return typeof version === "string" && version.trim().length > 0 ? version.trim() : undefined;
-  } catch (error) {
-    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
-      return undefined;
-    }
-    throw error;
-  }
-}
 
 const dmSansFonts = {
   regular: "@expo-google-fonts/dm-sans/400Regular/DMSans_400Regular.ttf",
@@ -201,7 +161,7 @@ const config: ExpoConfig = {
   slug: "t3-code",
   platforms: ["ios", "android"],
   scheme: variant.scheme,
-  version: mobileAppVersion,
+  version: "1.0.2",
   runtimeVersion: {
     // Fingerprint (not appVersion) so an OTA only reaches binaries whose native
     // project — native deps, config plugins, AND patches/ — matches the update.
@@ -214,13 +174,16 @@ const config: ExpoConfig = {
   userInterfaceStyle: "automatic",
   updates: {
     enabled: true,
-    url: firstNonEmpty(repoEnv.EXPO_UPDATES_URL) ?? `https://u.expo.dev/${easProjectId}`,
+    url: "https://u.expo.dev/d763fcb8-d37c-41ea-a773-b54a0ab4a454",
     checkAutomatically: "ON_LOAD",
     fallbackToCacheTimeout: 0,
   },
   ios: {
     icon: variant.assets.iosIcon,
     supportsTablet: true,
+    // Multitasking-capable iPad apps cannot rotate programmatically, so the
+    // showcase capture build requires full screen (see infoPlist below).
+    requireFullScreen: process.env.T3_SHOWCASE_CAPTURE_BUILD === "1",
     bundleIdentifier: iosBundleIdentifier,
     // Pin code signing to the T3 Tools team so non-interactive `expo run:ios`
     // does not fall back to a personal team (which cannot sign app groups,
@@ -237,6 +200,21 @@ const config: ExpoConfig = {
       NSLocalNetworkUsageDescription:
         "Allow T3 Code to connect to T3 Code servers on your local network or tailnet.",
       ITSAppUsesNonExemptEncryption: false,
+      // The App Store screenshot harness rotates the iPad interface from
+      // inside the app (CI denies osascript the Accessibility access that
+      // Simulator menu scripting needs), and iPadOS ignores programmatic
+      // orientation requests for multitasking-capable apps — so the capture
+      // build opts out of multitasking and declares landscape support.
+      ...(process.env.T3_SHOWCASE_CAPTURE_BUILD === "1"
+        ? {
+            "UISupportedInterfaceOrientations~ipad": [
+              "UIInterfaceOrientationPortrait",
+              "UIInterfaceOrientationPortraitUpsideDown",
+              "UIInterfaceOrientationLandscapeLeft",
+              "UIInterfaceOrientationLandscapeRight",
+            ],
+          }
+        : {}),
     },
   },
   android: {
@@ -315,10 +293,12 @@ const config: ExpoConfig = {
       "expo-camera",
       {
         cameraPermission: "Allow T3 Code to access your camera so you can scan pairing QR codes.",
+        microphonePermission: false,
         barcodeScannerEnabled: true,
         recordAudioAndroid: false,
       },
     ],
+    ["expo-image-picker", { photosPermission: false, microphonePermission: false }],
     [
       "expo-splash-screen",
       {
@@ -358,8 +338,6 @@ const config: ExpoConfig = {
     "./plugins/withAndroidModernPopupMenu.cjs",
     "./plugins/withAndroidModernAlertDialog.cjs",
     "./plugins/withAndroidPredictiveBackCompat.cjs",
-    // Fork-local: registers Android widget string resources for the widgets above.
-    ["./plugins/withAndroidWidgetStringResources.cjs", { widgets }],
     ...(isIosPersonalTeamBuild ? ["./plugins/withoutIosPersonalTeamCapabilities.cjs"] : []),
   ],
   extra: {
@@ -387,10 +365,10 @@ const config: ExpoConfig = {
       tracesToken: repoEnv.EXPO_PUBLIC_OTLP_TRACES_TOKEN ?? null,
     },
     eas: {
-      projectId: easProjectId,
+      projectId: "d763fcb8-d37c-41ea-a773-b54a0ab4a454",
     },
   },
-  owner: firstNonEmpty(repoEnv.EXPO_OWNER) ?? "pingdotgg",
+  owner: "pingdotgg",
 };
 
 export default config;

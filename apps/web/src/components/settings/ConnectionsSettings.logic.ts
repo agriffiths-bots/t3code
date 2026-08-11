@@ -1,7 +1,33 @@
-import type { DesktopBridge, DesktopWslState } from "@t3tools/contracts";
+import type { AdvertisedEndpoint, DesktopBridge, DesktopWslState } from "@t3tools/contracts";
 import { resolveRemotePairingTarget } from "@t3tools/shared/remote";
 
 type WslEnableBridge = Pick<DesktopBridge, "setWslBackendEnabled" | "setWslDistro" | "setWslOnly">;
+
+export function isQrShareableEndpoint(endpoint: AdvertisedEndpoint): boolean {
+  return endpoint.status !== "unavailable" && endpoint.reachability !== "loopback";
+}
+
+export type QrEndpointOption = {
+  readonly id: string;
+  readonly preferenceKey: string;
+  readonly qrShareable: boolean;
+};
+
+export function selectQrEndpointOption<T extends QrEndpointOption>(
+  options: ReadonlyArray<T>,
+  selectedId: string | null,
+  defaultPreferenceKey: string | null,
+): T | null {
+  return (
+    (selectedId !== null ? options.find((option) => option.id === selectedId) : undefined) ??
+    (defaultPreferenceKey !== null
+      ? options.find((option) => option.preferenceKey === defaultPreferenceKey)
+      : undefined) ??
+    options.find((option) => option.qrShareable) ??
+    options[0] ??
+    null
+  );
+}
 
 export interface RemotePairingFields {
   readonly host: string;

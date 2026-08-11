@@ -111,39 +111,22 @@ const connectivityLayer = Connectivity.layer({
 
 const wakeupsLayer = Wakeups.layer({
   changes: Stream.merge(
-    Stream.merge(
-      Stream.callback<"application-active">((queue) =>
-        Effect.acquireRelease(
+    Stream.callback<"application-active">((queue) =>
+      Effect.acquireRelease(
+        Effect.sync(() => {
+          const listener = () => {
+            if (document.visibilityState === "visible") {
+              Queue.offerUnsafe(queue, "application-active");
+            }
+          };
+          document.addEventListener("visibilitychange", listener);
+          return listener;
+        }),
+        (listener) =>
           Effect.sync(() => {
-            const listener = () => {
-              if (document.visibilityState === "visible") {
-                Queue.offerUnsafe(queue, "application-active");
-              }
-            };
-            document.addEventListener("visibilitychange", listener);
-            return listener;
+            document.removeEventListener("visibilitychange", listener);
           }),
-          (listener) =>
-            Effect.sync(() => {
-              document.removeEventListener("visibilitychange", listener);
-            }),
-        ).pipe(Effect.asVoid),
-      ),
-      Stream.callback<"browser-online">((queue) =>
-        Effect.acquireRelease(
-          Effect.sync(() => {
-            const listener = () => {
-              Queue.offerUnsafe(queue, "browser-online");
-            };
-            window.addEventListener("online", listener);
-            return listener;
-          }),
-          (listener) =>
-            Effect.sync(() => {
-              window.removeEventListener("online", listener);
-            }),
-        ).pipe(Effect.asVoid),
-      ),
+      ).pipe(Effect.asVoid),
     ),
     managedRelayAccountChanges(appAtomRegistry).pipe(
       Stream.map(() => "credentials-changed" as const),
@@ -679,7 +662,7 @@ const rpcRequestObserverLayer = Layer.succeed(
       Effect.sync(() => {
         nextObservedRpcRequestId += 1;
         const requestId = `${environmentId}:${nextObservedRpcRequestId}`;
-        trackRpcRequestSent(requestId, `${method} · ${environmentId}`);
+        trackRpcRequestSent(requestId, method, `${method} · ${environmentId}`);
         return Effect.sync(() => {
           acknowledgeRpcRequest(requestId);
         });

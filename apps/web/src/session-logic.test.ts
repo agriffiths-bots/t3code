@@ -1,29 +1,24 @@
 import {
+  classifyTaskAgentKind,
   EventId,
   MessageId,
-  ProjectId,
-  ProviderInstanceId,
   ThreadId,
   TurnId,
-  type OrchestrationThread,
   type OrchestrationThreadActivity,
 } from "@t3tools/contracts";
-import { applyThreadDetailEvent } from "@t3tools/client-runtime/state/threads";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
   deriveActiveWorkStartedAt,
   deriveActivePlanState,
+  deriveTurnPlans,
   derivePendingApprovals,
   derivePendingUserInputs,
   deriveTimelineEntries,
   deriveWorkLogEntries,
   findLatestProposedPlan,
-  findSidebarProposedPlan,
   hasActionableProposedPlan,
-  isThreadSessionActive,
   isLatestTurnSettled,
-  isThreadReadyForQueuedTurn,
   workEntryIndicatesToolFailure,
   workEntryIndicatesToolNeutralStatus,
   workEntryIndicatesToolSuccess,
@@ -41,7 +36,19 @@ function makeActivity(overrides: {
   turnId?: string;
   sequence?: number;
 }): OrchestrationThreadActivity {
-  const payload = overrides.payload ?? {};
+  // Fixtures model post-ingestion rows: ingestion stamps agentKind on every
+  // task.* payload. Pass an explicit agentKind to model legacy rows.
+  const rawPayload = overrides.payload ?? {};
+  const payload =
+    overrides.kind?.startsWith("task.") && !("agentKind" in rawPayload)
+      ? {
+          ...rawPayload,
+          agentKind: classifyTaskAgentKind({
+            taskType: typeof rawPayload.taskType === "string" ? rawPayload.taskType : undefined,
+            agentId: typeof rawPayload.agentId === "string" ? rawPayload.agentId : undefined,
+          }),
+        }
+      : rawPayload;
   return {
     id: EventId.make(overrides.id ?? `activity-${nextActivityId++}`),
     createdAt: overrides.createdAt ?? "2026-02-23T00:00:00.000Z",
@@ -119,6 +126,32 @@ describe("derivePendingApprovals", () => {
         requestKind: "command",
         createdAt: "2026-02-23T00:00:01.000Z",
         detail: "pwd",
+      },
+    ]);
+  });
+
+  it("derives dynamic tool requests as actionable generic approvals", () => {
+    const activities: OrchestrationThreadActivity[] = [
+      makeActivity({
+        id: "approval-open-dynamic-tool",
+        createdAt: "2026-02-23T00:00:01.000Z",
+        kind: "approval.requested",
+        summary: "Approval requested",
+        tone: "approval",
+        payload: {
+          requestId: "req-dynamic-tool",
+          requestType: "dynamic_tool_call",
+          detail: "Search the web",
+        },
+      }),
+    ];
+
+    expect(derivePendingApprovals(activities)).toEqual([
+      {
+        requestId: "req-dynamic-tool",
+        requestKind: "command",
+        createdAt: "2026-02-23T00:00:01.000Z",
+        detail: "Search the web",
       },
     ]);
   });
@@ -377,6 +410,95 @@ describe("deriveActivePlanState", () => {
   });
 });
 
+describe("deriveTurnPlans", () => {
+  it("keeps one entry per turn, anchored at the first snapshot with the latest steps", () => {
+    const activities: OrchestrationThreadActivity[] = [
+      makeActivity({
+        id: "plan-1a",
+        createdAt: "2026-02-23T00:00:01.000Z",
+        kind: "turn.plan.updated",
+        summary: "Plan updated",
+        tone: "info",
+        turnId: "turn-1",
+        payload: {
+          plan: [{ step: "Inspect code", status: "inProgress" }],
+        },
+      }),
+      makeActivity({
+        id: "plan-1b",
+        createdAt: "2026-02-23T00:00:05.000Z",
+        kind: "turn.plan.updated",
+        summary: "Plan updated",
+        tone: "info",
+        turnId: "turn-1",
+        payload: {
+          plan: [{ step: "Inspect code", status: "completed" }],
+        },
+      }),
+      makeActivity({
+        id: "plan-2a",
+        createdAt: "2026-02-23T00:01:00.000Z",
+        kind: "turn.plan.updated",
+        summary: "Plan updated",
+        tone: "info",
+        turnId: "turn-2",
+        payload: {
+          plan: [{ step: "Ship it", status: "pending" }],
+        },
+      }),
+    ];
+
+    const turnPlans = deriveTurnPlans(activities);
+    expect(turnPlans).toHaveLength(2);
+    expect(turnPlans[0]).toMatchObject({
+      id: "turn-plan:turn-1",
+      createdAt: "2026-02-23T00:00:01.000Z",
+      turnId: "turn-1",
+    });
+    expect(turnPlans[0]?.plan.steps).toEqual([{ step: "Inspect code", status: "completed" }]);
+    expect(turnPlans[1]?.plan.steps).toEqual([{ step: "Ship it", status: "pending" }]);
+  });
+
+  it("skips activities without parseable steps", () => {
+    const activities: OrchestrationThreadActivity[] = [
+      makeActivity({
+        id: "plan-bad",
+        createdAt: "2026-02-23T00:00:01.000Z",
+        kind: "turn.plan.updated",
+        summary: "Plan updated",
+        tone: "info",
+        turnId: "turn-1",
+        payload: { plan: [] },
+      }),
+    ];
+    expect(deriveTurnPlans(activities)).toEqual([]);
+  });
+
+  it("drops a turn's chip when a later snapshot clears the plan", () => {
+    const activities: OrchestrationThreadActivity[] = [
+      makeActivity({
+        id: "plan-set",
+        createdAt: "2026-02-23T00:00:01.000Z",
+        kind: "turn.plan.updated",
+        summary: "Plan updated",
+        tone: "info",
+        turnId: "turn-1",
+        payload: { plan: [{ step: "Inspect code", status: "inProgress" }] },
+      }),
+      makeActivity({
+        id: "plan-clear",
+        createdAt: "2026-02-23T00:00:02.000Z",
+        kind: "turn.plan.updated",
+        summary: "Plan updated",
+        tone: "info",
+        turnId: "turn-1",
+        payload: { plan: [] },
+      }),
+    ];
+    expect(deriveTurnPlans(activities)).toEqual([]);
+  });
+});
+
 describe("findLatestProposedPlan", () => {
   it("prefers the latest proposed plan for the active turn", () => {
     expect(
@@ -479,103 +601,6 @@ describe("hasActionableProposedPlan", () => {
         updatedAt: "2026-02-23T00:00:02.000Z",
       }),
     ).toBe(false);
-  });
-});
-
-describe("findSidebarProposedPlan", () => {
-  it("prefers the running turn source proposed plan when available on the same thread", () => {
-    expect(
-      findSidebarProposedPlan({
-        threads: [
-          {
-            id: ThreadId.make("thread-1"),
-            proposedPlans: [
-              {
-                id: "plan-1",
-                turnId: TurnId.make("turn-plan"),
-                planMarkdown: "# Source plan",
-                implementedAt: "2026-02-23T00:00:03.000Z",
-                implementationThreadId: ThreadId.make("thread-2"),
-                createdAt: "2026-02-23T00:00:01.000Z",
-                updatedAt: "2026-02-23T00:00:02.000Z",
-              },
-            ],
-          },
-          {
-            id: ThreadId.make("thread-2"),
-            proposedPlans: [
-              {
-                id: "plan-2",
-                turnId: TurnId.make("turn-other"),
-                planMarkdown: "# Latest elsewhere",
-                implementedAt: null,
-                implementationThreadId: null,
-                createdAt: "2026-02-23T00:00:04.000Z",
-                updatedAt: "2026-02-23T00:00:05.000Z",
-              },
-            ],
-          },
-        ],
-        latestTurn: {
-          turnId: TurnId.make("turn-implementation"),
-          sourceProposedPlan: {
-            threadId: ThreadId.make("thread-1"),
-            planId: "plan-1",
-          },
-        },
-        latestTurnSettled: false,
-        threadId: ThreadId.make("thread-1"),
-      }),
-    ).toEqual({
-      id: "plan-1",
-      turnId: "turn-plan",
-      planMarkdown: "# Source plan",
-      implementedAt: "2026-02-23T00:00:03.000Z",
-      implementationThreadId: "thread-2",
-      createdAt: "2026-02-23T00:00:01.000Z",
-      updatedAt: "2026-02-23T00:00:02.000Z",
-    });
-  });
-
-  it("falls back to the latest proposed plan once the turn is settled", () => {
-    expect(
-      findSidebarProposedPlan({
-        threads: [
-          {
-            id: ThreadId.make("thread-1"),
-            proposedPlans: [
-              {
-                id: "plan-1",
-                turnId: TurnId.make("turn-plan"),
-                planMarkdown: "# Older",
-                implementedAt: null,
-                implementationThreadId: null,
-                createdAt: "2026-02-23T00:00:01.000Z",
-                updatedAt: "2026-02-23T00:00:02.000Z",
-              },
-              {
-                id: "plan-2",
-                turnId: TurnId.make("turn-latest"),
-                planMarkdown: "# Latest",
-                implementedAt: null,
-                implementationThreadId: null,
-                createdAt: "2026-02-23T00:00:03.000Z",
-                updatedAt: "2026-02-23T00:00:04.000Z",
-              },
-            ],
-          },
-        ],
-        latestTurn: {
-          turnId: TurnId.make("turn-implementation"),
-          sourceProposedPlan: {
-            threadId: ThreadId.make("thread-1"),
-            planId: "plan-1",
-          },
-        },
-        latestTurnSettled: true,
-        threadId: ThreadId.make("thread-1"),
-      })?.planMarkdown,
-    ).toBe("# Latest");
   });
 });
 
@@ -1543,319 +1568,6 @@ describe("deriveTimelineEntries", () => {
       },
     });
   });
-
-  it("keeps resumed-turn assistant messages after their user prompt when segment ids were reused", () => {
-    const entries = deriveTimelineEntries(
-      [
-        {
-          id: MessageId.make("user-turn-1"),
-          role: "user",
-          text: "first prompt",
-          createdAt: "2026-02-23T00:00:00.000Z",
-          turnId: TurnId.make("turn-1"),
-          updatedAt: "2026-02-23T00:00:00.000Z",
-          streaming: false,
-        },
-        {
-          id: MessageId.make("assistant-turn-1"),
-          role: "assistant",
-          text: "first response",
-          createdAt: "2026-02-23T00:00:01.000Z",
-          turnId: TurnId.make("turn-1"),
-          updatedAt: "2026-02-23T00:00:01.000Z",
-          streaming: false,
-        },
-        {
-          id: MessageId.make("assistant-reused-segment-turn-2"),
-          role: "assistant",
-          text: "second response with stale timestamp",
-          createdAt: "2026-02-23T00:00:01.500Z",
-          turnId: TurnId.make("turn-2"),
-          updatedAt: "2026-02-23T00:01:01.500Z",
-          streaming: false,
-        },
-        {
-          id: MessageId.make("assistant-same-boundary-turn-2"),
-          role: "assistant",
-          text: "second response sharing the request timestamp",
-          createdAt: "2026-02-23T00:01:00.000Z",
-          turnId: TurnId.make("turn-2"),
-          updatedAt: "2026-02-23T00:01:01.600Z",
-          streaming: false,
-        },
-        {
-          id: MessageId.make("user-turn-2"),
-          role: "user",
-          text: "second prompt",
-          createdAt: "2026-02-23T00:01:00.000Z",
-          turnId: TurnId.make("turn-2"),
-          updatedAt: "2026-02-23T00:01:00.000Z",
-          streaming: false,
-        },
-      ],
-      [],
-      [],
-      [{ turnId: TurnId.make("turn-1"), requestedAt: "2026-02-23T00:00:00.000Z" }],
-      { turnId: TurnId.make("turn-2"), requestedAt: "2026-02-23T00:01:00.000Z" },
-    );
-
-    expect(entries.map((entry) => entry.id)).toEqual([
-      "user-turn-1",
-      "assistant-turn-1",
-      "user-turn-2",
-      "assistant-reused-segment-turn-2",
-      "assistant-same-boundary-turn-2",
-    ]);
-  });
-
-  it("prefers the latest-turn request boundary over a stale matching history row", () => {
-    const turnId = TurnId.make("turn-reconnected");
-    const entries = deriveTimelineEntries(
-      [
-        {
-          id: MessageId.make("user-reconnected"),
-          role: "user",
-          text: "resume after reconnect",
-          createdAt: "2026-02-23T00:01:00.000Z",
-          turnId,
-          updatedAt: "2026-02-23T00:01:00.000Z",
-          streaming: false,
-        },
-        {
-          id: MessageId.make("assistant-reconnected-stale-segment"),
-          role: "assistant",
-          text: "replayed segment with its original timestamp",
-          createdAt: "2026-02-23T00:00:30.000Z",
-          turnId,
-          updatedAt: "2026-02-23T00:01:01.000Z",
-          streaming: false,
-        },
-      ],
-      [],
-      [],
-      [{ turnId, requestedAt: "2026-02-23T00:00:00.000Z" }],
-      { turnId, requestedAt: "2026-02-23T00:01:00.000Z" },
-    );
-
-    expect(entries.map((entry) => entry.id)).toEqual([
-      "user-reconnected",
-      "assistant-reconnected-stale-segment",
-    ]);
-  });
-
-  it("does not infer a turn-start boundary from a historical Claude steer", () => {
-    const historicalTurnId = TurnId.make("turn-history-gap");
-    const entries = deriveTimelineEntries(
-      [
-        {
-          id: MessageId.make("assistant-before-history-gap-steer"),
-          role: "assistant",
-          text: "output before steer",
-          createdAt: "2026-02-23T00:00:30.000Z",
-          turnId: historicalTurnId,
-          updatedAt: "2026-02-23T00:00:30.000Z",
-          streaming: false,
-        },
-        {
-          id: MessageId.make("user-history-gap-steer"),
-          role: "user",
-          text: "historical steer",
-          createdAt: "2026-02-23T00:01:00.000Z",
-          turnId: historicalTurnId,
-          updatedAt: "2026-02-23T00:01:00.000Z",
-          streaming: false,
-        },
-        {
-          id: MessageId.make("assistant-after-history-gap-steer"),
-          role: "assistant",
-          text: "output after steer",
-          createdAt: "2026-02-23T00:01:30.000Z",
-          turnId: historicalTurnId,
-          updatedAt: "2026-02-23T00:01:30.000Z",
-          streaming: false,
-        },
-      ],
-      [],
-      [],
-      [],
-      {
-        turnId: TurnId.make("turn-current"),
-        requestedAt: "2026-02-23T00:02:00.000Z",
-      },
-    );
-
-    expect(entries.map((entry) => entry.id)).toEqual([
-      "assistant-before-history-gap-steer",
-      "user-history-gap-steer",
-      "assistant-after-history-gap-steer",
-    ]);
-  });
-
-  it.each([
-    ["Codex", null, "2026-07-10T08:00:01.000Z", "2026-07-10T08:00:01.000Z", true],
-    [
-      "Claude",
-      TurnId.make("turn-active"),
-      "2026-07-10T08:00:01.000Z",
-      "2026-07-10T08:00:01.000Z",
-      true,
-    ],
-    [
-      "Claude with a spanning assistant segment",
-      TurnId.make("turn-active"),
-      "2026-07-10T08:00:01.000Z",
-      "2026-07-10T08:00:04.000Z",
-      false,
-    ],
-    [
-      "Claude with a rebound assistant segment",
-      TurnId.make("turn-active"),
-      "2026-07-10T08:00:00.250Z",
-      "2026-07-10T08:00:04.000Z",
-      false,
-    ],
-  ] as const)(
-    "keeps a %s mid-turn message before the same turn's continuing output",
-    (_provider, injectedTurnId, assistantCreatedAt, assistantUpdatedAt, includeFirstWork) => {
-      const activeTurnId = TurnId.make("turn-active");
-      const message = (
-        id: string,
-        role: "user" | "assistant",
-        createdAt: string,
-        turnId: TurnId | null,
-        updatedAt = createdAt,
-      ) => ({
-        id: MessageId.make(id),
-        role,
-        text: id,
-        createdAt,
-        turnId,
-        updatedAt,
-        streaming: false,
-      });
-      const work = (id: string, createdAt: string) => ({
-        id,
-        turnId: activeTurnId,
-        createdAt,
-        label: id,
-        tone: "tool" as const,
-      });
-      const entries = deriveTimelineEntries(
-        [
-          message("user-initial", "user", "2026-07-10T08:00:00.000Z", null),
-          message(
-            "assistant-before-steer",
-            "assistant",
-            assistantCreatedAt,
-            activeTurnId,
-            assistantUpdatedAt,
-          ),
-          message("user-mid-turn", "user", "2026-07-10T08:00:03.000Z", injectedTurnId),
-          message("assistant-after-steer", "assistant", "2026-07-10T08:00:04.000Z", activeTurnId),
-        ],
-        [],
-        [
-          ...(includeFirstWork ? [work("work-before-steer", "2026-07-10T08:00:02.000Z")] : []),
-          work("work-after-steer", "2026-07-10T08:00:05.000Z"),
-        ],
-        [{ turnId: activeTurnId, requestedAt: "2026-07-10T08:00:00.500Z" }],
-      );
-
-      expect(entries.map((entry) => entry.id)).toEqual([
-        "user-initial",
-        "assistant-before-steer",
-        ...(includeFirstWork ? ["work-before-steer"] : []),
-        "user-mid-turn",
-        "assistant-after-steer",
-        "work-after-steer",
-      ]);
-    },
-  );
-
-  it("exposes a running-turn assistant message-sent event immediately", () => {
-    const threadId = ThreadId.make("thread-live-assistant");
-    const turnId = TurnId.make("turn-live-assistant");
-    const baseThread: OrchestrationThread = {
-      id: threadId,
-      projectId: ProjectId.make("project-live-assistant"),
-      dataAudience: "private",
-      title: "Live assistant delivery",
-      modelSelection: { instanceId: ProviderInstanceId.make("claudeAgent"), model: "claude" },
-      runtimeMode: "full-access",
-      interactionMode: "default",
-      branch: "main",
-      worktreePath: null,
-      latestTurn: {
-        turnId,
-        state: "running",
-        requestedAt: "2026-07-07T21:00:00.000Z",
-        startedAt: "2026-07-07T21:00:01.000Z",
-        completedAt: null,
-        assistantMessageId: null,
-      },
-      createdAt: "2026-07-07T21:00:00.000Z",
-      updatedAt: "2026-07-07T21:00:01.000Z",
-      archivedAt: null,
-      settledOverride: null,
-      settledAt: null,
-      deletedAt: null,
-      messages: [],
-      turns: [],
-      proposedPlans: [],
-      activities: [],
-      checkpoints: [],
-      session: {
-        threadId,
-        status: "running",
-        providerName: "claudeAgent",
-        runtimeMode: "full-access",
-        activeTurnId: turnId,
-        lastError: null,
-        updatedAt: "2026-07-07T21:00:01.000Z",
-      },
-    };
-
-    const result = applyThreadDetailEvent(baseThread, {
-      eventId: EventId.make("event-live-assistant"),
-      sequence: 42,
-      occurredAt: "2026-07-07T21:00:03.000Z",
-      commandId: null,
-      causationEventId: null,
-      correlationId: null,
-      metadata: {},
-      aggregateKind: "thread",
-      aggregateId: threadId,
-      type: "thread.message-sent",
-      payload: {
-        threadId,
-        messageId: MessageId.make("message-live-assistant"),
-        role: "assistant",
-        text: "INTERIM text visible before the turn settles.",
-        turnId,
-        streaming: false,
-        createdAt: "2026-07-07T21:00:03.000Z",
-        updatedAt: "2026-07-07T21:00:03.000Z",
-      },
-    });
-
-    expect(result.kind).toBe("updated");
-    if (result.kind !== "updated") {
-      return;
-    }
-    expect(result.thread.latestTurn?.state).toBe("running");
-
-    const entries = deriveTimelineEntries(result.thread.messages, [], []);
-    expect(entries).toEqual([
-      expect.objectContaining({
-        kind: "message",
-        message: expect.objectContaining({
-          role: "assistant",
-          text: "INTERIM text visible before the turn settles.",
-          turnId,
-        }),
-      }),
-    ]);
-  });
 });
 
 describe("deriveWorkLogEntries context window handling", () => {
@@ -1897,26 +1609,6 @@ describe("deriveWorkLogEntries context window handling", () => {
   });
 });
 
-describe("isThreadSessionActive", () => {
-  it("treats active waiting sessions as active work", () => {
-    expect(
-      isThreadSessionActive({
-        status: "waiting",
-        activeTurnId: TurnId.make("turn-1"),
-      }),
-    ).toBe(true);
-  });
-
-  it("does not treat parked waiting sessions as active work", () => {
-    expect(
-      isThreadSessionActive({
-        status: "waiting",
-        activeTurnId: null,
-      }),
-    ).toBe(false);
-  });
-});
-
 describe("isLatestTurnSettled", () => {
   const latestTurn = {
     turnId: TurnId.make("turn-1"),
@@ -1951,24 +1643,6 @@ describe("isLatestTurnSettled", () => {
     ).toBe(true);
   });
 
-  it("returns true for parked waiting sessions without an active turn", () => {
-    expect(
-      isLatestTurnSettled(latestTurn, {
-        status: "waiting",
-        activeTurnId: null,
-      }),
-    ).toBe(true);
-  });
-
-  it("returns false for waiting sessions with an active turn", () => {
-    expect(
-      isLatestTurnSettled(latestTurn, {
-        status: "waiting",
-        activeTurnId: TurnId.make("turn-1"),
-      }),
-    ).toBe(false);
-  });
-
   it("returns false when turn timestamps are incomplete", () => {
     expect(
       isLatestTurnSettled(
@@ -1979,55 +1653,6 @@ describe("isLatestTurnSettled", () => {
         },
         null,
       ),
-    ).toBe(false);
-  });
-});
-
-describe("isThreadReadyForQueuedTurn", () => {
-  const latestTurn = {
-    turnId: TurnId.make("turn-1"),
-    startedAt: "2026-02-27T21:10:00.000Z",
-    completedAt: "2026-02-27T21:10:06.000Z",
-  } as const;
-
-  it("allows queued sends to drain on empty idle threads", () => {
-    expect(isThreadReadyForQueuedTurn(null, null)).toBe(true);
-    expect(
-      isThreadReadyForQueuedTurn(null, {
-        status: "ready",
-        activeTurnId: null,
-      }),
-    ).toBe(true);
-  });
-
-  it("blocks queued sends while a session is active even without a latest turn", () => {
-    expect(
-      isThreadReadyForQueuedTurn(null, {
-        status: "running",
-        activeTurnId: TurnId.make("turn-1"),
-      }),
-    ).toBe(false);
-    expect(
-      isThreadReadyForQueuedTurn(null, {
-        status: "starting",
-        activeTurnId: null,
-      }),
-    ).toBe(false);
-  });
-
-  it("uses settled latest-turn state when the thread has prior turns", () => {
-    expect(isThreadReadyForQueuedTurn(latestTurn, null)).toBe(true);
-    expect(
-      isThreadReadyForQueuedTurn(latestTurn, {
-        status: "running",
-        activeTurnId: TurnId.make("turn-2"),
-      }),
-    ).toBe(false);
-    expect(
-      isThreadReadyForQueuedTurn(latestTurn, {
-        status: "starting",
-        activeTurnId: null,
-      }),
     ).toBe(false);
   });
 });
@@ -2091,17 +1716,216 @@ describe("deriveActiveWorkStartedAt", () => {
       ),
     ).toBe("2026-02-27T21:11:00.000Z");
   });
+});
 
-  it("uses sendStartedAt for parked waiting sessions without an active turn", () => {
-    expect(
-      deriveActiveWorkStartedAt(
-        latestTurn,
-        {
-          status: "waiting",
-          activeTurnId: null,
-        },
-        "2026-02-27T21:11:00.000Z",
-      ),
-    ).toBe("2026-02-27T21:11:00.000Z");
+describe("deriveWorkLogEntries quiet-timeline guarantee", () => {
+  it("N concurrent subagents produce exactly N lifecycle rows, zero attributed tool rows", () => {
+    const activities: OrchestrationThreadActivity[] = [];
+    for (let agent = 0; agent < 5; agent += 1) {
+      const taskId = `task-${agent}`;
+      // Progress ticks (several per agent) + attributed tool rows.
+      for (let tick = 0; tick < 4; tick += 1) {
+        activities.push(
+          makeActivity({
+            kind: "task.progress",
+            summary: `agent ${agent} tick ${tick}`,
+            tone: "info",
+            payload: { taskId, summary: `working ${tick}`, role: "explorer" },
+            turnId: "turn-batch",
+            sequence: agent * 20 + tick,
+          }),
+        );
+        activities.push(
+          makeActivity({
+            kind: "tool.completed",
+            summary: "Read",
+            payload: { itemType: "dynamic_tool_call", agentId: taskId },
+            sequence: agent * 20 + 10 + tick,
+          }),
+        );
+      }
+      activities.push(
+        makeActivity({
+          kind: "task.completed",
+          summary: "Task completed",
+          tone: "info",
+          payload: {
+            taskId,
+            status: "completed",
+            summary: `agent ${agent} done`,
+            role: "explorer",
+          },
+          turnId: "turn-batch",
+          sequence: agent * 20 + 19,
+        }),
+      );
+    }
+
+    const entries = deriveWorkLogEntries(activities);
+    // A1 CTA design: all direct spawns in one turn collapse into ONE
+    // call-to-action row carrying the batch's agent ids.
+    const spawnRows = entries.filter((entry) => entry.agentSpawn !== undefined);
+    expect(spawnRows).toHaveLength(1);
+    expect(spawnRows[0]!.agentSpawn!.agentTaskIds).toHaveLength(5);
+    expect(spawnRows[0]!.agentSpawn!.workflowId).toBeNull();
+    // No agent-attributed tool rows leak into the main log.
+    expect(entries.some((entry) => entry.sourceActivityKind?.startsWith("tool."))).toBe(false);
+  });
+
+  it("a workflow run and its members collapse into one CTA row keyed to the coordinator", () => {
+    const entries = deriveWorkLogEntries([
+      makeActivity({
+        kind: "task.progress",
+        summary: "coordinator",
+        tone: "info",
+        payload: { taskId: "wf-1", taskType: "local_workflow", workflowName: "math-check" },
+        sequence: 1,
+      }),
+      makeActivity({
+        kind: "task.progress",
+        summary: "member",
+        tone: "info",
+        payload: { taskId: "wf-1:wf:0", status: "running", parentAgentId: "wf-1" },
+        sequence: 2,
+      }),
+      makeActivity({
+        kind: "task.completed",
+        summary: "member done",
+        tone: "info",
+        payload: { taskId: "wf-1:wf:1", status: "completed", parentAgentId: "wf-1" },
+        sequence: 3,
+      }),
+    ]);
+    const spawnRows = entries.filter((entry) => entry.agentSpawn !== undefined);
+    expect(spawnRows).toHaveLength(1);
+    expect(spawnRows[0]!.agentSpawn!.workflowId).toBe("wf-1");
+    expect(spawnRows[0]!.agentSpawn!.agentTaskIds).toEqual(
+      expect.arrayContaining(["wf-1", "wf-1:wf:0", "wf-1:wf:1"]),
+    );
+  });
+
+  it("keeps unattributed tool rows (over-hiding loses the only signal)", () => {
+    const entries = deriveWorkLogEntries([
+      makeActivity({
+        kind: "tool.completed",
+        summary: "Bash",
+        payload: { itemType: "command_execution", command: "ls" },
+      }),
+    ]);
+    expect(entries).toHaveLength(1);
+  });
+
+  it("folds timelineBypass agent rows into one CTA (Codex children, workflow members)", () => {
+    // Codex children carry their parent's spawn turn (spawnTurnId stamping),
+    // which is what batches a fleet into one CTA.
+    const entries = deriveWorkLogEntries([
+      makeActivity({
+        kind: "task.progress",
+        summary: "child work",
+        tone: "info",
+        payload: { taskId: "child-1", timelineBypass: true },
+        turnId: "turn-spawn",
+      }),
+      makeActivity({
+        kind: "task.progress",
+        summary: "child work again",
+        tone: "info",
+        payload: { taskId: "child-2", timelineBypass: true },
+        turnId: "turn-spawn",
+      }),
+    ]);
+    // Not suppressed outright (a Codex fleet's rows are ALL bypassed and
+    // still need a CTA anchor) — but never more than the batch's single row.
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.agentSpawn?.agentTaskIds).toEqual(["child-1", "child-2"]);
+  });
+
+  it("timelineBypass non-agent rows (background shells) stay suppressed", () => {
+    const entries = deriveWorkLogEntries([
+      makeActivity({
+        kind: "task.progress",
+        summary: "stall",
+        tone: "info",
+        payload: { taskId: "sh-1", taskType: "local_bash", timelineBypass: true },
+      }),
+    ]);
+    expect(entries).toHaveLength(0);
+  });
+
+  it("drops task.updated and tool.progress from the work log (fold input only)", () => {
+    const entries = deriveWorkLogEntries([
+      makeActivity({
+        kind: "task.updated",
+        summary: "Task running",
+        tone: "info",
+        payload: { taskId: "task-1", status: "running" },
+      }),
+      makeActivity({
+        kind: "tool.progress",
+        summary: "Read",
+        tone: "info",
+        payload: { taskId: "task-1", toolName: "Read" },
+      }),
+    ]);
+    expect(entries).toHaveLength(0);
+  });
+});
+
+describe("rerun workflows", () => {
+  it("turn-less direct spawns do not collapse into one global batch", () => {
+    // Rows that lost their turn id (defensive path) group per task, so two
+    // unrelated turn-less spawns never merge into one immortal CTA.
+    const entries = deriveWorkLogEntries([
+      makeActivity({
+        kind: "task.started",
+        summary: "Task started",
+        payload: { taskId: "loose-1", taskType: "local_agent", role: "a" },
+        sequence: 1,
+      }),
+      makeActivity({
+        kind: "task.started",
+        summary: "Task started",
+        payload: { taskId: "loose-2", taskType: "local_agent", role: "b" },
+        sequence: 2,
+      }),
+    ]);
+    const spawnRows = entries.filter((entry) => entry.agentSpawn !== undefined);
+    expect(spawnRows).toHaveLength(2);
+    expect(spawnRows.map((row) => row.agentSpawn!.agentTaskIds)).toEqual([
+      ["loose-1"],
+      ["loose-2"],
+    ]);
+  });
+
+  it("each workflow run gets its own CTA row (distinct coordinator ids)", () => {
+    const entries = deriveWorkLogEntries([
+      makeActivity({
+        kind: "task.progress",
+        summary: "run 1",
+        tone: "info",
+        payload: { taskId: "wf-run1", taskType: "local_workflow", workflowName: "math-check" },
+        turnId: "turn-1",
+        sequence: 1,
+      }),
+      makeActivity({
+        kind: "task.completed",
+        summary: "run 1 done",
+        tone: "info",
+        payload: { taskId: "wf-run1", status: "completed", taskType: "local_workflow" },
+        turnId: "turn-1",
+        sequence: 2,
+      }),
+      makeActivity({
+        kind: "task.progress",
+        summary: "run 2",
+        tone: "info",
+        payload: { taskId: "wf-run2", taskType: "local_workflow", workflowName: "math-check" },
+        turnId: "turn-2",
+        sequence: 3,
+      }),
+    ]);
+    const spawnRows = entries.filter((entry) => entry.agentSpawn !== undefined);
+    expect(spawnRows.map((row) => row.agentSpawn!.workflowId)).toEqual(["wf-run1", "wf-run2"]);
+    expect(spawnRows.map((row) => row.turnId)).toEqual(["turn-1", "turn-2"]);
   });
 });

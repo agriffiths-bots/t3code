@@ -6,12 +6,13 @@ import {
   OrchestrationDispatchCommandError,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
-import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
-import * as Schema from "effect/Schema";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
+import * as Schema from "effect/Schema";
 
+import { projectThreadDetailSnapshot } from "./ActivityPayloadProjection.ts";
 import {
   cleanupPersistedCommandAttachments,
   normalizeAuthorizedDispatchCommand,
@@ -39,11 +40,6 @@ import {
   OrchestrationCommandPreviouslyRejectedError,
 } from "./Errors.ts";
 
-const isClientCommandDispatchError = (cause: unknown) =>
-  isOrchestrationCommandInvariantError(cause) ||
-  isOrchestrationCommandAudienceAuthorizationError(cause) ||
-  isOrchestrationCommandPreviouslyRejectedError(cause);
-
 const isOrchestrationDispatchCommandError = Schema.is(OrchestrationDispatchCommandError);
 const isOrchestrationCommandInvariantError = Schema.is(OrchestrationCommandInvariantError);
 const isOrchestrationCommandAudienceAuthorizationError = Schema.is(
@@ -52,6 +48,10 @@ const isOrchestrationCommandAudienceAuthorizationError = Schema.is(
 const isOrchestrationCommandPreviouslyRejectedError = Schema.is(
   OrchestrationCommandPreviouslyRejectedError,
 );
+const isClientCommandDispatchError = (cause: unknown) =>
+  isOrchestrationCommandInvariantError(cause) ||
+  isOrchestrationCommandAudienceAuthorizationError(cause) ||
+  isOrchestrationCommandPreviouslyRejectedError(cause);
 const isProjectAudienceAdministrationError = Schema.is(ProjectAudienceAdministrationError);
 
 export const orchestrationHttpApiLayer = HttpApiBuilder.group(
@@ -68,8 +68,13 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
         Effect.fn("environment.orchestration.snapshot")(function* (args) {
           yield* annotateEnvironmentRequest(args.endpoint.name);
           yield* requireEnvironmentScope(AuthOrchestrationReadScope);
+          // Serve the lightweight command read model (thread bodies empty)
+          // instead of the fully hydrated snapshot. Hydrating every message
+          // and activity payload in the database has OOM-killed servers, and
+          // the route's only consumer (the project CLI) reads projects alone —
+          // UI clients load the shell and per-thread snapshots instead.
           return yield* projectionSnapshotQuery
-            .getSnapshot()
+            .getCommandReadModel()
             .pipe(
               Effect.catch((cause) =>
                 failEnvironmentInternal("orchestration_snapshot_failed", cause),
@@ -97,7 +102,17 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
           yield* annotateEnvironmentRequest(args.endpoint.name);
           yield* requireEnvironmentScope(AuthOrchestrationReadScope);
           const [snapshot, latestRevision] = yield* Effect.all([
-            projectionSnapshotQuery.getThreadDetailSnapshot(args.params.threadId),
+            projectionSnapshotQuery.getThreadDetailSnapshot(
+              args.params.threadId,
+              args.payload.turnLimit === undefined
+                ? undefined
+                : {
+                    turnLimit: args.payload.turnLimit,
+                    ...(args.payload.beforeCursor !== undefined
+                      ? { beforeCursor: args.payload.beforeCursor }
+                      : {}),
+                  },
+            ),
             orchestrationEventStore.getLatestThreadRevision(args.params.threadId),
           ]).pipe(
             Effect.catch((cause) =>
@@ -107,11 +122,11 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
           if (Option.isNone(snapshot)) {
             return yield* failEnvironmentNotFound("thread_not_found");
           }
-          return {
+          return projectThreadDetailSnapshot({
             ...snapshot.value,
             storageEpoch: orchestrationEventStore.storageEpoch,
             ...coveredThreadRevision(snapshot.value.snapshotSequence, latestRevision),
-          };
+          });
         }),
       )
       .handle(

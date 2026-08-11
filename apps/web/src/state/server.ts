@@ -7,10 +7,7 @@ import {
   type ServerProvider,
   type ServerSettings,
 } from "@t3tools/contracts";
-import {
-  createServerEnvironmentAtoms,
-  SERVER_CONFIG_SUBSCRIPTION_INPUT,
-} from "@t3tools/client-runtime/state/server";
+import { createServerEnvironmentAtoms } from "@t3tools/client-runtime/state/server";
 import { createEnvironmentServerConfigsAtom } from "@t3tools/client-runtime/state/shell";
 import { DEFAULT_RESOLVED_KEYBINDINGS } from "@t3tools/shared/keybindings";
 import * as Option from "effect/Option";
@@ -36,7 +33,7 @@ interface PrimaryServerState {
 }
 
 const EMPTY_AVAILABLE_EDITORS: ReadonlyArray<EditorId> = [];
-const EMPTY_SERVER_PROVIDERS: ReadonlyArray<ServerProvider> = [];
+export const EMPTY_SERVER_PROVIDERS: ReadonlyArray<ServerProvider> = [];
 const EMPTY_PRIMARY_SERVER_STATE: PrimaryServerState = {
   config: null,
   latestEvent: null,
@@ -49,15 +46,11 @@ export const primaryServerStateAtom = Atom.make((get): PrimaryServerState => {
     return EMPTY_PRIMARY_SERVER_STATE;
   }
 
-  // Must match the input used by `configValueAtom` in client-runtime so both
-  // consumers share a single `subscribeServerConfig` stream per environment.
-  const configTarget = { environmentId, input: SERVER_CONFIG_SUBSCRIPTION_INPUT };
+  const target = { environmentId, input: {} };
   const configProjection = Option.getOrNull(
-    AsyncResult.value(get(serverEnvironment.configProjection(configTarget))),
+    AsyncResult.value(get(serverEnvironment.configProjection(target))),
   );
-  const welcome = Option.getOrNull(
-    AsyncResult.value(get(serverEnvironment.welcome({ environmentId, input: {} }))),
-  );
+  const welcome = Option.getOrNull(AsyncResult.value(get(serverEnvironment.welcome(target))));
 
   return {
     config: get(serverEnvironment.configValueAtom(environmentId)),

@@ -2,7 +2,7 @@ import { NodeHttpServer } from "@effect/platform-node";
 import { expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
-import { McpServer } from "effect/unstable/ai";
+import { McpProtocol, McpServer } from "effect/unstable/ai";
 import { HttpBody, HttpClient, HttpRouter, HttpServerResponse } from "effect/unstable/http";
 
 import * as McpHttpServer from "./McpHttpServer.ts";
@@ -30,14 +30,12 @@ it("returns a non-OAuth recovery hint when MCP bearer auth fails", () => {
 it.effect("answers GET /mcp with 405 so it cannot fall through to the SPA fallback", () =>
   Effect.scoped(
     Effect.gen(function* () {
-      const serverLayer = Layer.mergeAll(
-        McpServer.layerHttp({
-          name: "MCP GET test",
-          version: "1.0.0",
-          path: "/mcp",
-        }),
-        McpHttpServer.McpGetMethodNotAllowedLive,
-      );
+      const serverLayer = McpServer.layerHttp({
+        name: "MCP GET test",
+        version: "1.0.0",
+        path: "/mcp",
+        protocols: [McpProtocol.v2025_06_18],
+      });
       yield* HttpRouter.serve(serverLayer, {
         disableListenLog: true,
         disableLogger: true,
@@ -60,6 +58,7 @@ it.effect("terminates HTTP MCP sessions with DELETE", () =>
         name: "MCP termination test",
         version: "1.0.0",
         path: "/mcp",
+        protocols: [McpProtocol.v2025_06_18],
       });
       yield* HttpRouter.serve(serverLayer, {
         disableListenLog: true,

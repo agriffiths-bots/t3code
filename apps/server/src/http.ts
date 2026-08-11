@@ -9,6 +9,7 @@ import {
   ServerNotificationAckAction,
   ServerNotificationRecoveryInput,
 } from "@t3tools/contracts";
+import { isDevProxiedPath } from "@t3tools/shared/devProxy";
 import { decodeOtlpTraceRecords } from "@t3tools/shared/observability";
 import * as Data from "effect/Data";
 import * as Clock from "effect/Clock";
@@ -27,6 +28,7 @@ import {
   HttpClientRequest,
   HttpClientResponse,
   FetchHttpClient,
+  HttpMiddleware,
   HttpRouter,
   HttpServerResponse,
   HttpServerRequest,
@@ -93,6 +95,12 @@ const BROWSER_API_CORS_MAX_AGE_SECONDS = 600;
 
 function browserApiCredentialedCorsOrigins(config: ServerConfig.ServerConfig["Service"]) {
   const origins = new Set<string>(configuredBrowserCookieCredentialOrigins(config));
+  for (const configuredOrigin of config.devAllowedOrigins) {
+    const normalizedOrigin = normalizeCorsOrigin(configuredOrigin);
+    if (normalizedOrigin !== null) {
+      origins.add(normalizedOrigin);
+    }
+  }
   const devOrigin = config.devUrl?.origin;
   if (devOrigin) {
     origins.add(devOrigin);
@@ -122,6 +130,9 @@ function browserApiCorsHeaders(input: {
       : {}),
   };
 }
+export const httpCompressionLayer = HttpRouter.middleware(HttpMiddleware.compression(), {
+  global: true,
+});
 
 export const browserApiCorsLayer = Layer.unwrap(
   Effect.gen(function* () {
@@ -948,6 +959,10 @@ export const staticAndDevRouteLayer = HttpRouter.add(
     }
 
     const config = yield* ServerConfig.ServerConfig;
+    if (config.devUrl && isDevProxiedPath(url.value.pathname)) {
+      return HttpServerResponse.text("Not Found", { status: 404 });
+    }
+
     if (config.devUrl && isLoopbackHostname(url.value.hostname)) {
       return HttpServerResponse.redirect(resolveDevRedirectUrl(config.devUrl, url.value), {
         status: 302,

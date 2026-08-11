@@ -1,5 +1,4 @@
 import * as Crypto from "effect/Crypto";
-import * as Effect from "effect/Effect";
 import { Atom } from "effect/unstable/reactivity";
 
 import { createAtomCommandScheduler, createEnvironmentCommand } from "./runtime.ts";
@@ -13,11 +12,16 @@ import {
   type RevertThreadCheckpointInput,
   type SetThreadInteractionModeInput,
   type SetThreadRuntimeModeInput,
+  type PinThreadInput,
+  type ReorderPinnedThreadInput,
   type SettleThreadInput,
+  type SnoozeThreadInput,
   type StartThreadTurnInput,
   type StopThreadSessionInput,
   type UnarchiveThreadInput,
+  type UnpinThreadInput,
   type UnsettleThreadInput,
+  type UnsnoozeThreadInput,
   type UpdateThreadMetadataInput,
   archiveThread,
   createThread,
@@ -28,16 +32,19 @@ import {
   revertThreadCheckpoint,
   setThreadInteractionMode,
   setThreadRuntimeMode,
+  pinThread,
+  reorderPinnedThread,
   settleThread,
+  snoozeThread,
   startThreadTurn,
   stopThreadSession,
   unarchiveThread,
+  unpinThread,
   unsettleThread,
+  unsnoozeThread,
   updateThreadMetadata,
 } from "../operations/commands.ts";
 import type { EnvironmentRegistry } from "../connection/registry.ts";
-import { EnvironmentSupervisor } from "../connection/supervisor.ts";
-import { ThreadReconciliationActivity } from "./threadReconciliationActivity.ts";
 
 export type {
   ArchiveThreadInput,
@@ -49,35 +56,21 @@ export type {
   RevertThreadCheckpointInput,
   SetThreadInteractionModeInput,
   SetThreadRuntimeModeInput,
+  PinThreadInput,
+  ReorderPinnedThreadInput,
   SettleThreadInput,
+  SnoozeThreadInput,
   StartThreadTurnInput,
   StopThreadSessionInput,
   UnarchiveThreadInput,
+  UnpinThreadInput,
   UnsettleThreadInput,
+  UnsnoozeThreadInput,
   UpdateThreadMetadataInput,
 } from "../operations/commands.ts";
 
-export const startThreadTurnWithReconciliation = Effect.fn(
-  "EnvironmentThreadCommands.startTurnWithReconciliation",
-)(function* (input: StartThreadTurnInput) {
-  const supervisor = yield* EnvironmentSupervisor;
-  const activity = yield* ThreadReconciliationActivity;
-  // Publish the local intent before dispatch. If the server accepts the turn
-  // but the response is lost, reconciliation must already be awake to detect
-  // the persisted revision even when the matching live event is also missed.
-  yield* activity.publish({
-    environmentId: supervisor.target.environmentId,
-    threadId: input.threadId,
-    reason: "locally-initiated-turn",
-  });
-  return yield* startThreadTurn(input);
-});
-
 export function createThreadEnvironmentAtoms<R, E>(
-  runtime: Atom.AtomRuntime<
-    EnvironmentRegistry | Crypto.Crypto | ThreadReconciliationActivity | R,
-    E
-  >,
+  runtime: Atom.AtomRuntime<EnvironmentRegistry | Crypto.Crypto | R, E>,
 ) {
   const scheduler = createAtomCommandScheduler();
   const concurrency = {
@@ -122,6 +115,36 @@ export function createThreadEnvironmentAtoms<R, E>(
       scheduler,
       concurrency,
     }),
+    snooze: createEnvironmentCommand(runtime, {
+      label: "environment-data:commands:thread:snooze",
+      execute: (input: SnoozeThreadInput) => snoozeThread(input),
+      scheduler,
+      concurrency,
+    }),
+    unsnooze: createEnvironmentCommand(runtime, {
+      label: "environment-data:commands:thread:unsnooze",
+      execute: (input: UnsnoozeThreadInput) => unsnoozeThread(input),
+      scheduler,
+      concurrency,
+    }),
+    pin: createEnvironmentCommand(runtime, {
+      label: "environment-data:commands:thread:pin",
+      execute: (input: PinThreadInput) => pinThread(input),
+      scheduler,
+      concurrency,
+    }),
+    unpin: createEnvironmentCommand(runtime, {
+      label: "environment-data:commands:thread:unpin",
+      execute: (input: UnpinThreadInput) => unpinThread(input),
+      scheduler,
+      concurrency,
+    }),
+    reorderPin: createEnvironmentCommand(runtime, {
+      label: "environment-data:commands:thread:reorder-pin",
+      execute: (input: ReorderPinnedThreadInput) => reorderPinnedThread(input),
+      scheduler,
+      concurrency,
+    }),
     updateMetadata: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:update-metadata",
       execute: (input: UpdateThreadMetadataInput) => updateThreadMetadata(input),
@@ -142,7 +165,7 @@ export function createThreadEnvironmentAtoms<R, E>(
     }),
     startTurn: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:start-turn",
-      execute: startThreadTurnWithReconciliation,
+      execute: (input: StartThreadTurnInput) => startThreadTurn(input),
       scheduler,
       concurrency,
     }),

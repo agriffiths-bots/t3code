@@ -61,6 +61,7 @@ class FakeClaudeQuery implements AsyncIterable<SDKMessage> {
   private failure: unknown | undefined;
 
   public readonly interruptCalls: Array<void> = [];
+  public readonly stopTaskCalls: Array<string> = [];
   public readonly setModelCalls: Array<string | undefined> = [];
   public readonly setPermissionModeCalls: Array<string> = [];
   public readonly setMaxThinkingTokensCalls: Array<number | null> = [];
@@ -102,6 +103,10 @@ class FakeClaudeQuery implements AsyncIterable<SDKMessage> {
 
   readonly interrupt = async (): Promise<void> => {
     this.interruptCalls.push(undefined);
+  };
+
+  readonly stopTask = async (taskId: string): Promise<void> => {
+    this.stopTaskCalls.push(taskId);
   };
 
   readonly setModel = async (model?: string): Promise<void> => {
@@ -363,6 +368,25 @@ describe("ClaudeAdapterLive", () => {
       assert.deepEqual(createInput?.options.settingSources, ["user", "project", "local"]);
       assert.equal(createInput?.options.permissionMode, "bypassPermissions");
       assert.equal(createInput?.options.allowDangerouslySkipPermissions, true);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("derives auto permission mode from auto runtime policy without skip flag", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "auto",
+      });
+
+      const createInput = harness.getLastCreateQueryInput();
+      assert.equal(createInput?.options.permissionMode, "auto");
+      assert.equal(createInput?.options.allowDangerouslySkipPermissions, undefined);
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),
@@ -1159,6 +1183,75 @@ describe("ClaudeAdapterLive", () => {
       if (turnCompleted?.type === "turn.completed") {
         assert.equal(String(turnCompleted.turnId), String(turn.turnId));
         assert.equal(turnCompleted.payload.state, "completed");
+      }
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("does not emit turn.completed for a result with no active turn", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+
+      // Collect through session.exited so the window after the second result
+      // is deterministically inside the collection: both results are queued
+      // after sendTurn returns and drain in order on the one stream consumer.
+      const runtimeEventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.takeUntil((event) => event.type === "session.exited"),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      const turn = yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "hello",
+        attachments: [],
+      });
+
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        errors: [],
+        num_turns: 1,
+        session_id: "sdk-session-1",
+        uuid: "result-real",
+      } as unknown as SDKMessage);
+
+      // Second result with no turn in flight — the shape the resume
+      // handshake (system/init + result(num_turns: 0)) delivers, and the
+      // same completeTurn branch every no-turnState result lands in. This
+      // used to emit an untargeted turn.completed; it must emit nothing.
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        errors: [],
+        num_turns: 0,
+        usage: { input_tokens: 0, output_tokens: 0 },
+        session_id: "sdk-session-1",
+        uuid: "result-handshake",
+      } as unknown as SDKMessage);
+
+      harness.query.finish();
+
+      const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
+      const completions = runtimeEvents.filter((event) => event.type === "turn.completed");
+      // Exactly one completion — the real turn's, targeted at its turn id.
+      // The buggy branch produced a second, untargeted one here.
+      assert.equal(completions.length, 1);
+      const completed = completions[0];
+      if (completed?.type === "turn.completed") {
+        assert.equal(String(completed.turnId), String(turn.turnId));
+        assert.equal(completed.payload.state, "completed");
       }
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
@@ -4582,6 +4675,151 @@ describe("ClaudeAdapterLive", () => {
         );
         assert.equal(progressEvent.payload.description, "Running background teammate");
       }
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("consumes undeclared and UX-internal system subtypes without warning rows", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => runtimeEvents.push(event)),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      // Undeclared wire-only roster snapshot + every typed UX-internal
+      // subtype and top-level type consumed silently: none may surface as
+      // unknown-subtype warnings.
+      for (const message of [
+        {
+          type: "system",
+          subtype: "background_tasks_changed",
+          tasks: [{ task_id: "t1", task_type: "local_agent", description: "Say hi" }],
+          session_id: "session",
+          uuid: "roster",
+        },
+        {
+          type: "system",
+          subtype: "vcs_state_changed",
+          kind: "push",
+          cwd: "/tmp/worktree",
+          session_id: "session",
+          uuid: "vcs",
+        },
+        {
+          type: "system",
+          subtype: "code_change_published",
+          provider: "github",
+          url: "https://github.com/pingdotgg/t3code/pull/1",
+          repo: "pingdotgg/t3code",
+          identifier: "1",
+          session_id: "session",
+          uuid: "ccp",
+        },
+        {
+          type: "system",
+          subtype: "task_updated",
+          task_id: "t1",
+          patch: { status: "running" },
+          session_id: "session",
+          uuid: "tu",
+        },
+        { type: "system", subtype: "commands_changed", session_id: "session", uuid: "cc" },
+        { type: "system", subtype: "model_refusal_fallback", session_id: "session", uuid: "mrf" },
+        { type: "system", subtype: "local_command_output", session_id: "session", uuid: "lco" },
+        { type: "system", subtype: "plugin_install", session_id: "session", uuid: "pi" },
+        { type: "system", subtype: "memory_recall", session_id: "session", uuid: "mr" },
+        { type: "system", subtype: "elicitation_complete", session_id: "session", uuid: "ec" },
+        { type: "prompt_suggestion", suggestion: "try this", session_id: "session", uuid: "ps" },
+        {
+          type: "system",
+          subtype: "notification",
+          key: "context",
+          text: "low priority note",
+          priority: "low",
+          session_id: "session",
+          uuid: "notif",
+        },
+      ]) {
+        harness.query.emit(message as unknown as SDKMessage);
+      }
+      // High-priority notifications DO surface as a warning row.
+      harness.query.emit({
+        type: "system",
+        subtype: "notification",
+        key: "limit",
+        text: "context window nearly full",
+        priority: "high",
+        session_id: "session",
+        uuid: "notif-high",
+      } as unknown as SDKMessage);
+      // session_state_changed maps to the matching session states.
+      for (const [state, uuid] of [
+        ["running", "ssc-run"],
+        ["requires_action", "ssc-req"],
+        ["idle", "ssc-idle"],
+      ]) {
+        harness.query.emit({
+          type: "system",
+          subtype: "session_state_changed",
+          state,
+          session_id: "session",
+          uuid,
+        } as unknown as SDKMessage);
+      }
+      // api_retry maps to a session heartbeat, not a warning row.
+      harness.query.emit({
+        type: "system",
+        subtype: "api_retry",
+        attempt: 3,
+        max_retries: 10,
+        retry_delay_ms: 1000,
+        error_status: 502,
+        error: { type: "api_error" },
+        session_id: "session",
+        uuid: "retry",
+      } as unknown as SDKMessage);
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+
+      const warnings = runtimeEvents.filter((event) => event.type === "runtime.warning");
+      // Exactly one warning: the high-priority notification. Nothing else.
+      assert.deepEqual(
+        warnings.map((event) => event.payload.message),
+        ["context window nearly full"],
+      );
+      const sessionStates = runtimeEvents
+        .filter((event) => event.type === "session.state.changed")
+        .map((event) =>
+          event.type === "session.state.changed"
+            ? `${event.payload.state}:${event.payload.reason ?? ""}`
+            : "",
+        )
+        .filter(
+          (entry) => entry.startsWith("running:session_state") || entry.includes("session_state"),
+        );
+      assert.deepEqual(sessionStates, [
+        "running:session_state:running",
+        "waiting:session_state:requires_action",
+        "ready:session_state:idle",
+      ]);
+      const heartbeat = runtimeEvents.find(
+        (event) =>
+          event.type === "session.state.changed" &&
+          typeof event.payload.reason === "string" &&
+          event.payload.reason.startsWith("api_retry:"),
+      );
+      assert.equal(heartbeat?.type, "session.state.changed");
+      runtimeEventsFiber.interruptUnsafe();
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),

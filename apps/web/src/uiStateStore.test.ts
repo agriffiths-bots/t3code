@@ -11,11 +11,9 @@ import {
   persistState,
   reorderProjects,
   resolveProjectExpanded,
-  resolveThreadTreeExpanded,
   setDefaultAdvertisedEndpointKey,
   setProjectExpanded,
   setThreadChangedFilesExpanded,
-  setThreadTreeExpanded,
   type UiState,
 } from "./uiStateStore";
 
@@ -24,7 +22,6 @@ function makeUiState(overrides: Partial<UiState> = {}): UiState {
     projectExpandedById: {},
     projectOrder: [],
     threadLastVisitedAtById: {},
-    threadTreeExpandedById: {},
     threadChangedFilesExpandedById: {},
     defaultAdvertisedEndpointKey: null,
     ...overrides,
@@ -119,7 +116,7 @@ describe("uiStateStore pure functions", () => {
     );
   });
 
-  it("stores only collapsed changed-file turns", () => {
+  it("stores explicit changed-file expansion choices", () => {
     const threadId = ThreadId.make("thread-1");
     const collapsed = setThreadChangedFilesExpanded(makeUiState(), threadId, "turn-1", false);
 
@@ -131,26 +128,11 @@ describe("uiStateStore pure functions", () => {
     expect(
       setThreadChangedFilesExpanded(collapsed, threadId, "turn-1", true)
         .threadChangedFilesExpandedById,
-    ).toEqual({});
-  });
-
-  it("persists parent thread tree expansion with expanded as the default", () => {
-    const threadId = ThreadId.make("parent-thread");
-    const initialState = makeUiState();
-
-    expect(resolveThreadTreeExpanded(initialState.threadTreeExpandedById, threadId)).toBe(true);
-
-    const collapsed = setThreadTreeExpanded(initialState, threadId, false);
-
-    expect(resolveThreadTreeExpanded(collapsed.threadTreeExpandedById, threadId)).toBe(false);
-    expect(setThreadTreeExpanded(collapsed, threadId, false)).toBe(collapsed);
-    expect(
-      resolveThreadTreeExpanded(collapsed.threadTreeExpandedById, ThreadId.make("other")),
-    ).toBe(true);
-
-    const expanded = setThreadTreeExpanded(collapsed, threadId, true);
-
-    expect(resolveThreadTreeExpanded(expanded.threadTreeExpandedById, threadId)).toBe(true);
+    ).toEqual({
+      [threadId]: {
+        "turn-1": true,
+      },
+    });
   });
 
   it("stores the endpoint preference by stable key", () => {
@@ -176,12 +158,8 @@ describe("parsePersistedState", () => {
         "environment:thread-1": "2026-02-25T12:35:00.000Z",
         invalid: "not-a-date",
       },
-      threadTreeExpandedById: {
-        "environment:thread-1": false,
-        "environment:thread-2": true,
-        invalid: "no" as unknown as boolean,
-      },
       defaultAdvertisedEndpointKey: "desktop-core:lan:http",
+      threadChangedFilesExpansionVersion: 1,
       threadChangedFilesExpandedById: {
         "environment:thread-1": {
           "turn-1": false,
@@ -198,17 +176,26 @@ describe("parsePersistedState", () => {
       threadLastVisitedAtById: {
         "environment:thread-1": "2026-02-25T12:35:00.000Z",
       },
-      threadTreeExpandedById: {
-        "environment:thread-1": false,
-        "environment:thread-2": true,
-      },
       defaultAdvertisedEndpointKey: "desktop-core:lan:http",
+      threadChangedFilesExpandedById: {
+        "environment:thread-1": {
+          "turn-1": false,
+          "turn-2": true,
+        },
+      },
+    });
+  });
+
+  it("ignores changed-file expansion values saved with legacy folder semantics", () => {
+    const parsed = parsePersistedState({
       threadChangedFilesExpandedById: {
         "environment:thread-1": {
           "turn-1": false,
         },
       },
     });
+
+    expect(parsed.threadChangedFilesExpandedById).toEqual({});
   });
 
   it("migrates legacy CWD project preferences into local alias keys", () => {
@@ -286,9 +273,6 @@ describe("uiStateStore persistence", () => {
       threadLastVisitedAtById: {
         "environment:thread-1": "2026-02-25T12:35:00.000Z",
       },
-      threadTreeExpandedById: {
-        "environment:thread-1": false,
-      },
       threadChangedFilesExpandedById: {
         "environment:thread-1": {
           "turn-1": false,
@@ -311,23 +295,17 @@ describe("uiStateStore persistence", () => {
       threadLastVisitedAtById: {
         "environment:thread-1": "2026-02-25T12:35:00.000Z",
       },
-      threadTreeExpandedById: {
-        "environment:thread-1": false,
-      },
       defaultAdvertisedEndpointKey: "desktop-core:lan:http",
+      threadChangedFilesExpansionVersion: 1,
       threadChangedFilesExpandedById: {
         "environment:thread-1": {
           "turn-1": false,
+          "turn-2": true,
         },
       },
     });
     expect(parsePersistedState(persisted)).toEqual({
       ...state,
-      threadChangedFilesExpandedById: {
-        "environment:thread-1": {
-          "turn-1": false,
-        },
-      },
     });
   });
 

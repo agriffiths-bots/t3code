@@ -140,6 +140,7 @@ const entitledPeerInvocation: McpInvocationContext.PeerMcpInvocationScope = {
 };
 const client = McpSchema.McpServerClient.of({
   clientId: 1,
+  protocolVersion: "2025-06-18",
   initializePayload: {
     protocolVersion: "2025-03-26",
     capabilities: {},
@@ -549,6 +550,7 @@ const makeScheduleThreadShell = (threadId: ThreadId, dataAudience: "factory" | "
 const projectionLayer = Layer.succeed(ProjectionSnapshotQuery, {
   getCommandReadModel: () => unsupported(),
   getSnapshot: () => unsupported(),
+  searchThreads: () => unsupported(),
   getShellSnapshot: () =>
     Effect.succeed({
       snapshotSequence: 1,
@@ -3368,7 +3370,7 @@ describe("SubagentToolkit", () => {
           }),
         ];
 
-        const result = yield* server
+        const error = yield* server
           .callTool({
             name: "t3_schedule_update",
             arguments: { taskId: scheduledTaskId, model: null },
@@ -3376,9 +3378,10 @@ describe("SubagentToolkit", () => {
           .pipe(
             Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
             Effect.provideService(McpSchema.McpServerClient, client),
+            Effect.flip,
           );
 
-        expect(result.isError).toBe(true);
+        expect(error._tag).toBe("InvalidParams");
         expect(updatedTasks).toHaveLength(0);
       }),
     ).pipe(Effect.provide(TestLayer)),

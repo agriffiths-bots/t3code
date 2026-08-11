@@ -199,14 +199,11 @@ describe("serializeRelayClientTracingEnvironment", () => {
   });
 });
 
-describe("artifact release workflows", () => {
-  it.effect("publish app artifacts without relay deployment", () =>
+describe("fork artifact release workflows", () => {
+  it.effect("publish fork app artifacts without relay deployment", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
-      const stableWorkflowPath = yield* path.fromFileUrl(
-        new URL("../../../.github/workflows/release.yml", import.meta.url),
-      );
       const mainWorkflowPath = yield* path.fromFileUrl(
         new URL("../../../.github/workflows/main-artifacts-release.yml", import.meta.url),
       );
@@ -219,40 +216,18 @@ describe("artifact release workflows", () => {
       const ciWorkflowPath = yield* path.fromFileUrl(
         new URL("../../../.github/workflows/ci.yml", import.meta.url),
       );
-      const stableWorkflow = yield* fileSystem.readFileString(stableWorkflowPath);
       const mainWorkflow = yield* fileSystem.readFileString(mainWorkflowPath);
       const reusableWorkflow = yield* fileSystem.readFileString(reusableWorkflowPath);
       const verifiedNightlyWorkflow = yield* fileSystem.readFileString(verifiedNightlyWorkflowPath);
       const ciWorkflow = yield* fileSystem.readFileString(ciWorkflowPath);
 
-      for (const workflow of [stableWorkflow, mainWorkflow]) {
-        expect(workflow).toContain(
-          "uses: ./.github/workflows/reusable-build-release-artifacts.yml",
-        );
-        expect(workflow).not.toContain("relay_public_config");
-        expect(workflow).not.toContain("client_tracing_token:");
-        expect(workflow).not.toContain("deploy-relay");
-      }
-
-      expect(stableWorkflow).toContain("name: Stable Artifact Release");
-      expect(stableWorkflow).toContain("needs: [metadata, preflight, public_config]");
-      expect(stableWorkflow).toContain("run: vp check");
-      expect(stableWorkflow).toContain("run: vp run typecheck");
-      expect(stableWorkflow).toContain("run: vp run test");
-      expect(stableWorkflow).toContain('relay_url="https://$relay_domain"');
-      expect(stableWorkflow).toContain("Mobile app builds are deprecated");
-      expect(stableWorkflow).not.toContain("android_required:");
-      expect(stableWorkflow).not.toContain("android_profile:");
-      expect(stableWorkflow).not.toContain("android_artifact_name:");
-      expect(stableWorkflow).not.toContain("android_mobile_version_policy:");
-      expect(stableWorkflow).not.toContain("android_app_version:");
-      expect(stableWorkflow).toContain(
-        "clerk_publishable_key: ${{ needs.public_config.outputs.clerk_publishable_key }}",
+      expect(mainWorkflow).toContain(
+        "uses: ./.github/workflows/reusable-build-release-artifacts.yml",
       );
-      expect(stableWorkflow).toContain("relay_url: ${{ needs.public_config.outputs.relay_url }}");
-      expect(stableWorkflow).toContain("prerelease: false");
-      expect(stableWorkflow).toContain("make_latest: true");
-      expect(stableWorkflow).toContain("windows_signing: true");
+      expect(mainWorkflow).not.toContain("relay_public_config");
+      expect(mainWorkflow).not.toContain("client_tracing_token:");
+      expect(mainWorkflow).not.toContain("deploy-relay");
+
       expect(mainWorkflow).toContain("name: Main Artifact Release");
       // Manual-only: landing on main must not auto-publish a release.
       expect(mainWorkflow).toContain("workflow_dispatch:");
@@ -378,9 +353,6 @@ describe("artifact release workflows", () => {
       expect(verifiedNightlyWorkflow).toContain('-f sha="$SOURCE_SHA"');
       expect(verifiedNightlyWorkflow).toContain("--verify-tag");
       expect(verifiedNightlyWorkflow).toContain("--latest");
-      expect(ciWorkflow).not.toContain("mobile_native_static_analysis:");
-      expect(ciWorkflow).not.toContain("brew bundle install --file apps/mobile/Brewfile");
-      expect(ciWorkflow).not.toContain("run: vp run lint:mobile");
       expect(ciWorkflow).not.toContain("Prebuild mobile Android config");
       expect(ciWorkflow).not.toContain(
         "pnpm exec expo prebuild --clean --platform android --no-install",

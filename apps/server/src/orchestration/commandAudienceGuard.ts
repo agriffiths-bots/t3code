@@ -1034,6 +1034,12 @@ export const authorizeOrchestrationCommandMutation = Effect.fn(
     case "thread.message.assistant.complete":
     case "thread.proposed-plan.upsert":
     case "thread.turn.diff.complete":
+    case "thread.snooze":
+    case "thread.unsnooze":
+    case "thread.pin":
+    case "thread.unpin":
+    case "thread.pin.reorder":
+    case "thread.title.regeneration.complete":
     case "thread.turn.effective-model.set":
     case "thread.activity.append":
     case "thread.revert.complete":

@@ -32,6 +32,8 @@ export interface PrStatusIndicator {
   label: string;
   colorClass: string;
   tooltip: string;
+  tooltipLead: string;
+  tooltipTitle: string;
   url: string;
 }
 
@@ -43,26 +45,51 @@ export interface TerminalStatusIndicator {
 
 export type ThreadPr = VcsStatusResult["pr"];
 
+export function settledPrHoverColorClass(state: NonNullable<ThreadPr>["state"]): string {
+  switch (state) {
+    case "open":
+      return "group-hover/v2-row:text-emerald-600 dark:group-hover/v2-row:text-emerald-300/90";
+    case "merged":
+      return "group-hover/v2-row:text-violet-600 dark:group-hover/v2-row:text-violet-300/90";
+    case "closed":
+      return "group-hover/v2-row:text-red-600 dark:group-hover/v2-row:text-red-300/90";
+  }
+}
+
 export function prStatusIndicator(
   pr: ThreadPr,
   provider: VcsStatusResult["sourceControlProvider"] | null | undefined,
 ): PrStatusIndicator | null {
+  function formatPrState(state: NonNullable<ThreadPr>["state"]): string {
+    return state.charAt(0).toUpperCase() + state.slice(1);
+  }
+
+  function formatPrStatusLead(pr: NonNullable<ThreadPr>, changeRequestShortName: string): string {
+    return `${changeRequestShortName} #${pr.number} - ${formatPrState(pr.state)}`;
+  }
   if (!pr) return null;
   const presentation = resolveChangeRequestPresentation(provider);
+
+  const tooltipLead = formatPrStatusLead(pr, presentation.shortName);
+  const tooltip = `${tooltipLead}: ${pr.title}`;
 
   if (pr.state === "open") {
     return {
       label: `${presentation.shortName} open`,
       colorClass: "text-emerald-600 dark:text-emerald-300/90",
-      tooltip: `#${pr.number} ${presentation.shortName} open: ${pr.title}`,
+      tooltip,
+      tooltipLead,
+      tooltipTitle: pr.title,
       url: pr.url,
     };
   }
   if (pr.state === "closed") {
     return {
       label: `${presentation.shortName} closed`,
-      colorClass: "text-zinc-500 dark:text-zinc-400/80",
-      tooltip: `#${pr.number} ${presentation.shortName} closed: ${pr.title}`,
+      colorClass: "text-red-600 dark:text-red-300/90",
+      tooltip,
+      tooltipLead,
+      tooltipTitle: pr.title,
       url: pr.url,
     };
   }
@@ -70,7 +97,9 @@ export function prStatusIndicator(
     return {
       label: `${presentation.shortName} merged`,
       colorClass: "text-violet-600 dark:text-violet-300/90",
-      tooltip: `#${pr.number} ${presentation.shortName} merged: ${pr.title}`,
+      tooltip,
+      tooltipLead,
+      tooltipTitle: pr.title,
       url: pr.url,
     };
   }
@@ -81,15 +110,16 @@ export function ChangeRequestStatusIcon({ className }: { className?: string }) {
   return <GitPullRequestIcon className={className} />;
 }
 
-/**
- * Build the leading-icon presentation for a thread row's schedule. State is
- * always carried by icon SHAPE + color (never color alone), per design.md
- * ONE ACCENT, ONE GLYPH FAMILY:
- *   healthy        = ClockIcon, text-info
- *   overdue/failed = TriangleAlertIcon, text-warning
- *   paused         = ClockIcon, text-muted-foreground/50
- * The tooltip/aria-label mirror that state for colorblind + SR users.
- */
+export function PrStatusTooltipContent({ status }: { status: PrStatusIndicator }) {
+  return (
+    <span className="flex max-w-[min(34rem,calc(100vw-2rem))] items-stretch overflow-hidden whitespace-nowrap">
+      <span className="shrink-0 pr-2 font-medium">{status.tooltipLead}</span>
+      <span className="min-h-4 shrink-0 border-border/70 border-l" aria-hidden="true" />
+      <span className="min-w-0 truncate pl-2">{status.tooltipTitle}</span>
+    </span>
+  );
+}
+
 export function scheduleIconPresentation(summary: ThreadScheduleSummary): {
   Icon: typeof ClockIcon;
   colorClass: string;
@@ -113,11 +143,6 @@ export function scheduleIconPresentation(summary: ThreadScheduleSummary): {
   return { Icon: ClockIcon, colorClass: "text-info", label: `Scheduled · ${next}` };
 }
 
-/**
- * Non-interactive thread-row schedule indicator. Renders a SPAN (not a button)
- * so the row click still opens the thread (design.md SURFACE 2). Returns null
- * when the thread has no schedule, for zero layout cost.
- */
 export function ScheduledTaskIcon({
   summary,
   className,
@@ -125,9 +150,7 @@ export function ScheduledTaskIcon({
   summary: ThreadScheduleSummary | null | undefined;
   className?: string;
 }) {
-  if (!summary) {
-    return null;
-  }
+  if (!summary) return null;
   const { Icon, colorClass, label } = scheduleIconPresentation(summary);
   return (
     <Tooltip>
@@ -146,11 +169,16 @@ export function ScheduledTaskIcon({
   );
 }
 
-export function resolveThreadPr(
-  threadBranch: string | null,
-  gitStatus: VcsStatusResult | null,
-): ThreadPr | null {
-  if (threadBranch === null || gitStatus === null || gitStatus.refName !== threadBranch) {
+export function resolveThreadPr(input: {
+  threadBranch: string | null;
+  gitStatus: VcsStatusResult | null;
+}): ThreadPr | null {
+  const { threadBranch, gitStatus } = input;
+  if (gitStatus === null) {
+    return null;
+  }
+
+  if (threadBranch === null || gitStatus.refName !== threadBranch) {
     return null;
   }
 
@@ -274,14 +302,17 @@ export function ThreadRowLeadingStatus({ thread }: { thread: SidebarThreadSummar
   const threadProjectCwd = threadProject?.workspaceRoot ?? null;
   const gitCwd = thread.worktreePath ?? threadProjectCwd;
   const gitStatus = useEnvironmentQuery(
-    thread.branch != null && gitCwd !== null
+    (thread.branch != null || thread.worktreePath !== null) && gitCwd !== null
       ? vcsEnvironment.status({
           environmentId: thread.environmentId,
           input: { cwd: gitCwd },
         })
       : null,
   );
-  const pr = resolveThreadPr(thread.branch, gitStatus.data);
+  const pr = resolveThreadPr({
+    threadBranch: thread.branch,
+    gitStatus: gitStatus.data,
+  });
   const prStatus = prStatusIndicator(pr, gitStatus.data?.sourceControlProvider);
   const scheduleSummary = useThreadScheduleSummary(thread.environmentId, thread.id);
   const threadStatus = resolveThreadStatusPill({
@@ -310,7 +341,9 @@ export function ThreadRowLeadingStatus({ thread }: { thread: SidebarThreadSummar
           >
             <ChangeRequestStatusIcon className="size-3" />
           </TooltipTrigger>
-          <TooltipPopup side="top">{prStatus.tooltip}</TooltipPopup>
+          <TooltipPopup side="top">
+            <PrStatusTooltipContent status={prStatus} />
+          </TooltipPopup>
         </Tooltip>
       ) : null}
       {threadStatus ? <ThreadStatusLabel status={threadStatus} /> : null}

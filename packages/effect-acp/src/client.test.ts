@@ -41,7 +41,7 @@ const SessionUpdateNotification = jsonRpcNotification(
   "session/update",
   AcpSchema.SessionNotification,
 );
-const encodeUnknownJsonString = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
+const encodeUnknownJsonString = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 const decodeJsonRpcResponseId = Schema.decodeUnknownSync(
   Schema.fromJsonString(
     Schema.Struct({
