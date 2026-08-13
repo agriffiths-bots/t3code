@@ -4,6 +4,24 @@ export interface HostedDisplayUrlAllowlistEntry {
   readonly rationale: string;
 }
 
+export const HOSTED_DISPLAY_URL_MARKER_PREFIX = "__T3_DISPLAY_ONLY_URL_SOURCE__";
+export const HOSTED_DISPLAY_URL_MARKER_SEPARATOR = "__T3_DISPLAY_ONLY_URL_VALUE__";
+export const HOSTED_DISPLAY_URL_MARKER_SUFFIX = "__T3_DISPLAY_ONLY_URL_END__";
+
+/**
+ * Bind an emitted display literal to its reviewed source declaration without
+ * relying on source maps, which are intentionally absent from some builds.
+ */
+export function hostedDisplayUrlMarker(sourceFile: string, url: string): string {
+  return (
+    HOSTED_DISPLAY_URL_MARKER_PREFIX +
+    sourceFile +
+    HOSTED_DISPLAY_URL_MARKER_SEPARATOR +
+    url +
+    HOSTED_DISPLAY_URL_MARKER_SUFFIX
+  );
+}
+
 /**
  * Audited display-only URL literals allowed in hosted web assets.
  *

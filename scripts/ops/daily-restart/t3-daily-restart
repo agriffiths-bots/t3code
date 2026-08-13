@@ -326,7 +326,7 @@ publish_static_release() {
     log "copied static release failed identity validation: $release_dir"
     return 1
   }
-  run_capture 120 node "$pinned_web_scanner" --force "$release_dir" || {
+  run_capture 120 node "$pinned_web_scanner" --force "$release_dir" --repo-root "$checkout" || {
     log "copied static release failed dev-endpoint scan: $release_dir"
     return 1
   }
@@ -900,7 +900,7 @@ run_compatible_web_build() {
   run_capture 900 env -u VITE_HTTP_URL -u VITE_WS_URL -u VITE_DEV_SERVER_URL T3CODE_BUILD_SHA="$build_sha" T3CODE_HOSTED_BUILD=1 \
     pnpm -C "$checkout/apps/web" run "$script" || return 1
   if [[ "$script" == "build" ]]; then
-    run_capture 120 node "$pinned_web_scanner" --force "$checkout/apps/web/dist"
+    run_capture 120 node "$pinned_web_scanner" --force "$checkout/apps/web/dist" --repo-root "$checkout"
   fi
 }
 run_hosted_desktop_server_build() {
@@ -908,32 +908,37 @@ run_hosted_desktop_server_build() {
   run_capture 900 env -u VITE_HTTP_URL -u VITE_WS_URL -u VITE_DEV_SERVER_URL \
     T3CODE_BUILD_SHA="$build_sha" T3CODE_HOSTED_BUILD=1 \
     pnpm -C "$checkout" run build:desktop || return 1
-  run_capture 120 node "$pinned_web_scanner" --force "$checkout/apps/web/dist"
+  run_capture 120 node "$pinned_web_scanner" --force "$checkout/apps/web/dist" --repo-root "$checkout"
 }
 
 
 pin_web_scanner() {
-  local source_scanner source_hosted pinned_dir temp_scanner temp_hosted
+  local source_scanner source_hosted source_allowlist pinned_dir temp_scanner temp_hosted temp_allowlist
   source_scanner="$script_dir/../../assert-web-no-dev-endpoints.ts"
   source_hosted="$script_dir/../../lib/hosted-build.ts"
-  [[ -f "$source_scanner" && -f "$source_hosted" ]] || return 1
+  source_allowlist="$script_dir/../../hosted-display-url-allowlist.ts"
+  [[ -f "$source_scanner" && -f "$source_hosted" && -f "$source_allowlist" ]] || return 1
   pinned_dir="$pinned_tools_dir/web-scanner"
   mkdir -p "$pinned_dir/lib" || return 1
   chmod 700 "$pinned_dir" "$pinned_dir/lib" || return 1
   temp_scanner="$pinned_dir/.assert-web-no-dev-endpoints.ts.$$"
   temp_hosted="$pinned_dir/lib/.hosted-build.ts.$$"
-  rm -f -- "$temp_scanner" "$temp_hosted" || return 1
-  cp -p -- "$source_scanner" "$temp_scanner" && cp -p -- "$source_hosted" "$temp_hosted" || {
-    rm -f -- "$temp_scanner" "$temp_hosted"
+  temp_allowlist="$pinned_dir/.hosted-display-url-allowlist.ts.$$"
+  rm -f -- "$temp_scanner" "$temp_hosted" "$temp_allowlist" || return 1
+  cp -p -- "$source_scanner" "$temp_scanner" &&
+    cp -p -- "$source_hosted" "$temp_hosted" &&
+    cp -p -- "$source_allowlist" "$temp_allowlist" || {
+    rm -f -- "$temp_scanner" "$temp_hosted" "$temp_allowlist"
     return 1
   }
-  chmod 600 "$temp_scanner" "$temp_hosted" || {
-    rm -f -- "$temp_scanner" "$temp_hosted"
+  chmod 600 "$temp_scanner" "$temp_hosted" "$temp_allowlist" || {
+    rm -f -- "$temp_scanner" "$temp_hosted" "$temp_allowlist"
     return 1
   }
   mv -f -- "$temp_hosted" "$pinned_dir/lib/hosted-build.ts" &&
+    mv -f -- "$temp_allowlist" "$pinned_dir/hosted-display-url-allowlist.ts" &&
     mv -f -- "$temp_scanner" "$pinned_dir/assert-web-no-dev-endpoints.ts" || {
-      rm -f -- "$temp_scanner" "$temp_hosted"
+      rm -f -- "$temp_scanner" "$temp_hosted" "$temp_allowlist"
       return 1
     }
   pinned_web_scanner="$pinned_dir/assert-web-no-dev-endpoints.ts"

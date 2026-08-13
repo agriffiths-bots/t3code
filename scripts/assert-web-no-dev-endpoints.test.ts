@@ -4,24 +4,20 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 import { assert, expect, it } from "@effect/vitest";
-import { addMapping, GenMapping, toEncodedMap } from "@jridgewell/gen-mapping";
-
 import {
   assertDistHasNoDevEndpoints,
   parseScannerCliArgs,
   scanDistForDevEndpoints,
   scanTextForDevEndpoints,
 } from "./assert-web-no-dev-endpoints.ts";
-import { HOSTED_DISPLAY_URL_ALLOWLIST } from "./hosted-display-url-allowlist.ts";
+import {
+  HOSTED_DISPLAY_URL_ALLOWLIST,
+  hostedDisplayUrlMarker,
+} from "./hosted-display-url-allowlist.ts";
 
-function generatedPositionAt(text: string, index: number): { line: number; column: number } {
-  const prefix = text.slice(0, index);
-  const lastNewline = prefix.lastIndexOf("\n");
-  return {
-    line: (prefix.match(/\n/g)?.length ?? 0) + 1,
-    column: index - lastNewline - 1,
-  };
-}
+const HOSTED_DISPLAY_URL_MARKERS = HOSTED_DISPLAY_URL_ALLOWLIST.map((entry) =>
+  hostedDisplayUrlMarker(entry.sourceFile, entry.url),
+);
 
 async function createHostedBuildFixture(
   assetText: string,
@@ -33,46 +29,15 @@ async function createHostedBuildFixture(
   await NodeFSP.mkdir(NodePath.dirname(assetFile), { recursive: true });
   await NodeFSP.writeFile(assetFile, assetText, "utf8");
 
-  const ranges: Array<{
-    readonly start: number;
-    readonly end: number;
-    readonly source: string;
-    readonly content: string;
-  }> = [];
   for (const entry of HOSTED_DISPLAY_URL_ALLOWLIST) {
     const sourceFile = NodePath.join(repoRoot, entry.sourceFile);
     const sourceText =
-      entry.url === missingProvenanceUrl ? "display copy removed" : JSON.stringify(entry.url);
+      entry.url === missingProvenanceUrl
+        ? "display copy removed"
+        : JSON.stringify(hostedDisplayUrlMarker(entry.sourceFile, entry.url));
     await NodeFSP.mkdir(NodePath.dirname(sourceFile), { recursive: true });
     await NodeFSP.writeFile(sourceFile, sourceText, "utf8");
-
-    const start = assetText.indexOf(entry.url);
-    if (start !== -1) {
-      ranges.push({
-        start,
-        end: start + entry.url.length,
-        source: NodePath.relative(NodePath.dirname(assetFile), sourceFile).replaceAll(
-          NodePath.sep,
-          "/",
-        ),
-        content: sourceText,
-      });
-    }
   }
-
-  const sourceMap = new GenMapping({ file: NodePath.basename(assetFile) });
-  for (const range of ranges.sort((a, b) => a.start - b.start)) {
-    addMapping(sourceMap, {
-      generated: generatedPositionAt(assetText, range.start),
-      source: range.source,
-      original: { line: 1, column: 0 },
-      content: range.content,
-    });
-    addMapping(sourceMap, {
-      generated: generatedPositionAt(assetText, range.end),
-    });
-  }
-  await NodeFSP.writeFile(`${assetFile}.map`, JSON.stringify(toEncodedMap(sourceMap)), "utf8");
 
   return { repoRoot, distDir };
 }
@@ -169,6 +134,14 @@ it("parses --force independently of the positional dist directory", () => {
   const trailing = parseScannerCliArgs(["apps/web/dist", "--force"]);
   assert.isTrue(conventional.forced);
   assert.equal(conventional.distDir, trailing.distDir);
+  const staged = parseScannerCliArgs([
+    "--force",
+    "apps/web/dist",
+    "--repo-root",
+    "/tmp/staged-checkout",
+  ]);
+  assert.equal(staged.repoRoot, NodePath.resolve("/tmp/staged-checkout"));
+  assert.throws(() => parseScannerCliArgs(["--repo-root"]));
   assert.throws(() => parseScannerCliArgs(["--unknown", "apps/web/dist"]));
   assert.throws(() => parseScannerCliArgs(["first", "second"]));
 });
@@ -234,9 +207,7 @@ it("does not flag ported public backend URLs", () => {
 });
 
 it("passes a scrubbed hosted build containing the audited display copy", async () => {
-  const assetText = `const displayCopy=${JSON.stringify(
-    HOSTED_DISPLAY_URL_ALLOWLIST.map((entry) => entry.url),
-  )};`;
+  const assetText = `const displayCopy=${JSON.stringify(HOSTED_DISPLAY_URL_MARKERS)};`;
   const fixture = await createHostedBuildFixture(assetText);
   try {
     await assertDistHasNoDevEndpoints(fixture.distDir, fixture.repoRoot);
@@ -247,7 +218,7 @@ it("passes a scrubbed hosted build containing the audited display copy", async (
 
 it("still rejects a VITE_HTTP_URL-style backend endpoint", async () => {
   const assetText = [
-    `const displayCopy=${JSON.stringify(HOSTED_DISPLAY_URL_ALLOWLIST.map((entry) => entry.url))};`,
+    `const displayCopy=${JSON.stringify(HOSTED_DISPLAY_URL_MARKERS)};`,
     'const VITE_HTTP_URL="http://127.0.0.1:15773";fetch(VITE_HTTP_URL);',
   ].join("\n");
   const fixture = await createHostedBuildFixture(assetText);
@@ -265,7 +236,7 @@ it.each(HOSTED_DISPLAY_URL_ALLOWLIST.map((entry) => [entry.url] as const))(
   async (url) => {
     const fixture = await createHostedBuildFixture(
       [
-        `const displayCopy=${JSON.stringify(HOSTED_DISPLAY_URL_ALLOWLIST.map((entry) => entry.url))};`,
+        `const displayCopy=${JSON.stringify(HOSTED_DISPLAY_URL_MARKERS)};`,
         `const VITE_HTTP_URL=${JSON.stringify(url)};fetch(VITE_HTTP_URL);`,
       ].join("\n"),
     );
@@ -279,13 +250,12 @@ it.each(HOSTED_DISPLAY_URL_ALLOWLIST.map((entry) => [entry.url] as const))(
   },
 );
 
-it("fails closed when an emitted display literal has no source map", async () => {
+it("fails closed when emitted display literals are not provenance-marked", async () => {
   const assetText = `const displayCopy=${JSON.stringify(
     HOSTED_DISPLAY_URL_ALLOWLIST.map((entry) => entry.url),
   )};`;
   const fixture = await createHostedBuildFixture(assetText);
   try {
-    await NodeFSP.rm(NodePath.join(fixture.distDir, "assets", "index.js.map"));
     await expect(assertDistHasNoDevEndpoints(fixture.distDir, fixture.repoRoot)).rejects.toThrow(
       /hosted bundle contains dev\/loopback backend endpoints/,
     );
@@ -302,7 +272,7 @@ it.each([
 ] as const)("does not let the display allowlist hide a %s endpoint", async (_case, url) => {
   const fixture = await createHostedBuildFixture(
     [
-      `const displayCopy=${JSON.stringify(HOSTED_DISPLAY_URL_ALLOWLIST.map((entry) => entry.url))};`,
+      `const displayCopy=${JSON.stringify(HOSTED_DISPLAY_URL_MARKERS)};`,
       `const VITE_HTTP_URL=${JSON.stringify(url)};`,
     ].join("\n"),
   );
@@ -321,7 +291,7 @@ it.each(HOSTED_DISPLAY_URL_ALLOWLIST.map((entry) => [entry.url] as const))(
     const fixture = await createHostedBuildFixture('const clean="asset";', url);
     try {
       await expect(assertDistHasNoDevEndpoints(fixture.distDir, fixture.repoRoot)).rejects.toThrow(
-        /display URL allowlist provenance requires exactly one occurrence/,
+        /display URL allowlist provenance requires exactly one marked occurrence/,
       );
     } finally {
       await NodeFSP.rm(fixture.repoRoot, { recursive: true, force: true });

@@ -57,7 +57,10 @@ case "$*" in
     ;;
   *"worktree prune"*) exit "${FAKE_GIT_WORKTREE_PRUNE_RC:-0}" ;;
   *"worktree add --detach"*)
-    mkdir -p "${*: -2:1}"
+    stage_checkout="${*: -2:1}"
+    mkdir -p "$stage_checkout/apps/web/src/components/settings"
+    cp "$T_ROOT/apps/web/src/components/settings/SettingsFontPreviews.tsx" "$stage_checkout/apps/web/src/components/settings/SettingsFontPreviews.tsx"
+    cp "$T_ROOT/apps/web/src/components/projectScriptEditor.tsx" "$stage_checkout/apps/web/src/components/projectScriptEditor.tsx"
     exit "${FAKE_GIT_WORKTREE_RC:-0}"
     ;;
   *"worktree remove --force"*)
@@ -197,7 +200,7 @@ run_cycle() {
   printf '#!/usr/bin/env bash\nexit 0\n' >"$tmp/checkout/scripts/ops/daily-restart/health-probe"
   chmod +x "$tmp/checkout/scripts/ops/daily-restart/health-probe"
   make_fake_bin "$tmp/bin"
-  T_TMP="$tmp" T_LOG="$tmp/calls.log" REAL_NODE="$REAL_NODE" T3DR_TEST_PATH_PREFIX="$tmp/bin" \
+  T_TMP="$tmp" T_LOG="$tmp/calls.log" T_ROOT="$ROOT" REAL_NODE="$REAL_NODE" T3DR_TEST_PATH_PREFIX="$tmp/bin" \
     T3DR_CHECKOUT="$tmp/checkout" \
     T3DR_LEDGER="$tmp/ledger" \
     T3DR_DB="$tmp/state.sqlite" \
@@ -238,6 +241,9 @@ run_cycle "$tmp"
 unset VITE_HTTP_URL VITE_WS_URL VITE_DEV_SERVER_URL
 stage="$tmp/ledger/$(date -u +%F)/prebuilt-stage/checkout"
 [[ "$(cat "$tmp/rc")" == "0" ]] && pass "happy path exits zero" || fail "happy path exits zero"
+grep -Fq "assert-web-no-dev-endpoints.ts --force $stage/apps/web/dist --repo-root $stage" "$tmp/calls.log" &&
+  pass "staged scanner verifies the checkout that produced the build" ||
+  fail "staged scanner verifies the checkout that produced the build"
 assert_order "$tmp/calls.log" "backup" "sync" "git -C" "git -C $tmp/checkout worktree prune" "git -C $tmp/checkout worktree add --detach $stage" "pnpm -C $stage install --frozen-lockfile --prefer-offline" "pnpm -C $stage/apps/web run build:hosted" "pnpm -C $stage run build:desktop" "assert-web-no-dev-endpoints.ts --force $stage/apps/web/dist" "restart prebuilt=1"
 grep -Fq "pnpm-env T3CODE_BUILD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cmd=-C $stage/apps/web run build:hosted" "$tmp/calls.log" \
   && pass "happy path stamps standalone web build" \
