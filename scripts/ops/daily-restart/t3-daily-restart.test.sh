@@ -289,6 +289,11 @@ run_manager() {
   local tmp="$1"
   shift
   mkdir -p "$tmp/checkout" "$tmp/bin" "$tmp/ledger" "$tmp/snaps"
+  mkdir -p "$tmp/checkout/apps/web/src/components/settings"
+  cp "$ROOT/apps/web/src/components/settings/SettingsFontPreviews.tsx" \
+    "$tmp/checkout/apps/web/src/components/settings/SettingsFontPreviews.tsx"
+  cp "$ROOT/apps/web/src/components/projectScriptEditor.tsx" \
+    "$tmp/checkout/apps/web/src/components/projectScriptEditor.tsx"
   mkdir -p "$tmp/prebuilt-assets/apps/web/dist" "$tmp/prebuilt-assets/apps/server/dist/client"
   printf 'web\n' >"$tmp/prebuilt-assets/apps/web/dist/index.html"
   printf '{"buildSha":"%s"}\n' "${FAKE_TARGET_SHA:-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}" >"$tmp/prebuilt-assets/apps/web/dist/build-identity.json"
@@ -340,6 +345,12 @@ export VITE_HTTP_URL=//localhost:3773 VITE_WS_URL=//127.0.0.2:3773 VITE_DEV_SERV
 run_manager "$tmp"
 unset VITE_HTTP_URL VITE_WS_URL VITE_DEV_SERVER_URL
 [[ "$(cat "$tmp/rc")" == "0" ]] && pass "happy path exits zero" || fail "happy path exits zero"
+[[ -f "$tmp/ledger/$(date -u +%F)/pinned-tools/web-scanner/hosted-display-url-allowlist.ts" ]] &&
+  pass "pinned scanner includes display URL provenance manifest" ||
+  fail "pinned scanner includes display URL provenance manifest"
+grep -Fq "assert-web-no-dev-endpoints.ts --force $tmp/checkout/apps/web/dist --repo-root $tmp/checkout" "$tmp/calls.log" &&
+  pass "pinned scanner verifies the checkout that produced the build" ||
+  fail "pinned scanner verifies the checkout that produced the build"
 assert_order "$tmp/calls.log" "git -C" "snapshot" "capture" "systemctl --user stop" "capture" "snapshot" "git -C" "pnpm -C" "systemctl --user start" "verify-restart" "health" "inject"
 assert_order "$tmp/calls.log" "mint-resume-token" "validate-resume-token" "systemctl --user stop"
 grep -Fq "inject token=minted-token" "$tmp/calls.log" && pass "resume injection receives preflight token" || fail "resume injection receives preflight token"

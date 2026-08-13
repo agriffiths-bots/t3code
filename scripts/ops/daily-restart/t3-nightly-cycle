@@ -807,7 +807,7 @@ build_release_artifacts() {
     fi
   fi
   if [[ "$rc" -eq 0 && ( "$rollback_sha" != "$target_sha" || "$build_always" == "1" ) ]]; then
-    run_logged 120 "$step_log" node "$script_dir/../../assert-web-no-dev-endpoints.ts" --force "$stage_checkout/apps/web/dist" || rc=$?
+    run_logged 120 "$step_log" node "$script_dir/../../assert-web-no-dev-endpoints.ts" --force "$stage_checkout/apps/web/dist" --repo-root "$stage_checkout" || rc=$?
   fi
   if [[ "$rc" -eq 0 && ( "$rollback_sha" != "$target_sha" || "$build_always" == "1" ) ]]; then
     remove_path_under "$stage_root" "$stage_payload" || rc=$?
@@ -921,7 +921,7 @@ run_live_deploy_step() {
     fi
   fi
   if [[ "$rc" -eq 0 ]]; then
-    run_logged 120 "$step_log" node "$script_dir/../../assert-web-no-dev-endpoints.ts" --force "$stage_checkout/apps/web/dist" || rc=$?
+    run_logged 120 "$step_log" node "$script_dir/../../assert-web-no-dev-endpoints.ts" --force "$stage_checkout/apps/web/dist" --repo-root "$stage_checkout" || rc=$?
   fi
   if [[ "$rc" -eq 0 ]]; then
     checkout_status="$(capture_logged 30 "$step_log" git -C "$checkout" status --porcelain)" || rc=$?

@@ -22,6 +22,7 @@ import {
   keybindingValueForCommand,
   decodeProjectScriptKeybindingRule,
 } from "~/lib/projectScriptKeybindings";
+import { displayOnlyUrl } from "~/lib/displayOnlyUrl";
 import { keybindingFromKeyboardEvent } from "~/components/settings/KeybindingsSettings.logic";
 import { commandForProjectScript, nextProjectScriptId } from "~/projectScripts";
 import {
@@ -57,6 +58,10 @@ export const SCRIPT_ICONS: Array<{ id: ProjectScriptIcon; label: string }> = [
   { id: "build", label: "Build" },
   { id: "debug", label: "Debug" },
 ];
+
+const SCRIPT_PREVIEW_URL_PLACEHOLDER = displayOnlyUrl(
+  "__T3_DISPLAY_ONLY_URL_SOURCE__apps/web/src/components/projectScriptEditor.tsx__T3_DISPLAY_ONLY_URL_VALUE__http://localhost:5173__T3_DISPLAY_ONLY_URL_END__",
+);
 
 export function ScriptIcon({
   icon,
@@ -337,7 +342,7 @@ export function ProjectScriptEditorDialog({
                 <Label htmlFor="script-preview-url">Preview URL (optional)</Label>
                 <Input
                   id="script-preview-url"
-                  placeholder="http://localhost:5173"
+                  placeholder={SCRIPT_PREVIEW_URL_PLACEHOLDER}
                   value={previewUrl}
                   onChange={(event) => setPreviewUrl(event.target.value)}
                 />

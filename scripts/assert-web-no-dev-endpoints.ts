@@ -2,7 +2,7 @@
 // @effect-diagnostics globalConsole:off - Build script prints a one-line result and a findings report.
 //
 // assert-web-no-dev-endpoints — scan EVERY emitted asset of a hosted web build
-// for dev/loopback backend endpoints and FAIL the build if any survive.
+// for dev/loopback backend endpoints and FAIL the build if any unapproved ones survive.
 //
 // Root cause it guards (2026-07-22 outage): the auth client executed from a
 // NON-ENTRY chunk (textarea-*.js) that had VITE_HTTP_URL=http://127.0.0.1:15773
@@ -12,11 +12,13 @@
 // a loopback backend cannot hide in a lazily-loaded chunk.
 //
 // Anything that looks like a loopback backend — any ported http(s)/ws(s)
-// loopback URL or the desktop dev backend port :15773 — is a finding. There is
-// deliberately no origin allowlist: emitted text cannot prove whether a literal
-// came from harmless UI copy or a configured backend. Bare loopback hostnames
-// with no scheme (e.g. the LOOPBACK_HOSTNAMES set literal) are intentionally
-// NOT matched, because a hosted build compares against them at runtime.
+// loopback URL or the desktop dev backend port :15773 — is a finding. The only
+// exceptions are exact display-copy literals in the target revision's audited
+// in-repo allowlist. When an emitted marker is needed, the build verifies its
+// entry against the declared target source before allowing it. Bare loopback
+// hostnames with no scheme (e.g. the LOOPBACK_HOSTNAMES set literal) are
+// intentionally NOT matched, because a hosted build compares against them at
+// runtime.
 import * as NodeFS from "node:fs";
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
@@ -77,6 +79,46 @@ export interface DevEndpointFinding {
   readonly reason: string;
 }
 
+interface HostedDisplayUrlAllowlistEntry {
+  readonly url: string;
+  readonly sourceFile: string;
+  readonly rationale: string;
+}
+
+interface HostedDisplayUrlManifest {
+  readonly entries: ReadonlyArray<HostedDisplayUrlAllowlistEntry>;
+  readonly markerFor: (sourceFile: string, url: string) => string;
+}
+
+interface VerifiedHostedDisplayUrl {
+  readonly url: string;
+  readonly sourceFile: string;
+  readonly markerPrefix: string;
+  readonly markerSuffix: string;
+}
+
+type VerifiedHostedDisplayUrls = ReadonlyMap<string, VerifiedHostedDisplayUrl>;
+
+const EMPTY_VERIFIED_DISPLAY_URLS: VerifiedHostedDisplayUrls = new Map();
+const DISPLAY_URL_MARKER_PREFIX = "__T3_DISPLAY_ONLY_URL_SOURCE__";
+
+function matchingVerifiedDisplayUrl(
+  text: string,
+  index: number,
+  verifiedDisplayUrls: VerifiedHostedDisplayUrls,
+): VerifiedHostedDisplayUrl | undefined {
+  for (const entry of verifiedDisplayUrls.values()) {
+    const markerStart = index - entry.markerPrefix.length;
+    if (markerStart < 0 || !text.startsWith(entry.markerPrefix, markerStart)) {
+      continue;
+    }
+    if (text.startsWith(`${entry.url}${entry.markerSuffix}`, index)) {
+      return entry;
+    }
+  }
+  return undefined;
+}
+
 /**
  * Scan a single asset's text for dev/loopback backend endpoints. Pure and
  * deterministic; the CLI wraps this over every asset in the graph.
@@ -129,6 +171,125 @@ export function scanTextForDevEndpoints(text: string): DevEndpointFinding[] {
   return findings;
 }
 
+function isOutsideRoot(root: string, candidate: string): boolean {
+  const relative = NodePath.relative(root, candidate);
+  return (
+    relative === ".." || relative.startsWith(`..${NodePath.sep}`) || NodePath.isAbsolute(relative)
+  );
+}
+
+function isHostedDisplayUrlAllowlistEntry(value: unknown): value is HostedDisplayUrlAllowlistEntry {
+  if (typeof value !== "object" || value === null) return false;
+  const entry = value as Record<string, unknown>;
+  return (
+    typeof entry.url === "string" &&
+    typeof entry.sourceFile === "string" &&
+    typeof entry.rationale === "string"
+  );
+}
+
+async function loadHostedDisplayUrlManifest(repoRoot: string): Promise<HostedDisplayUrlManifest> {
+  const realRepoRoot = await NodeFSP.realpath(repoRoot).catch(() => NodePath.resolve(repoRoot));
+  const declaredManifest = NodePath.resolve(
+    realRepoRoot,
+    "scripts/hosted-display-url-allowlist.ts",
+  );
+  const realManifest = await NodeFSP.realpath(declaredManifest).catch(() => null);
+  if (realManifest === null || isOutsideRoot(realRepoRoot, realManifest)) {
+    throw new Error(
+      "web dev-endpoint assertion failed: target display URL allowlist manifest is unavailable",
+    );
+  }
+
+  const loaded: unknown = await import(NodeURL.pathToFileURL(realManifest).href);
+  if (typeof loaded !== "object" || loaded === null) {
+    throw new Error("web dev-endpoint assertion failed: target display URL allowlist is invalid");
+  }
+  const manifest = loaded as Record<string, unknown>;
+  const entries = manifest.HOSTED_DISPLAY_URL_ALLOWLIST;
+  const markerFor = manifest.hostedDisplayUrlMarker;
+  if (
+    !Array.isArray(entries) ||
+    !entries.every(isHostedDisplayUrlAllowlistEntry) ||
+    typeof markerFor !== "function"
+  ) {
+    throw new Error("web dev-endpoint assertion failed: target display URL allowlist is invalid");
+  }
+  return {
+    entries,
+    markerFor: markerFor as HostedDisplayUrlManifest["markerFor"],
+  };
+}
+
+/**
+ * Validate emitted display-only exemptions against the target revision's
+ * reviewed source before they can influence the asset scan. Missing, moved,
+ * duplicated, or under-audited entries fail closed. Entries absent from the
+ * affected assets are deliberately ignored so clean legacy/fork builds do not
+ * depend on source files for exemptions they never use.
+ */
+export async function verifyHostedDisplayUrlAllowlist(
+  repoRoot: string,
+  emittedAssetTexts?: ReadonlyArray<string>,
+): Promise<VerifiedHostedDisplayUrls> {
+  const realRepoRoot = await NodeFSP.realpath(repoRoot).catch(() => NodePath.resolve(repoRoot));
+  const manifest = await loadHostedDisplayUrlManifest(realRepoRoot);
+  const verified = new Map<string, VerifiedHostedDisplayUrl>();
+  const entries =
+    emittedAssetTexts === undefined
+      ? manifest.entries
+      : manifest.entries.filter((entry) => {
+          const marker = manifest.markerFor(entry.sourceFile, entry.url);
+          return emittedAssetTexts.some((text) => text.includes(marker));
+        });
+
+  for (const entry of entries) {
+    if (entry.rationale.trim().length < 120) {
+      throw new Error(
+        `web dev-endpoint assertion failed: display URL allowlist rationale for ${entry.url} must be at least 120 characters`,
+      );
+    }
+    if (verified.has(entry.url)) {
+      throw new Error(
+        `web dev-endpoint assertion failed: duplicate display URL allowlist entry for ${entry.url}`,
+      );
+    }
+
+    const declaredSource = NodePath.resolve(realRepoRoot, entry.sourceFile);
+    const realSource = await NodeFSP.realpath(declaredSource).catch(() => null);
+    if (realSource === null || isOutsideRoot(realRepoRoot, realSource)) {
+      throw new Error(
+        `web dev-endpoint assertion failed: display URL allowlist provenance source is unavailable: ${entry.sourceFile}`,
+      );
+    }
+
+    const sourceText = await NodeFSP.readFile(realSource, "utf8");
+    const marker = manifest.markerFor(entry.sourceFile, entry.url);
+    const urlOccurrences = sourceText.split(entry.url).length - 1;
+    const markerOccurrences = sourceText.split(marker).length - 1;
+    if (urlOccurrences !== 1 || markerOccurrences !== 1) {
+      throw new Error(
+        `web dev-endpoint assertion failed: display URL allowlist provenance requires exactly one marked occurrence of ${entry.url} in ${entry.sourceFile}; found ${markerOccurrences} marked and ${urlOccurrences} total`,
+      );
+    }
+
+    const urlIndex = marker.indexOf(entry.url);
+    if (urlIndex < 0) {
+      throw new Error(
+        `web dev-endpoint assertion failed: display URL marker does not contain ${entry.url}`,
+      );
+    }
+    verified.set(entry.url, {
+      url: entry.url,
+      sourceFile: entry.sourceFile,
+      markerPrefix: marker.slice(0, urlIndex),
+      markerSuffix: marker.slice(urlIndex + entry.url.length),
+    });
+  }
+
+  return verified;
+}
+
 const SCANNED_EXTENSIONS = new Set([".js", ".mjs", ".cjs", ".css", ".html"]);
 
 async function collectAssetFiles(distDir: string): Promise<string[]> {
@@ -157,29 +318,98 @@ export interface AssetScanResult {
   readonly findings: ReadonlyArray<DevEndpointFinding>;
 }
 
-/** Scan every JS/CSS/HTML asset under `distDir`. Skips sourcemaps and binaries. */
-export async function scanDistForDevEndpoints(distDir: string): Promise<AssetScanResult[]> {
+/**
+ * Scan every JS/CSS/HTML asset under `distDir`. An exact display-copy match is
+ * exempted only when the occurrence is inside its source-bound audited marker.
+ */
+export async function scanDistForDevEndpoints(
+  distDir: string,
+  verifiedDisplayUrls: VerifiedHostedDisplayUrls = EMPTY_VERIFIED_DISPLAY_URLS,
+): Promise<AssetScanResult[]> {
   const files = await collectAssetFiles(distDir);
   const results: AssetScanResult[] = [];
   for (const file of files) {
     const text = await NodeFSP.readFile(file, "utf8");
-    const findings = scanTextForDevEndpoints(text);
-    if (findings.length > 0) {
-      results.push({ file, findings });
+    const strictFindings = scanTextForDevEndpoints(text);
+    if (strictFindings.length === 0) {
+      continue;
+    }
+
+    const activeFindings = strictFindings.filter(
+      (finding) =>
+        matchingVerifiedDisplayUrl(text, finding.index, verifiedDisplayUrls) === undefined,
+    );
+
+    if (activeFindings.length > 0) {
+      results.push({ file, findings: activeFindings });
     }
   }
   return results;
 }
 
+const REPO_ROOT = NodePath.resolve(NodePath.dirname(NodeURL.fileURLToPath(import.meta.url)), "..");
+
+export async function assertDistHasNoDevEndpoints(
+  distDir: string,
+  repoRoot: string = REPO_ROOT,
+): Promise<void> {
+  const strictResults = await scanDistForDevEndpoints(distDir);
+  if (strictResults.length === 0) {
+    return;
+  }
+
+  const emittedAssetTexts = await Promise.all(
+    strictResults.map((result) => NodeFSP.readFile(result.file, "utf8")),
+  );
+  const hasPotentialExemption = emittedAssetTexts.some((text) =>
+    text.includes(DISPLAY_URL_MARKER_PREFIX),
+  );
+  const results = hasPotentialExemption
+    ? await scanDistForDevEndpoints(
+        distDir,
+        await verifyHostedDisplayUrlAllowlist(repoRoot, emittedAssetTexts),
+      )
+    : strictResults;
+  if (results.length === 0) {
+    return;
+  }
+
+  const report = results
+    .map((result) => {
+      const rel = NodePath.relative(distDir, result.file) || result.file;
+      const lines = result.findings
+        .map((finding) => `    - ${finding.reason}: …${finding.match}…`)
+        .join("\n");
+      return `  ${rel}\n${lines}`;
+    })
+    .join("\n");
+  throw new Error(
+    `web dev-endpoint assertion failed: hosted bundle contains dev/loopback backend endpoints ` +
+      `in ${results.length} asset(s):\n${report}\n` +
+      `A hosted build must derive its backend from window.location.origin. Only exact display-copy ` +
+      `literals with verified source provenance may be exempted; do not weaken the scanner.`,
+  );
+}
+
 export function parseScannerCliArgs(args: ReadonlyArray<string>): {
   readonly distDir: string;
+  readonly repoRoot: string;
   readonly forced: boolean;
 } {
   const positional: string[] = [];
   let forced = false;
-  for (const arg of args) {
+  let repoRoot = REPO_ROOT;
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]!;
     if (arg === "--force") {
       forced = true;
+    } else if (arg === "--repo-root") {
+      const value = args[index + 1];
+      if (value === undefined || value.startsWith("--")) {
+        throw new Error("web dev-endpoint assertion failed: --repo-root requires a directory");
+      }
+      repoRoot = NodePath.resolve(value);
+      index += 1;
     } else if (arg.startsWith("--")) {
       throw new Error(`web dev-endpoint assertion failed: unknown option ${arg}`);
     } else {
@@ -191,6 +421,7 @@ export function parseScannerCliArgs(args: ReadonlyArray<string>): {
   }
   return {
     distDir: NodePath.resolve(positional[0] ?? "apps/web/dist"),
+    repoRoot,
     forced,
   };
 }
@@ -213,26 +444,11 @@ async function main(): Promise<void> {
     throw new Error(`web dev-endpoint assertion failed: ${distDir} is not a directory`);
   }
 
-  const results = await scanDistForDevEndpoints(distDir);
-  if (results.length > 0) {
-    const report = results
-      .map((result) => {
-        const rel = NodePath.relative(distDir, result.file) || result.file;
-        const lines = result.findings
-          .map((finding) => `    - ${finding.reason}: …${finding.match}…`)
-          .join("\n");
-        return `  ${rel}\n${lines}`;
-      })
-      .join("\n");
-    throw new Error(
-      `web dev-endpoint assertion failed: hosted bundle contains dev/loopback backend endpoints ` +
-        `in ${results.length} asset(s):\n${report}\n` +
-        `A hosted build must derive its backend from window.location.origin. This is the ` +
-        `2026-07-22 contamination class — fix the build environment, do not allowlist.`,
-    );
-  }
+  await assertDistHasNoDevEndpoints(distDir, parsed.repoRoot);
 
-  console.log("web dev-endpoint assertion passed (no loopback/dev backend endpoints in any asset)");
+  console.log(
+    "web dev-endpoint assertion passed (no unapproved loopback/dev backend endpoints in any asset)",
+  );
 }
 
 /**
