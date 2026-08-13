@@ -13,20 +13,17 @@
 //
 // Anything that looks like a loopback backend — any ported http(s)/ws(s)
 // loopback URL or the desktop dev backend port :15773 — is a finding. The only
-// exceptions are exact display-copy literals in the audited in-repo allowlist,
-// and the build verifies that every entry still exists in its declared source
-// file before scanning assets. Bare loopback hostnames with no scheme (e.g. the
-// LOOPBACK_HOSTNAMES set literal) are intentionally NOT matched, because a
-// hosted build compares against them at runtime.
+// exceptions are exact display-copy literals in the target revision's audited
+// in-repo allowlist. When an emitted marker is needed, the build verifies its
+// entry against the declared target source before allowing it. Bare loopback
+// hostnames with no scheme (e.g. the LOOPBACK_HOSTNAMES set literal) are
+// intentionally NOT matched, because a hosted build compares against them at
+// runtime.
 import * as NodeFS from "node:fs";
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
 import * as NodeURL from "node:url";
 
-import {
-  HOSTED_DISPLAY_URL_ALLOWLIST,
-  hostedDisplayUrlMarker,
-} from "./hosted-display-url-allowlist.ts";
 import { isHostedBuild } from "./lib/hosted-build.ts";
 
 /** Desktop dev backend ports that must never appear in a hosted bundle. */
@@ -82,6 +79,17 @@ export interface DevEndpointFinding {
   readonly reason: string;
 }
 
+interface HostedDisplayUrlAllowlistEntry {
+  readonly url: string;
+  readonly sourceFile: string;
+  readonly rationale: string;
+}
+
+interface HostedDisplayUrlManifest {
+  readonly entries: ReadonlyArray<HostedDisplayUrlAllowlistEntry>;
+  readonly markerFor: (sourceFile: string, url: string) => string;
+}
+
 interface VerifiedHostedDisplayUrl {
   readonly url: string;
   readonly sourceFile: string;
@@ -92,6 +100,7 @@ interface VerifiedHostedDisplayUrl {
 type VerifiedHostedDisplayUrls = ReadonlyMap<string, VerifiedHostedDisplayUrl>;
 
 const EMPTY_VERIFIED_DISPLAY_URLS: VerifiedHostedDisplayUrls = new Map();
+const DISPLAY_URL_MARKER_PREFIX = "__T3_DISPLAY_ONLY_URL_SOURCE__";
 
 function matchingVerifiedDisplayUrl(
   text: string,
@@ -169,18 +178,72 @@ function isOutsideRoot(root: string, candidate: string): boolean {
   );
 }
 
+function isHostedDisplayUrlAllowlistEntry(value: unknown): value is HostedDisplayUrlAllowlistEntry {
+  if (typeof value !== "object" || value === null) return false;
+  const entry = value as Record<string, unknown>;
+  return (
+    typeof entry.url === "string" &&
+    typeof entry.sourceFile === "string" &&
+    typeof entry.rationale === "string"
+  );
+}
+
+async function loadHostedDisplayUrlManifest(repoRoot: string): Promise<HostedDisplayUrlManifest> {
+  const realRepoRoot = await NodeFSP.realpath(repoRoot).catch(() => NodePath.resolve(repoRoot));
+  const declaredManifest = NodePath.resolve(
+    realRepoRoot,
+    "scripts/hosted-display-url-allowlist.ts",
+  );
+  const realManifest = await NodeFSP.realpath(declaredManifest).catch(() => null);
+  if (realManifest === null || isOutsideRoot(realRepoRoot, realManifest)) {
+    throw new Error(
+      "web dev-endpoint assertion failed: target display URL allowlist manifest is unavailable",
+    );
+  }
+
+  const loaded: unknown = await import(NodeURL.pathToFileURL(realManifest).href);
+  if (typeof loaded !== "object" || loaded === null) {
+    throw new Error("web dev-endpoint assertion failed: target display URL allowlist is invalid");
+  }
+  const manifest = loaded as Record<string, unknown>;
+  const entries = manifest.HOSTED_DISPLAY_URL_ALLOWLIST;
+  const markerFor = manifest.hostedDisplayUrlMarker;
+  if (
+    !Array.isArray(entries) ||
+    !entries.every(isHostedDisplayUrlAllowlistEntry) ||
+    typeof markerFor !== "function"
+  ) {
+    throw new Error("web dev-endpoint assertion failed: target display URL allowlist is invalid");
+  }
+  return {
+    entries,
+    markerFor: markerFor as HostedDisplayUrlManifest["markerFor"],
+  };
+}
+
 /**
- * Validate every display-only exemption against reviewed source before it can
- * influence the emitted-asset scan. Missing, moved, duplicated, or under-audited
- * entries fail closed.
+ * Validate emitted display-only exemptions against the target revision's
+ * reviewed source before they can influence the asset scan. Missing, moved,
+ * duplicated, or under-audited entries fail closed. Entries absent from the
+ * affected assets are deliberately ignored so clean legacy/fork builds do not
+ * depend on source files for exemptions they never use.
  */
 export async function verifyHostedDisplayUrlAllowlist(
   repoRoot: string,
+  emittedAssetTexts?: ReadonlyArray<string>,
 ): Promise<VerifiedHostedDisplayUrls> {
   const realRepoRoot = await NodeFSP.realpath(repoRoot).catch(() => NodePath.resolve(repoRoot));
+  const manifest = await loadHostedDisplayUrlManifest(realRepoRoot);
   const verified = new Map<string, VerifiedHostedDisplayUrl>();
+  const entries =
+    emittedAssetTexts === undefined
+      ? manifest.entries
+      : manifest.entries.filter((entry) => {
+          const marker = manifest.markerFor(entry.sourceFile, entry.url);
+          return emittedAssetTexts.some((text) => text.includes(marker));
+        });
 
-  for (const entry of HOSTED_DISPLAY_URL_ALLOWLIST) {
+  for (const entry of entries) {
     if (entry.rationale.trim().length < 120) {
       throw new Error(
         `web dev-endpoint assertion failed: display URL allowlist rationale for ${entry.url} must be at least 120 characters`,
@@ -201,7 +264,7 @@ export async function verifyHostedDisplayUrlAllowlist(
     }
 
     const sourceText = await NodeFSP.readFile(realSource, "utf8");
-    const marker = hostedDisplayUrlMarker(entry.sourceFile, entry.url);
+    const marker = manifest.markerFor(entry.sourceFile, entry.url);
     const urlOccurrences = sourceText.split(entry.url).length - 1;
     const markerOccurrences = sourceText.split(marker).length - 1;
     if (urlOccurrences !== 1 || markerOccurrences !== 1) {
@@ -211,6 +274,11 @@ export async function verifyHostedDisplayUrlAllowlist(
     }
 
     const urlIndex = marker.indexOf(entry.url);
+    if (urlIndex < 0) {
+      throw new Error(
+        `web dev-endpoint assertion failed: display URL marker does not contain ${entry.url}`,
+      );
+    }
     verified.set(entry.url, {
       url: entry.url,
       sourceFile: entry.sourceFile,
@@ -285,8 +353,23 @@ export async function assertDistHasNoDevEndpoints(
   distDir: string,
   repoRoot: string = REPO_ROOT,
 ): Promise<void> {
-  const verifiedDisplayUrls = await verifyHostedDisplayUrlAllowlist(repoRoot);
-  const results = await scanDistForDevEndpoints(distDir, verifiedDisplayUrls);
+  const strictResults = await scanDistForDevEndpoints(distDir);
+  if (strictResults.length === 0) {
+    return;
+  }
+
+  const emittedAssetTexts = await Promise.all(
+    strictResults.map((result) => NodeFSP.readFile(result.file, "utf8")),
+  );
+  const hasPotentialExemption = emittedAssetTexts.some((text) =>
+    text.includes(DISPLAY_URL_MARKER_PREFIX),
+  );
+  const results = hasPotentialExemption
+    ? await scanDistForDevEndpoints(
+        distDir,
+        await verifyHostedDisplayUrlAllowlist(repoRoot, emittedAssetTexts),
+      )
+    : strictResults;
   if (results.length === 0) {
     return;
   }
