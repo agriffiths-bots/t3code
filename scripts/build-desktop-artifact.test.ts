@@ -62,7 +62,6 @@ import {
   stageDesktopDmgBackground,
   STAGE_INSTALL_ARGS,
   validateBundledClientAssets,
-  WINDOWS_ASAR_UNPACK,
   ancestorNodeModulesPaths,
   copyDirectoryPreservingSymlinks,
   validateWindowsPackagedPayload,

@@ -59,6 +59,11 @@ export const CLI_RUNTIME_EXTERNAL_PREFIXES = [
  * does not need to be external — only the entry point must stay unbundled.
  */
 export const CLI_BUILD_ONLY_EXTERNAL_PREFIXES = [
+  // T3 Code always passes the user's installed Claude executable to the SDK,
+  // so these optional platform packages are never loaded. Keep their bundled
+  // executables out of the server artifact without promoting the SDK itself
+  // into the runtime-external sidecar dependency closure.
+  "@anthropic-ai/claude-agent-sdk-",
   "@effect/platform-bun",
   "@effect/sql-sqlite-bun",
 ] as const;

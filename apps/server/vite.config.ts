@@ -3,10 +3,6 @@ import { normalizeBuildVersion } from "@t3tools/shared/semver";
 import { defineConfig, mergeConfig } from "vite-plus";
 
 import baseConfig from "../../vite.config.ts";
-import {
-  packageNameMatchesPrefix,
-  resolveBarePackageName,
-} from "../../scripts/lib/package-names.ts";
 import { loadRepoEnv } from "../../scripts/lib/public-config.ts";
 import packageJson from "./package.json" with { type: "json" };
 

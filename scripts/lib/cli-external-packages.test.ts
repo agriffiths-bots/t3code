@@ -55,7 +55,11 @@ describe("shouldBundleCliDependency", () => {
     }
   });
 
-  it("leaves bun-only entry points external", () => {
+  it("leaves build-only packages external", () => {
+    assert.strictEqual(
+      shouldBundleCliDependency("@anthropic-ai/claude-agent-sdk-linux-x64"),
+      false,
+    );
     assert.strictEqual(shouldBundleCliDependency("@effect/platform-bun"), false);
     assert.strictEqual(shouldBundleCliDependency("@effect/sql-sqlite-bun"), false);
   });

@@ -839,7 +839,6 @@ export const DESKTOP_PACKAGE_BUILD_ENV = {
   T3CODE_DESKTOP_PACKAGE: "1",
   T3CODE_WEB_SOURCEMAP: "0",
 } as const;
-const FFI_RS_VERSION = "1.3.2";
 export const DESKTOP_AFTER_PACK_HOOK_STAGE_PATH = "desktop-after-pack-prune.mjs";
 export const DESKTOP_ASAR_UNPACK_BASE = ["apps/server/dist/**"] as const;
 export const MOCK_UPDATE_SERVER_HOST = "127.0.0.1";
@@ -2959,12 +2958,13 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
       }),
   });
 
-  const resolvedStagedRuntimeDependencies = yield* Effect.try({
-    try: () =>
-      resolveStagedRuntimeDependencies({
-        desktopDependencies: desktopPackageJson.dependencies,
-        serverDependencies,
-        catalog: workspaceCatalog,
+  const resolvedServerDependencies = yield* Effect.try({
+    try: () => resolveCatalogDependencies(serverDependencies, workspaceCatalog, "apps/server"),
+    catch: (cause) =>
+      new DesktopBuildDependencyResolutionError({
+        kind: "server-production",
+        manifestPath: "apps/server/package.json",
+        cause,
       }),
   });
   const resolvedServerRuntimeExternalDependencies = selectCliRuntimeExternalDependencies(
