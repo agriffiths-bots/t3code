@@ -28,6 +28,7 @@ import {
   ThreadCreatedPayload,
   ThreadTurnDiff,
   ThreadTurnStartRequestedPayload,
+  isProviderSendTurnSupportedImageMimeType,
 } from "./orchestration.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 
@@ -526,6 +527,8 @@ it.effect("defaults settled fields when decoding historical thread data", () =>
       interactionMode: "default",
       branch: null,
       worktreePath: null,
+      parentThreadId: "thread-parent",
+      parentEnvironmentId: "environment-parent",
       latestTurn: null,
       createdAt: "2026-01-01T00:00:00.000Z",
       updatedAt: "2026-01-01T00:00:00.000Z",
@@ -548,6 +551,10 @@ it.effect("defaults settled fields when decoding historical thread data", () =>
       hasActionableProposedPlan: false,
     });
 
+    assert.strictEqual(thread.parentThreadId, "thread-parent");
+    assert.strictEqual(thread.parentEnvironmentId, "environment-parent");
+    assert.strictEqual(shell.parentThreadId, "thread-parent");
+    assert.strictEqual(shell.parentEnvironmentId, "environment-parent");
     assert.strictEqual(thread.settledOverride, null);
     assert.strictEqual(thread.settledAt, null);
     assert.strictEqual(shell.settledOverride, null);
@@ -1064,4 +1071,111 @@ it.effect("project favicon overrides accept only supported image files", () =>
     );
     assert.strictEqual(invalid._tag, "Failure");
   }),
+);
+
+it("isProviderSendTurnSupportedImageMimeType accepts raster formats and rejects svg", () => {
+  assert.strictEqual(isProviderSendTurnSupportedImageMimeType("image/png"), true);
+  assert.strictEqual(isProviderSendTurnSupportedImageMimeType("IMAGE/JPEG"), true);
+  assert.strictEqual(isProviderSendTurnSupportedImageMimeType("image/svg+xml"), false);
+});
+
+it.effect(
+  "round-trips parent commands and events and decodes every scheduled-task RPC schema",
+  () =>
+    Effect.gen(function* () {
+      const command = yield* decodeOrchestrationCommand({
+        type: "thread.parent.set",
+        commandId: "cmd-parent-1",
+        threadId: "thread-child",
+        parentThreadId: "thread-parent",
+        parentEnvironmentId: "environment-parent",
+        createdAt: "2026-08-17T00:00:00.000Z",
+      });
+      assert.strictEqual(command.type, "thread.parent.set");
+      if (command.type !== "thread.parent.set")
+        assert.fail("parent command was lost from the union");
+      assert.strictEqual(command.parentThreadId, "thread-parent");
+      assert.strictEqual(command.parentEnvironmentId, "environment-parent");
+
+      const event = yield* decodeOrchestrationEvent({
+        sequence: 1,
+        eventId: "event-parent-1",
+        aggregateKind: "thread",
+        aggregateId: "thread-child",
+        type: "thread.parent-set",
+        occurredAt: "2026-08-17T00:00:00.000Z",
+        commandId: "cmd-parent-1",
+        causationEventId: null,
+        correlationId: "cmd-parent-1",
+        metadata: {},
+        payload: {
+          threadId: "thread-child",
+          parentThreadId: "thread-parent",
+          parentEnvironmentId: "environment-parent",
+          updatedAt: "2026-08-17T00:00:00.000Z",
+        },
+      });
+      assert.strictEqual(event.type, "thread.parent-set");
+      if (event.type !== "thread.parent-set") assert.fail("parent event was lost from the union");
+      assert.strictEqual(event.payload.parentThreadId, "thread-parent");
+      assert.strictEqual(event.payload.parentEnvironmentId, "environment-parent");
+
+      const rawTask = {
+        taskId: "task-1",
+        threadId: "thread-child",
+        prompt: "Continue",
+        scheduleKind: "interval",
+        intervalSeconds: 60,
+        cronExpr: null,
+        timezone: "UTC",
+        enabled: true,
+        busyPolicy: "queue_once",
+        nextRunAt: null,
+        lastRunAt: null,
+        lastStatus: null,
+        modelSelection: null,
+      };
+      const task = yield* Schema.decodeUnknownEffect(
+        OrchestrationRpcSchemas.setScheduledTaskEnabled.output,
+      )(rawTask);
+      assert.deepStrictEqual(
+        yield* Schema.decodeUnknownEffect(OrchestrationRpcSchemas.subscribeScheduledTasks.input)(
+          {},
+        ),
+        {},
+      );
+      assert.deepStrictEqual(
+        yield* Schema.decodeUnknownEffect(OrchestrationRpcSchemas.subscribeScheduledTasks.output)({
+          kind: "snapshot",
+          snapshot: { sequence: 0, tasks: [task] },
+        }),
+        { kind: "snapshot", snapshot: { sequence: 0, tasks: [task] } },
+      );
+      assert.deepStrictEqual(
+        yield* Schema.decodeUnknownEffect(OrchestrationRpcSchemas.setScheduledTaskEnabled.input)({
+          taskId: "task-1",
+          enabled: false,
+        }),
+        { taskId: "task-1", enabled: false },
+      );
+      assert.deepStrictEqual(
+        yield* Schema.decodeUnknownEffect(OrchestrationRpcSchemas.setScheduledTaskEnabled.output)(
+          task,
+        ),
+        task,
+      );
+      assert.deepStrictEqual(
+        yield* Schema.decodeUnknownEffect(OrchestrationRpcSchemas.deleteScheduledTask.input)({
+          taskId: "task-1",
+        }),
+        { taskId: "task-1" },
+      );
+      assert.deepStrictEqual(
+        yield* Schema.decodeUnknownEffect(OrchestrationRpcSchemas.deleteScheduledTask.output)({
+          taskId: "task-1",
+          deleted: true,
+        }),
+        { taskId: "task-1", deleted: true },
+      );
+    }),
 );

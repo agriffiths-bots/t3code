@@ -311,7 +311,6 @@ export function useThreadComposerState() {
     modelSelection,
     runtimeMode,
     interactionMode,
-    activeThreadBusy,
     onChangeDraftMessage,
     onPickDraftImages,
     onPasteIntoDraft,

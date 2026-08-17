@@ -13,7 +13,7 @@ it.effect("reports generic capability denial for provider-scoped credentials", (
     providerInstanceId: ProviderInstanceId.make("codex"),
     capabilities: new Set(),
     issuedAt: 1,
-    expiresAt: 2,
+    expiresAt: Number.MAX_SAFE_INTEGER,
   };
 
   return Effect.gen(function* () {

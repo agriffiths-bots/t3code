@@ -25,9 +25,13 @@ import {
   browserApiCorsLayer,
   httpCompressionLayer,
 } from "./http.ts";
+import { guardHttpResponseWriteErrors } from "./httpResponseErrorGuard.ts";
 import { fixPath } from "./os-jank.ts";
 import { websocketRpcRouteLayer } from "./ws.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
+import { pullRequestHttpApiLayer } from "./pullRequest/http.ts";
+import * as PullRequestProviderRegistry from "./pullRequest/PullRequestProviderRegistry.ts";
+import * as PullRequestService from "./pullRequest/PullRequestService.ts";
 import { layerConfig as SqlitePersistenceLayerLive } from "./persistence/Layers/Sqlite.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
@@ -49,6 +53,7 @@ import { ProviderInstanceRegistryHydrationLive } from "./provider/Layers/Provide
 import * as TerminalManager from "./terminal/Manager.ts";
 import * as McpHttpServer from "./mcp/McpHttpServer.ts";
 import * as McpSessionRegistry from "./mcp/McpSessionRegistry.ts";
+import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
 import * as PreviewManager from "./preview/Manager.ts";
 import * as PortScanner from "./preview/PortScanner.ts";
 import * as ProcessRunner from "./processRunner.ts";
@@ -95,6 +100,7 @@ import * as SourceControlRepositoryService from "./sourceControl/SourceControlRe
 import * as ProjectSetupScriptRunner from "./project/ProjectSetupScriptRunner.ts";
 import { ObservabilityLive } from "./observability/Layers/Observability.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
+import * as RemoteOpenTargets from "./environment/RemoteOpenTargets.ts";
 import { authHttpApiLayer, environmentAuthenticatedAuthLayer } from "./auth/http.ts";
 import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
@@ -226,7 +232,7 @@ const HttpServerLive = Layer.unwrap(
         Effect.promise(() => import("@effect/platform-node/NodeHttpServer")),
         Effect.promise(() => import("node:http")),
       ]);
-      return NodeHttpServer.layer(NodeHttp.createServer, {
+      return NodeHttpServer.layer(() => guardHttpResponseWriteErrors(NodeHttp.createServer()), {
         host: config.host ?? "127.0.0.1",
         port: config.port,
         gracefulShutdownTimeout: HTTP_PREEMPTIVE_SHUTDOWN_GRACE_MS,
@@ -449,10 +455,7 @@ const RuntimeCoreDependenciesLive = RuntimeCoreDependenciesBaseLive.pipe(
   Layer.provideMerge(DeviceNotificationsLayerLive),
   Layer.provideMerge(
     Layer.mergeAll(
-      CloudCliTokenManager.layer.pipe(
-        Layer.provide(ServerSecretStore.layer),
-        Layer.provide(ExternalLauncher.layer),
-      ),
+      CloudCliTokenManager.layer.pipe(Layer.provide(ExternalLauncher.layer)),
       CloudManagedEndpointRuntimeLive,
     ),
   ),
@@ -467,6 +470,7 @@ const RuntimeDependenciesLive = PlanUsageSnapshot.layer.pipe(
   Layer.provideMerge(TraceDiagnostics.layer),
   Layer.provideMerge(AnalyticsService.layer),
   Layer.provideMerge(ExternalLauncher.layer),
+  Layer.provideMerge(RemoteOpenTargets.layer),
   Layer.provideMerge(ServerLifecycleEvents.layer),
   Layer.provide(NetService.layer),
 );
@@ -496,12 +500,20 @@ const McpRoutesLayer = Layer.mergeAll(mcpPeerTokenRouteLayer, McpHttpServer.laye
   Layer.provide(SubagentPeerRegistry.layer),
 );
 
+const PullRequestServiceLive = PullRequestService.layer.pipe(
+  // One registry entry per supported host; the service only knows the registry.
+  Layer.provide(PullRequestProviderRegistry.layer),
+  Layer.provide(SourceControlProviderRegistryLayerLive),
+  Layer.provide(VcsProcess.layer),
+);
+
 export const makeRoutesLayer = Layer.mergeAll(
   Layer.mergeAll(
     HttpApiBuilder.layer(EnvironmentHttpApi).pipe(
       Layer.provide(authHttpApiLayer),
       Layer.provide(connectHttpApiLayer),
       Layer.provide(orchestrationHttpApiLayer),
+      Layer.provide(pullRequestHttpApiLayer),
       Layer.provide(serverEnvironmentHttpApiLayer),
       Layer.provide(environmentAuthenticatedAuthLayer),
     ),
@@ -518,6 +530,11 @@ export const makeRoutesLayer = Layer.mergeAll(
   ),
   McpRoutesLayer,
 ).pipe(
+  // Both transports consume the same service instance, so caches single-flight across clients
+  // and mutations observed on WebSocket invalidate patches subsequently read over HTTP.
+  Layer.provide(PullRequestServiceLive),
+  Layer.provide(PreviewAutomationBroker.layer),
+  Layer.provide(ServerSelfUpdate.layer),
   Layer.provide(commandReadinessLayer),
   Layer.provide(browserApiCorsLayer),
   Layer.provide(httpCompressionLayer),

@@ -25,6 +25,7 @@ import {
 } from "effect/unstable/http";
 
 import * as ServerConfig from "../config.ts";
+import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as SubagentPeerRegistry from "../subagents/SubagentPeerRegistry.ts";
 import {
@@ -337,14 +338,19 @@ const runWithPeerRegistry = <A, E>(
     const logLevel = yield* GlobalFlag.LogLevel;
     const config = yield* resolveCliAuthConfig(flags, logLevel);
     const minimumLogLevel = options?.quietLogs ? "Error" : config.logLevel;
+    const configLayer = ServerConfig.layer(config);
+    const secretStoreLayer = ServerSecretStore.layer.pipe(Layer.provide(configLayer));
     return yield* Effect.gen(function* () {
       const registry = yield* SubagentPeerRegistry.SubagentPeerRegistry;
       return yield* run(registry);
     }).pipe(
       Effect.provide(
         Layer.mergeAll(
-          SubagentPeerRegistry.layer.pipe(Layer.provide(ServerConfig.layer(config))),
-          ServerEnvironment.layer.pipe(Layer.provide(ServerConfig.layer(config))),
+          SubagentPeerRegistry.layer.pipe(
+            Layer.provide(secretStoreLayer),
+            Layer.provide(configLayer),
+          ),
+          ServerEnvironment.layer.pipe(Layer.provide(secretStoreLayer), Layer.provide(configLayer)),
           FetchHttpClient.layer,
           Layer.succeed(FetchHttpClient.RequestInit, PEER_PAIRING_FETCH_REQUEST_INIT),
           Layer.succeed(References.MinimumLogLevel, minimumLogLevel),

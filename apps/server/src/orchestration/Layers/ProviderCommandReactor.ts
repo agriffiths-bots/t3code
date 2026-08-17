@@ -50,6 +50,7 @@ import {
   type ProviderCommandReactorShape,
 } from "../Services/ProviderCommandReactor.ts";
 import { forkParked, ServerActivation } from "../../serverActivation.ts";
+import { canReplaceThreadTitle, DEFAULT_THREAD_TITLE } from "../threadTitles.ts";
 import {
   resolveSourceControlWriterModelSelection,
   ServerSettingsService,
@@ -110,7 +111,6 @@ const HANDLED_TURN_START_KEY_TTL = Duration.minutes(30);
 const FAILED_TURN_STOP_TIMEOUT = Duration.seconds(10);
 const FAILED_TURN_SESSION_LOOKUP_TIMEOUT = Duration.seconds(1);
 const DEFAULT_RUNTIME_MODE: RuntimeMode = "full-access";
-const DEFAULT_THREAD_TITLE = "New thread";
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 
 function normalizeWorktreeIdentityPath(value: string | null | undefined): string | null {
@@ -260,18 +260,6 @@ export function providerErrorLabelFromInstanceHint(input: {
   return providerErrorLabel(
     input.instanceId ?? input.modelSelectionInstanceId ?? input.sessionProvider,
   );
-}
-
-function canReplaceThreadTitle(currentTitle: string, titleSeed?: string): boolean {
-  const trimmedCurrentTitle = currentTitle.trim();
-  if (trimmedCurrentTitle === DEFAULT_THREAD_TITLE) {
-    return true;
-  }
-
-  const trimmedTitleSeed = titleSeed?.trim();
-  return trimmedTitleSeed !== undefined && trimmedTitleSeed.length > 0
-    ? trimmedCurrentTitle === trimmedTitleSeed
-    : false;
 }
 
 function findProviderAdapterRequestError(
