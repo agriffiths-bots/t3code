@@ -114,6 +114,7 @@ const makeAssetAccessTestLayer = (
     ServerSecretStore.layer.pipe(Layer.provide(configLayer)),
     Layer.mock(SessionStore.SessionStore)({
       cookieName: "t3_asset_access_test",
+      cookieNames: ["t3_asset_access_test"],
       isActive: () => Effect.succeed(true),
     }),
     Layer.mock(ServerEnvironment.ServerEnvironment)({
@@ -531,6 +532,7 @@ describe("AssetAccess", () => {
           Effect.provide(
             Layer.mock(SessionStore.SessionStore)({
               cookieName: "t3_asset_access_revoked_test",
+              cookieNames: ["t3_asset_access_revoked_test"],
               isActive: () => Effect.succeed(false),
             }),
           ),

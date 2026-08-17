@@ -29,6 +29,7 @@ const makeFakeSessionStore = (
 ): SessionStore.SessionStore["Service"] =>
   SessionStore.SessionStore.of({
     cookieName: "t3.test.sid",
+    cookieNames: ["t3.test.sid"],
     issue: () => Effect.die("unused"),
     verify: () => Effect.die("unused"),
     issueWebSocketToken: () => Effect.die("unused"),

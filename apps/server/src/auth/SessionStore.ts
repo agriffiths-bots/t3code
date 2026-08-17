@@ -27,7 +27,7 @@ import { restrictScopesForAudienceCeiling } from "./audienceScopePolicy.ts";
 import {
   base64UrlDecodeUtf8,
   base64UrlEncode,
-  resolveSessionCookieName,
+  resolveSessionCookieNames,
   signPayload,
   timingSafeEqualBase64Url,
 } from "./utils.ts";
@@ -375,6 +375,7 @@ export class SessionStore extends Context.Service<
   SessionStore,
   {
     readonly cookieName: string;
+    readonly cookieNames: readonly [string, ...Array<string>];
     readonly issue: (input: {
       readonly audienceCeiling: AuthAudienceCeiling;
       readonly ttl?: Duration.Duration;
@@ -490,13 +491,14 @@ export const make = Effect.gen(function* () {
   const signingSecret = yield* secretStore.getOrCreateRandom(SIGNING_SECRET_NAME, 32);
   const connectedSessionsRef = yield* Ref.make(new Map<string, number>());
   const changesPubSub = yield* PubSub.unbounded<SessionCredentialChange>();
-  const cookieName = resolveSessionCookieName({
+  const cookieNames = resolveSessionCookieNames({
     mode: serverConfig.mode,
     port: serverConfig.port,
     host: serverConfig.host,
     instanceKey: serverConfig.stateDir,
     development: serverConfig.devUrl !== undefined,
   });
+  const cookieName = cookieNames[0];
 
   const emitUpsert = (clientSession: AuthClientSession) =>
     PubSub.publish(changesPubSub, {
@@ -978,6 +980,7 @@ export const make = Effect.gen(function* () {
 
   return SessionStore.of({
     cookieName,
+    cookieNames,
     issue,
     verify,
     issueWebSocketToken,

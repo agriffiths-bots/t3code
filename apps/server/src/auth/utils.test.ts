@@ -4,6 +4,7 @@ import {
   deriveAuthClientMetadata,
   isRemoteReachableHost,
   resolveSessionCookieName,
+  resolveSessionCookieNames,
 } from "./utils.ts";
 
 describe("deriveAuthClientMetadata", () => {
@@ -98,6 +99,19 @@ describe("session cookie isolation", () => {
         development: false,
       }),
     ).toBe("t3_session");
+  });
+
+  it("accepts the legacy hosted cookie during production loopback upgrades", () => {
+    const cookieNames = resolveSessionCookieNames({
+      mode: "web",
+      port: 3773,
+      host: "127.0.0.1",
+      instanceKey: "/srv/hosted-behind-proxy",
+      development: false,
+    });
+
+    expect(cookieNames[0]).toMatch(/^t3_session_3773_[a-f0-9]{12}$/);
+    expect(cookieNames[1]).toBe("t3_session");
   });
 
   it("retains desktop port scoping", () => {
