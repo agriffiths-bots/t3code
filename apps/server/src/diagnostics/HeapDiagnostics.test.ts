@@ -3,8 +3,11 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
+import * as PlatformError from "effect/PlatformError";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
@@ -44,7 +47,22 @@ const makeOperations = (
   ...overrides,
 });
 
-const makeTestLayer = (operations: HeapDiagnosticsOperations) =>
+const NoopChmodFileSystemLayer = Layer.effect(
+  FileSystem.FileSystem,
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+
+    return {
+      ...fileSystem,
+      chmod: () => Effect.void,
+    } satisfies FileSystem.FileSystem;
+  }),
+).pipe(Layer.provide(NodeServices.layer));
+
+const makeTestLayer = (
+  operations: HeapDiagnosticsOperations,
+  fileSystemLayer = NoopChmodFileSystemLayer,
+) =>
   layerWithOperations(operations).pipe(
     Layer.provide(
       Layer.succeed(
@@ -59,7 +77,39 @@ const makeTestLayer = (operations: HeapDiagnosticsOperations) =>
       ),
     ),
     Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "t3-heap-diagnostics-" })),
+    Layer.provideMerge(fileSystemLayer),
   );
+
+const makeChmodFailureLayer = (failedMode: number, failedOccurrence = 1) =>
+  Layer.effect(
+    FileSystem.FileSystem,
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      let matchingCallCount = 0;
+
+      return {
+        ...fileSystem,
+        chmod: (path, mode) => {
+          if (mode === failedMode) {
+            matchingCallCount += 1;
+            if (matchingCallCount === failedOccurrence) {
+              return Effect.fail(
+                PlatformError.systemError({
+                  _tag: "PermissionDenied",
+                  module: "FileSystem",
+                  method: "chmod",
+                  pathOrDescriptor: path,
+                  description: "Permission denied while securing heap snapshot data.",
+                }),
+              );
+            }
+          }
+
+          return fileSystem.chmod(path, mode);
+        },
+      } satisfies FileSystem.FileSystem;
+    }),
+  ).pipe(Layer.provide(NodeServices.layer));
 
 it.layer(NodeServices.layer)("HeapDiagnostics", (it) => {
   it.effect("maps process, V8, and live orchestration fields", () =>
@@ -127,6 +177,77 @@ it.layer(NodeServices.layer)("HeapDiagnostics", (it) => {
       expect(writtenPaths).toEqual([result.path]);
     }).pipe(Effect.provide(makeTestLayer(operations)));
   });
+
+  it.effect("uses owner-only permissions for the snapshot directory and file", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      let snapshotModeBeforeWrite: number | undefined;
+      const operations = makeOperations({
+        writeHeapSnapshot: (destination) =>
+          Effect.gen(function* () {
+            snapshotModeBeforeWrite = (yield* fileSystem.stat(destination)).mode & 0o777;
+            yield* fileSystem.writeFileString(destination, "snapshot");
+            return destination;
+          }).pipe(Effect.orDie),
+      });
+
+      yield* Effect.gen(function* () {
+        const diagnostics = yield* HeapDiagnostics;
+        const result = yield* diagnostics.writeSnapshot({ filename: "secure.heapsnapshot" });
+        const directoryStat = yield* fileSystem.stat(path.dirname(result.path));
+        const snapshotStat = yield* fileSystem.stat(result.path);
+
+        expect(snapshotModeBeforeWrite).toBe(0o600);
+        expect(directoryStat.mode & 0o777).toBe(0o700);
+        expect(snapshotStat.mode & 0o777).toBe(0o600);
+      }).pipe(Effect.provide(makeTestLayer(operations, NodeServices.layer)));
+    }),
+  );
+
+  it.effect("fails the operation when directory or file permissions cannot be secured", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      for (const { failedMode, failedOccurrence, expectedWriteCount } of [
+        { failedMode: 0o700, failedOccurrence: 1, expectedWriteCount: 0 },
+        { failedMode: 0o600, failedOccurrence: 1, expectedWriteCount: 0 },
+        { failedMode: 0o600, failedOccurrence: 2, expectedWriteCount: 1 },
+      ] as const) {
+        let writeCount = 0;
+        let writtenPath: string | undefined;
+        const operations = makeOperations({
+          writeHeapSnapshot: (path) =>
+            Effect.sync(() => {
+              writeCount += 1;
+              writtenPath = path;
+              return path;
+            }),
+        });
+
+        const error = yield* Effect.gen(function* () {
+          const diagnostics = yield* HeapDiagnostics;
+          return yield* diagnostics
+            .writeSnapshot({ filename: "chmod-failure.heapsnapshot" })
+            .pipe(Effect.flip);
+        }).pipe(
+          Effect.provide(
+            makeTestLayer(operations, makeChmodFailureLayer(failedMode, failedOccurrence)),
+          ),
+        );
+
+        expect(error.reason).toBe("writeFailed");
+        expect(error.detail).toBe(
+          failedMode === 0o700
+            ? "Could not secure the heap snapshot directory."
+            : "Could not secure the heap snapshot file.",
+        );
+        expect(writeCount).toBe(expectedWriteCount);
+        if (writtenPath !== undefined) {
+          expect(yield* fileSystem.exists(writtenPath)).toBe(false);
+        }
+      }
+    }),
+  );
 
   it.effect("rejects concurrent snapshots instead of queueing them", () =>
     Effect.gen(function* () {

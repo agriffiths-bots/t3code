@@ -159,7 +159,38 @@ export const make = Effect.fn("makeHeapDiagnostics")(function* (
                   }),
               ),
             );
+            yield* fileSystem.chmod(config.heapSnapshotsDir, 0o700).pipe(
+              Effect.mapError(
+                () =>
+                  new ServerHeapSnapshotError({
+                    reason: "writeFailed",
+                    detail: "Could not secure the heap snapshot directory.",
+                  }),
+              ),
+            );
             const destination = path.join(config.heapSnapshotsDir, filename);
+            const removeSnapshot = fileSystem.remove(destination).pipe(Effect.ignore);
+            yield* fileSystem
+              .writeFile(destination, new Uint8Array(), { flag: "wx", mode: 0o600 })
+              .pipe(
+                Effect.mapError(
+                  () =>
+                    new ServerHeapSnapshotError({
+                      reason: "writeFailed",
+                      detail: "Could not create the heap snapshot file.",
+                    }),
+                ),
+              );
+            yield* fileSystem.chmod(destination, 0o600).pipe(
+              Effect.onError(() => removeSnapshot),
+              Effect.mapError(
+                () =>
+                  new ServerHeapSnapshotError({
+                    reason: "writeFailed",
+                    detail: "Could not secure the heap snapshot file.",
+                  }),
+              ),
+            );
             const startedAtMs = yield* Clock.currentTimeMillis;
 
             yield* Effect.logWarning(
@@ -177,11 +208,22 @@ export const make = Effect.fn("makeHeapDiagnostics")(function* (
                   Effect.annotateLogs({ destination, cause }),
                 ),
               ),
+              Effect.onError(() => removeSnapshot),
               Effect.mapError(
                 () =>
                   new ServerHeapSnapshotError({
                     reason: "writeFailed",
                     detail: "V8 could not write the heap snapshot.",
+                  }),
+              ),
+            );
+            yield* fileSystem.chmod(writtenPath, 0o600).pipe(
+              Effect.onError(() => fileSystem.remove(writtenPath).pipe(Effect.ignore)),
+              Effect.mapError(
+                () =>
+                  new ServerHeapSnapshotError({
+                    reason: "writeFailed",
+                    detail: "Could not secure the heap snapshot file.",
                   }),
               ),
             );
