@@ -340,6 +340,34 @@ export const ServerProcessDiagnosticsResult = Schema.Struct({
 });
 export type ServerProcessDiagnosticsResult = typeof ServerProcessDiagnosticsResult.Type;
 
+export const ServerHeapSnapshotFilename = TrimmedNonEmptyString.check(
+  Schema.isMaxLength(160),
+  Schema.isPattern(/^[A-Za-z0-9][A-Za-z0-9_-]*\.heapsnapshot$/),
+);
+export type ServerHeapSnapshotFilename = typeof ServerHeapSnapshotFilename.Type;
+
+export const ServerWriteHeapSnapshotInput = Schema.Struct({
+  filename: Schema.optional(ServerHeapSnapshotFilename),
+});
+export type ServerWriteHeapSnapshotInput = typeof ServerWriteHeapSnapshotInput.Type;
+
+export const ServerWriteHeapSnapshotResult = Schema.Struct({
+  path: TrimmedNonEmptyString,
+});
+export type ServerWriteHeapSnapshotResult = typeof ServerWriteHeapSnapshotResult.Type;
+
+export class ServerHeapSnapshotError extends Schema.TaggedErrorClass<ServerHeapSnapshotError>()(
+  "ServerHeapSnapshotError",
+  {
+    reason: Schema.Literals(["busy", "invalidFilename", "writeFailed"]),
+    detail: TrimmedNonEmptyString,
+  },
+) {
+  override get message(): string {
+    return `Heap snapshot failed (${this.reason}): ${this.detail}`;
+  }
+}
+
 export const ServerProcessResourceHistoryInput = Schema.Struct({
   windowMs: NonNegativeInt,
   bucketMs: NonNegativeInt,

@@ -140,6 +140,19 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
     }),
   );
 
+  it.effect("derives the heap snapshot directory beneath T3 state", () =>
+    Effect.gen(function* () {
+      const { join } = yield* Path.Path;
+      const baseDir = join(NodeOS.tmpdir(), "t3-cli-config-heap-snapshot-base");
+      const paths = yield* deriveExplicitServerPaths(baseDir, undefined);
+
+      assert.equal(
+        paths.heapSnapshotsDir,
+        join(baseDir, "userdata", "diagnostics", "heap-snapshots"),
+      );
+    }),
+  );
+
   it.effect(
     "serves web statics from an explicit out-of-tree --static-dir / T3CODE_STATIC_DIR",
     () =>

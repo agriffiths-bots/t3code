@@ -107,6 +107,8 @@ const BUFFERED_PROPOSED_PLAN_BY_ID_TTL = Duration.minutes(120);
 const TASK_DESCRIPTION_BY_TASK_CACHE_CAPACITY = 10_000;
 const TASK_DESCRIPTION_BY_TASK_TTL = Duration.minutes(120);
 const MAX_BUFFERED_ASSISTANT_CHARS = 24_000;
+const MAX_BUFFERED_PROPOSED_PLAN_CHARS = 256_000;
+const PROPOSED_PLAN_TRUNCATION_MARKER = "\n\n[Proposed plan truncated by the server safety limit.]";
 const STRICT_PROVIDER_LIFECYCLE_GUARD = process.env.T3CODE_STRICT_PROVIDER_LIFECYCLE_GUARD !== "0";
 
 type TurnStartRequestedDomainEvent = Extract<
@@ -920,10 +922,13 @@ const make = Effect.gen(function* () {
       ),
   });
 
-  const bufferedProposedPlanById = yield* Cache.make<string, { text: string; createdAt: string }>({
+  const bufferedProposedPlanById = yield* Cache.make<
+    string,
+    { text: string; createdAt: string; truncated: boolean }
+  >({
     capacity: BUFFERED_PROPOSED_PLAN_BY_ID_CACHE_CAPACITY,
     timeToLive: BUFFERED_PROPOSED_PLAN_BY_ID_TTL,
-    lookup: () => Effect.succeed({ text: "", createdAt: "" }),
+    lookup: () => Effect.succeed({ text: "", createdAt: "", truncated: false }),
   });
 
   // Task names arrive on task.started/task.progress but not on task.completed,
@@ -1198,14 +1203,44 @@ const make = Effect.gen(function* () {
 
   const appendBufferedProposedPlan = (planId: string, delta: string, createdAt: string) =>
     Cache.getOption(bufferedProposedPlanById, planId).pipe(
-      Effect.flatMap((existingEntry) => {
-        const existing = Option.getOrUndefined(existingEntry);
-        return Cache.set(bufferedProposedPlanById, planId, {
-          text: `${existing?.text ?? ""}${delta}`,
-          createdAt:
-            existing?.createdAt && existing.createdAt.length > 0 ? existing.createdAt : createdAt,
-        });
-      }),
+      Effect.flatMap((existingEntry) =>
+        Effect.gen(function* () {
+          const existing = Option.getOrUndefined(existingEntry);
+          if (existing?.truncated === true) {
+            return;
+          }
+
+          const currentText = existing?.text ?? "";
+          const entryCreatedAt =
+            existing?.createdAt && existing.createdAt.length > 0 ? existing.createdAt : createdAt;
+          if (currentText.length + delta.length <= MAX_BUFFERED_PROPOSED_PLAN_CHARS) {
+            yield* Cache.set(bufferedProposedPlanById, planId, {
+              text: `${currentText}${delta}`,
+              createdAt: entryCreatedAt,
+              truncated: false,
+            });
+            return;
+          }
+
+          const maximumPrefixLength =
+            MAX_BUFFERED_PROPOSED_PLAN_CHARS - PROPOSED_PLAN_TRUNCATION_MARKER.length;
+          const retainedCurrentText = currentText.slice(0, maximumPrefixLength);
+          const retainedDeltaLength = maximumPrefixLength - retainedCurrentText.length;
+          const text = `${retainedCurrentText}${delta.slice(0, retainedDeltaLength)}${PROPOSED_PLAN_TRUNCATION_MARKER}`;
+          yield* Cache.set(bufferedProposedPlanById, planId, {
+            text,
+            createdAt: entryCreatedAt,
+            truncated: true,
+          });
+          yield* Effect.logWarning("Proposed plan truncated by server safety limit").pipe(
+            Effect.annotateLogs({
+              planId,
+              retainedCharacters: text.length,
+              rejectedDeltaCharacters: delta.length - retainedDeltaLength,
+            }),
+          );
+        }),
+      ),
     );
 
   const takeBufferedProposedPlan = (planId: string) =>

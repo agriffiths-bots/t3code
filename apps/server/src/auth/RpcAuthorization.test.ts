@@ -1,4 +1,5 @@
 import {
+  AuthAccessWriteScope,
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
   AuthRelayReadScope,
@@ -27,6 +28,12 @@ describe("RPC authorization scopes", () => {
     );
     expect(requiredScopeForRpcMethod(WS_METHODS.subscribeBackgroundPolicy)).toBe(
       AuthOrchestrationReadScope,
+    );
+  });
+
+  it("restricts heap snapshots to administrative access-write sessions", () => {
+    expect(requiredScopeForRpcMethod(WS_METHODS.serverWriteHeapSnapshot)).toBe(
+      AuthAccessWriteScope,
     );
   });
 
