@@ -133,6 +133,9 @@ import {
   ServerSelfUpdateResult,
   ServerTraceDiagnosticsResult,
   ServerProcessDiagnosticsResult,
+  ServerHeapSnapshotError,
+  ServerWriteHeapSnapshotInput,
+  ServerWriteHeapSnapshotResult,
   ServerProcessResourceHistoryInput,
   ServerProcessResourceHistoryResult,
   ServerNotificationAckInput,
@@ -237,6 +240,7 @@ export const WS_METHODS = {
   serverDiscoverSourceControl: "server.discoverSourceControl",
   serverGetTraceDiagnostics: "server.getTraceDiagnostics",
   serverGetProcessDiagnostics: "server.getProcessDiagnostics",
+  serverWriteHeapSnapshot: "server.writeHeapSnapshot",
   serverGetProcessResourceHistory: "server.getProcessResourceHistory",
   serverGetResourceTelemetryHistory: "server.getResourceTelemetryHistory",
   serverRetryResourceTelemetry: "server.retryResourceTelemetry",
@@ -360,6 +364,12 @@ export const WsServerGetProcessDiagnosticsRpc = Rpc.make(WS_METHODS.serverGetPro
   payload: Schema.Struct({}),
   success: ServerProcessDiagnosticsResult,
   error: EnvironmentAuthorizationError,
+});
+
+export const WsServerWriteHeapSnapshotRpc = Rpc.make(WS_METHODS.serverWriteHeapSnapshot, {
+  payload: ServerWriteHeapSnapshotInput,
+  success: ServerWriteHeapSnapshotResult,
+  error: Schema.Union([ServerHeapSnapshotError, EnvironmentAuthorizationError]),
 });
 
 export const WsServerGetProcessResourceHistoryRpc = Rpc.make(
@@ -878,6 +888,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerDiscoverSourceControlRpc,
   WsServerGetTraceDiagnosticsRpc,
   WsServerGetProcessDiagnosticsRpc,
+  WsServerWriteHeapSnapshotRpc,
   WsServerGetProcessResourceHistoryRpc,
   WsServerGetResourceTelemetryHistoryRpc,
   WsServerRetryResourceTelemetryRpc,

@@ -29,7 +29,10 @@ import {
   type OrchestrationEventStoreShape,
 } from "../../persistence/Services/OrchestrationEventStore.ts";
 import * as RepositoryIdentityResolver from "../../project/RepositoryIdentityResolver.ts";
-import { OrchestrationEngineLive } from "./OrchestrationEngine.ts";
+import {
+  measureCommandModelHeapDiagnostics,
+  OrchestrationEngineLive,
+} from "./OrchestrationEngine.ts";
 import { OrchestrationProjectionPipelineLive } from "./ProjectionPipeline.ts";
 import { OrchestrationProjectionSnapshotQueryLive } from "./ProjectionSnapshotQuery.ts";
 import * as ThreadBackgroundLiveness from "../ThreadBackgroundLiveness.ts";
@@ -270,7 +273,7 @@ describe("OrchestrationEngine", () => {
     await runtime.dispose();
   });
 
-  it("persists deterministic read models for repeated snapshot reads", async () => {
+  it("reports live command read-model heap diagnostics", async () => {
     const createdAt = now();
     const system = await createOrchestrationSystem();
     const { engine } = system;
@@ -327,6 +330,33 @@ describe("OrchestrationEngine", () => {
     const readModelA = await system.readModel();
     const readModelB = await system.readModel();
     expect(readModelB).toEqual(readModelA);
+    const expectedStats = {
+      threadCount: 1,
+      deletedThreadCount: 0,
+      retainedMessageCount: 1,
+      retainedMessageTextCodeUnits: 5,
+      retainedMessageTextUtf16Bytes: 10,
+    };
+    expect(measureCommandModelHeapDiagnostics(readModelA)).toEqual(expectedStats);
+
+    const readHeapDiagnostics = engine.readCommandModelHeapDiagnostics;
+    expect(readHeapDiagnostics).toBeDefined();
+    if (readHeapDiagnostics === undefined) {
+      throw new Error("Expected the live orchestration engine to expose heap diagnostics.");
+    }
+    expect(await system.run(readHeapDiagnostics)).toEqual(expectedStats);
+
+    await system.run(
+      dispatchTestCommand(engine, {
+        type: "thread.delete",
+        commandId: CommandId.make("cmd-thread-1-delete"),
+        threadId: ThreadId.make("thread-1"),
+      }),
+    );
+    expect(await system.run(readHeapDiagnostics)).toEqual({
+      ...expectedStats,
+      deletedThreadCount: 1,
+    });
     await system.dispose();
   });
 

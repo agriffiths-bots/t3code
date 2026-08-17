@@ -49,6 +49,7 @@ import {
   OrchestrationEngineService,
   type OrchestrationCommandAcceptanceGuard,
   type OrchestrationEngineShape,
+  type OrchestrationCommandModelHeapDiagnostics,
 } from "../Services/OrchestrationEngine.ts";
 import {
   commandRequiresWorktreeLifecycle,
@@ -70,6 +71,32 @@ interface CommandEnvelope {
   result: Deferred.Deferred<{ sequence: number }, OrchestrationDispatchError>;
   startedAtMs: number;
 }
+
+export const measureCommandModelHeapDiagnostics = (
+  readModel: OrchestrationReadModel,
+): OrchestrationCommandModelHeapDiagnostics => {
+  let deletedThreadCount = 0;
+  let retainedMessageCount = 0;
+  let retainedMessageTextCodeUnits = 0;
+
+  for (const thread of readModel.threads) {
+    if (thread.deletedAt !== null) {
+      deletedThreadCount += 1;
+    }
+    retainedMessageCount += thread.messages.length;
+    for (const message of thread.messages) {
+      retainedMessageTextCodeUnits += message.text.length;
+    }
+  }
+
+  return {
+    threadCount: readModel.threads.length,
+    deletedThreadCount,
+    retainedMessageCount,
+    retainedMessageTextCodeUnits,
+    retainedMessageTextUtf16Bytes: retainedMessageTextCodeUnits * 2,
+  };
+};
 
 const makeOrchestrationEngine = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
@@ -428,6 +455,11 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     // consistent, committed value — reassignment of `commandReadModel` is
     // atomic on the single-threaded event loop.
     latestSequence: Effect.sync(() => commandReadModel.snapshotSequence),
+    // Keep the complete tuple inside one synchronous turn. Like latestSequence,
+    // this relies on commandReadModel reassignment being atomic on the event loop.
+    readCommandModelHeapDiagnostics: Effect.sync(() =>
+      measureCommandModelHeapDiagnostics(commandReadModel),
+    ),
   } satisfies OrchestrationEngineShape;
 });
 

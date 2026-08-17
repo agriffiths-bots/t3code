@@ -34,6 +34,7 @@ export interface ServerDerivedPaths {
   readonly worktreesDir: string;
   readonly attachmentsDir: string;
   readonly logsDir: string;
+  readonly heapSnapshotsDir: string;
   readonly serverLogPath: string;
   readonly serverTracePath: string;
   readonly providerLogsDir: string;
@@ -111,6 +112,7 @@ export const deriveServerPaths = Effect.fn(function* (
   const dbPath = join(stateDir, "state.sqlite");
   const attachmentsDir = join(stateDir, "attachments");
   const logsDir = join(stateDir, "logs");
+  const heapSnapshotsDir = join(stateDir, "diagnostics", "heap-snapshots");
   const providerLogsDir = join(logsDir, "provider");
   const providerStatusCacheDir = join(baseDir, "caches");
   return {
@@ -122,6 +124,7 @@ export const deriveServerPaths = Effect.fn(function* (
     worktreesDir: join(baseDir, "worktrees"),
     attachmentsDir,
     logsDir,
+    heapSnapshotsDir,
     serverLogPath: join(logsDir, "server.log"),
     serverTracePath: join(logsDir, "server.trace.ndjson"),
     providerLogsDir,

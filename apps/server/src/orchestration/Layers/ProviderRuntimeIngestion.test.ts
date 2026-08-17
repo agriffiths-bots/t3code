@@ -1973,6 +1973,63 @@ describe("ProviderRuntimeIngestion", () => {
     expect(proposedPlan?.planMarkdown).toBe("## Buffered plan\n\n- first\n- second");
   });
 
+  it("caps buffered proposed-plan text with a visible truncation marker", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    const threadId = asThreadId("thread-1");
+    const turnId = asTurnId("turn-plan-cap");
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-turn-started-plan-cap"),
+      provider: ProviderDriverKind.make("codex"),
+      createdAt: now,
+      threadId,
+      turnId,
+    });
+    await waitForThread(
+      harness.readModel,
+      (thread) => thread.session?.status === "running" && thread.session?.activeTurnId === turnId,
+    );
+
+    const emitDelta = (eventId: string, delta: string) =>
+      harness.emit({
+        type: "turn.proposed.delta",
+        eventId: asEventId(eventId),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: now,
+        threadId,
+        turnId,
+        payload: { delta },
+      });
+
+    emitDelta("evt-plan-cap-prefix", "a".repeat(250_000));
+    emitDelta("evt-plan-cap-overflow", "b".repeat(10_000));
+    emitDelta("evt-plan-cap-ignored", "must-not-appear");
+    harness.emit({
+      type: "turn.completed",
+      eventId: asEventId("evt-turn-completed-plan-cap"),
+      provider: ProviderDriverKind.make("codex"),
+      createdAt: now,
+      threadId,
+      turnId,
+      payload: { state: "completed" },
+    });
+
+    const thread = await waitForThread(harness.readModel, (entry) =>
+      entry.proposedPlans.some(
+        (proposedPlan: ProviderRuntimeTestProposedPlan) =>
+          proposedPlan.id === "plan:thread-1:turn:turn-plan-cap",
+      ),
+    );
+    const planMarkdown = thread.proposedPlans.find(
+      (entry: ProviderRuntimeTestProposedPlan) => entry.id === "plan:thread-1:turn:turn-plan-cap",
+    )?.planMarkdown;
+    expect(planMarkdown?.length).toBe(256_000);
+    expect(planMarkdown).toMatch(/\[Proposed plan truncated by the server safety limit\.\]$/);
+    expect(planMarkdown).not.toContain("must-not-appear");
+  });
+
   it("buffers assistant deltas by default until completion", async () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";

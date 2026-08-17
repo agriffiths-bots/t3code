@@ -128,6 +128,7 @@ import {
   isRpcMethodAllowedForAudienceCeiling,
 } from "./auth/audienceScopePolicy.ts";
 import * as ProcessDiagnostics from "./diagnostics/ProcessDiagnostics.ts";
+import * as HeapDiagnostics from "./diagnostics/HeapDiagnostics.ts";
 import * as ProcessResourceMonitor from "./diagnostics/ProcessResourceMonitor.ts";
 import * as ResourceTelemetry from "./resourceTelemetry/ResourceTelemetry.ts";
 import * as UsageService from "./usage/UsageService.ts";
@@ -436,6 +437,7 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
       const bootstrapCredentials = yield* PairingGrantStore.PairingGrantStore;
       const sessions = yield* SessionStore.SessionStore;
       const processDiagnostics = yield* ProcessDiagnostics.ProcessDiagnostics;
+      const heapDiagnostics = yield* HeapDiagnostics.HeapDiagnostics;
       const processResourceMonitor = yield* ProcessResourceMonitor.ProcessResourceMonitor;
       const resourceTelemetry = yield* ResourceTelemetry.ResourceTelemetry;
       const usage = yield* UsageService.UsageService;
@@ -1929,6 +1931,14 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
           observeRpcEffect(WS_METHODS.serverGetProcessDiagnostics, processDiagnostics.read, {
             "rpc.aggregate": "server",
           }),
+        [WS_METHODS.serverWriteHeapSnapshot]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.serverWriteHeapSnapshot,
+            heapDiagnostics.writeSnapshot(input),
+            {
+              "rpc.aggregate": "server",
+            },
+          ),
         [WS_METHODS.serverGetProcessResourceHistory]: (input) =>
           observeRpcEffect(
             WS_METHODS.serverGetProcessResourceHistory,

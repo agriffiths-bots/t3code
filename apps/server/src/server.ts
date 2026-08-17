@@ -111,6 +111,7 @@ import * as CloudCliState from "./cloud/CliState.ts";
 import * as ServerSelfUpdate from "./cloud/selfUpdate.ts";
 import * as ServiceLauncherClient from "./cloud/serviceLauncherClient.ts";
 import * as ProcessDiagnostics from "./diagnostics/ProcessDiagnostics.ts";
+import * as HeapDiagnostics from "./diagnostics/HeapDiagnostics.ts";
 import * as ProcessResourceMonitor from "./diagnostics/ProcessResourceMonitor.ts";
 import * as TraceDiagnostics from "./diagnostics/TraceDiagnostics.ts";
 import * as DesktopTelemetryReceiver from "./resourceTelemetry/DesktopTelemetryReceiver.ts";
@@ -458,7 +459,7 @@ const RuntimeCoreDependenciesLive = RuntimeCoreDependenciesBaseLive.pipe(
   ),
 );
 
-const RuntimeDependenciesLive = PlanUsageSnapshot.layer.pipe(
+const RuntimeDependenciesLive = Layer.mergeAll(PlanUsageSnapshot.layer, HeapDiagnostics.layer).pipe(
   Layer.provideMerge(RuntimeCoreDependenciesLive),
   // Misc.
   Layer.provideMerge(BackgroundLayerLive),

@@ -29,6 +29,14 @@ export type OrchestrationCommandAcceptanceGuard = Effect.Effect<
   never
 >;
 
+export interface OrchestrationCommandModelHeapDiagnostics {
+  readonly threadCount: number;
+  readonly deletedThreadCount: number;
+  readonly retainedMessageCount: number;
+  readonly retainedMessageTextCodeUnits: number;
+  readonly retainedMessageTextUtf16Bytes: number;
+}
+
 /**
  * OrchestrationEngineShape - Service API for orchestration command and event flow.
  */
@@ -86,6 +94,16 @@ export interface OrchestrationEngineShape {
    * choosing between an incremental replay and a fresh projected snapshot.
    */
   readonly latestSequence: Effect.Effect<number, never, never>;
+
+  /**
+   * Reads diagnostic totals from the live command model. Optional so narrow
+   * engine doubles do not need to model server-only diagnostics.
+   */
+  readonly readCommandModelHeapDiagnostics?: Effect.Effect<
+    OrchestrationCommandModelHeapDiagnostics,
+    never,
+    never
+  >;
 }
 
 /**

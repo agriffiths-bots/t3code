@@ -30,6 +30,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ResolvedKeybindingRule,
+  ServerHeapSnapshotError,
   ThreadId,
   WS_METHODS,
   WsRpcGroup,
@@ -151,6 +152,7 @@ import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import * as CloudManagedEndpointRuntime from "./cloud/ManagedEndpointRuntime.ts";
 import * as CloudCliTokenManager from "./cloud/CliTokenManager.ts";
 import * as ProcessDiagnostics from "./diagnostics/ProcessDiagnostics.ts";
+import * as HeapDiagnostics from "./diagnostics/HeapDiagnostics.ts";
 import * as ProcessResourceMonitor from "./diagnostics/ProcessResourceMonitor.ts";
 import * as TraceDiagnostics from "./diagnostics/TraceDiagnostics.ts";
 import * as DesktopTelemetryReceiver from "./resourceTelemetry/DesktopTelemetryReceiver.ts";
@@ -433,6 +435,7 @@ const buildAppUnderTest = (options?: {
     projectSetupScriptRunner?: Partial<
       ProjectSetupScriptRunner.ProjectSetupScriptRunner["Service"]
     >;
+    heapDiagnostics?: Partial<HeapDiagnostics.HeapDiagnostics["Service"]>;
     terminalManager?: Partial<TerminalManager.TerminalManager["Service"]>;
     orchestrationEngine?: Partial<OrchestrationEngine.OrchestrationEngineService["Service"]>;
     orchestrationEventStore?: Partial<OrchestrationEventStore.OrchestrationEventStore["Service"]>;
@@ -846,20 +849,28 @@ const buildAppUnderTest = (options?: {
           }),
         ),
         Layer.provide(
-          Layer.mock(ProcessResourceMonitor.ProcessResourceMonitor)({
-            readHistory: (input) =>
-              Effect.succeed({
-                readAt: TEST_EPOCH,
-                windowMs: input.windowMs,
-                bucketMs: input.bucketMs,
-                sampleIntervalMs: 5_000,
-                retainedSampleCount: 0,
-                totalCpuSecondsApprox: 0,
-                buckets: [],
-                topProcesses: [],
-                error: Option.none(),
-              }),
-          }),
+          Layer.mergeAll(
+            Layer.mock(HeapDiagnostics.HeapDiagnostics)({
+              sample: Effect.die("HeapDiagnostics.sample not stubbed in this test"),
+              writeSnapshot: () =>
+                Effect.die("HeapDiagnostics.writeSnapshot not stubbed in this test"),
+              ...options?.layers?.heapDiagnostics,
+            }),
+            Layer.mock(ProcessResourceMonitor.ProcessResourceMonitor)({
+              readHistory: (input) =>
+                Effect.succeed({
+                  readAt: TEST_EPOCH,
+                  windowMs: input.windowMs,
+                  bucketMs: input.bucketMs,
+                  sampleIntervalMs: 5_000,
+                  retainedSampleCount: 0,
+                  totalCpuSecondsApprox: 0,
+                  buckets: [],
+                  topProcesses: [],
+                  error: Option.none(),
+                }),
+            }),
+          ),
         ),
         Layer.provide(
           Layer.mock(TraceDiagnostics.TraceDiagnostics)({
@@ -1556,6 +1567,23 @@ const getWsServerUrl = (
       baseUrl,
       yield* getAuthenticatedSessionCookieHeader(options?.credential),
     );
+  });
+
+const getScopedWsServerUrl = (scope: string) =>
+  Effect.gen(function* () {
+    const { response, body } = yield* exchangeAccessToken(defaultDesktopBootstrapToken, { scope });
+    assert.equal(response.status, 200);
+    assert.isDefined(body.access_token);
+
+    const ticketResponse = yield* HttpClient.post("/api/auth/websocket-ticket", {
+      headers: {
+        authorization: `Bearer ${body.access_token ?? ""}`,
+      },
+    });
+    const ticketBody = (yield* ticketResponse.json) as { readonly ticket: string };
+    assert.equal(ticketResponse.status, 200);
+
+    return `${yield* getWsServerUrl("/ws", { authenticated: false })}?wsTicket=${encodeURIComponent(ticketBody.ticket)}`;
   });
 
 // Mirrors NodeHttpServer.layerTest, which does not expose server options,
@@ -4190,6 +4218,87 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       assert.equal(response.auth.policy, "desktop-managed-local");
       assert.equal(response.shellResumeCompletionMarker, true);
       assert.equal(response.threadResumeCompletionMarker, true);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("restricts heap snapshot RPCs to access-write sessions", () =>
+    Effect.gen(function* () {
+      const snapshotPath = "/test/userdata/diagnostics/heap-snapshots/admin.heapsnapshot";
+      yield* buildAppUnderTest({
+        layers: {
+          heapDiagnostics: {
+            writeSnapshot: () => Effect.succeed({ path: snapshotPath }),
+          },
+        },
+      });
+
+      const standardWsUrl = yield* getScopedWsServerUrl(
+        "orchestration:read orchestration:operate terminal:operate review:write relay:read",
+      );
+      const authorizationError = yield* Effect.flip(
+        Effect.scoped(
+          withWsRpcClient(standardWsUrl, (client) =>
+            client[WS_METHODS.serverWriteHeapSnapshot]({ filename: "standard.heapsnapshot" }),
+          ),
+        ),
+      );
+      assert.equal(authorizationError._tag, "EnvironmentAuthorizationError");
+      if (authorizationError._tag === "EnvironmentAuthorizationError") {
+        assert.equal(authorizationError.requiredScope, "access:write");
+      }
+
+      const adminWsUrl = yield* getScopedWsServerUrl("access:write");
+      const result = yield* Effect.scoped(
+        withWsRpcClient(adminWsUrl, (client) =>
+          client[WS_METHODS.serverWriteHeapSnapshot]({ filename: "admin.heapsnapshot" }),
+        ),
+      );
+      assert.equal(result.path, snapshotPath);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("returns typed busy and write failures from the heap snapshot RPC", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest({
+        layers: {
+          heapDiagnostics: {
+            writeSnapshot: (input) =>
+              Effect.fail(
+                new ServerHeapSnapshotError({
+                  reason: input.filename === "busy.heapsnapshot" ? "busy" : "writeFailed",
+                  detail:
+                    input.filename === "busy.heapsnapshot"
+                      ? "A heap snapshot is already in progress."
+                      : "V8 could not write the heap snapshot.",
+                }),
+              ),
+          },
+        },
+      });
+
+      const adminWsUrl = yield* getScopedWsServerUrl("access:write");
+      const errors = yield* Effect.scoped(
+        withWsRpcClient(adminWsUrl, (client) =>
+          Effect.all({
+            busy: client[WS_METHODS.serverWriteHeapSnapshot]({
+              filename: "busy.heapsnapshot",
+            }).pipe(Effect.flip),
+            writeFailed: client[WS_METHODS.serverWriteHeapSnapshot]({
+              filename: "failed.heapsnapshot",
+            }).pipe(Effect.flip),
+          }),
+        ),
+      );
+      if (errors.busy._tag === "ServerHeapSnapshotError") {
+        assert.equal(errors.busy.reason, "busy");
+      } else {
+        assert.fail(`Expected busy heap snapshot error, got ${errors.busy._tag}`);
+      }
+      if (errors.writeFailed._tag === "ServerHeapSnapshotError") {
+        assert.equal(errors.writeFailed.reason, "writeFailed");
+      } else {
+        assert.fail(`Expected write failure, got ${errors.writeFailed._tag}`);
+      }
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
