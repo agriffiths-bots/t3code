@@ -126,6 +126,38 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
     }).pipe(Effect.provide(makeEnvironmentAuthLayer())),
   );
 
+  it.effect("accepts the legacy hosted cookie during production loopback upgrades", () =>
+    Effect.gen(function* () {
+      const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+      const sessions = yield* SessionStore.SessionStore;
+      const pairingCredential = yield* serverAuth.issuePairingCredential({
+        audienceCeiling: "private",
+      });
+      const exchanged = yield* serverAuth.createBrowserSession(
+        pairingCredential.credential,
+        requestMetadata,
+      );
+      const request = makeCookieRequest("t3_session", exchanged.sessionToken);
+      const verified = yield* serverAuth.authenticateHttpRequest(request);
+      const confirmed = yield* serverAuth.confirmHttpRequestSessionActive(
+        request,
+        verified.sessionId,
+      );
+
+      expect(sessions.cookieName).toMatch(/^t3_session_13773_[a-f0-9]{12}$/);
+      expect(sessions.cookieNames).toEqual([sessions.cookieName, "t3_session"]);
+      expect(confirmed.sessionId).toBe(verified.sessionId);
+    }).pipe(
+      Effect.provide(
+        makeEnvironmentAuthLayer({
+          mode: "web",
+          host: "127.0.0.1",
+          devUrl: undefined,
+        }),
+      ),
+    ),
+  );
+
   it.effect("pairs a factory-ceiling grant into a factory browser session", () =>
     Effect.gen(function* () {
       const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;

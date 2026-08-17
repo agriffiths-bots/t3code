@@ -646,10 +646,13 @@ export const make = Effect.gen(function* () {
       mapSessionVerificationErrors,
     );
 
+  const readSessionCookie = (request: HttpServerRequest.HttpServerRequest) =>
+    sessions.cookieNames.map((cookieName) => request.cookies[cookieName]).find(Boolean);
+
   const authenticateRequest = (
     request: HttpServerRequest.HttpServerRequest,
   ): Effect.Effect<AuthenticatedSession, ServerAuthCredentialError | ServerAuthInternalError> => {
-    const cookieToken = request.cookies[sessions.cookieName];
+    const cookieToken = readSessionCookie(request);
     const bearerToken = parseBearerToken(request);
     const dpopToken = parseDpopToken(request);
     const credential = cookieToken ?? bearerToken ?? dpopToken;
@@ -1058,7 +1061,7 @@ export const make = Effect.gen(function* () {
 
   const confirmHttpRequestSessionActive: EnvironmentAuth["Service"]["confirmHttpRequestSessionActive"] =
     (request, sessionId) => {
-      const cookieToken = request.cookies[sessions.cookieName];
+      const cookieToken = readSessionCookie(request);
       const bearerToken = parseBearerToken(request);
       const dpopToken = parseDpopToken(request);
       const credential = cookieToken ?? bearerToken ?? dpopToken;

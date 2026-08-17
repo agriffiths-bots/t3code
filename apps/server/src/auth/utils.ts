@@ -22,8 +22,10 @@ const SESSION_COOKIE_NAME = "t3_session";
  * - **Desktop**, which scans upward from 3773 for a free port and binds
  *   127.0.0.1, so a second instance lands on a different port and the same host.
  *
- * Hosted deployments keep the stable production name: their public port can
- * change between releases, and scoping it would log every user out.
+ * Hosted deployments with a remotely reachable bind keep the stable production
+ * name. Production web servers bound to loopback keep the isolated primary name
+ * and accept the legacy stable name through `resolveSessionCookieNames` so an
+ * upgrade does not invalidate existing browser sessions.
  */
 export function resolveSessionCookieName(input: {
   readonly mode: "web" | "desktop";
@@ -48,6 +50,15 @@ export function resolveSessionCookieName(input: {
     .digest("hex")
     .slice(0, 12);
   return `${SESSION_COOKIE_NAME}_${input.port}_${instanceHash}`;
+}
+
+export function resolveSessionCookieNames(
+  input: Parameters<typeof resolveSessionCookieName>[0],
+): readonly [string, ...Array<string>] {
+  const cookieName = resolveSessionCookieName(input);
+  return input.mode === "web" && !input.development && cookieName !== SESSION_COOKIE_NAME
+    ? [cookieName, SESSION_COOKIE_NAME]
+    : [cookieName];
 }
 
 export function isRemoteReachableHost(host: string | undefined): boolean {
