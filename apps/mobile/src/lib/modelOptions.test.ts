@@ -171,4 +171,80 @@ describe("mobile model options", () => {
     // Offline: nothing to validate against, selection passes through.
     expect(resolveDefaultableModelSelection(null, legacy)).toBe(legacy);
   });
+
+  it("rejects stored selections whose provider is not usable", () => {
+    const config = {
+      providers: [
+        {
+          instanceId: "codex",
+          driver: "codex",
+          enabled: true,
+          installed: true,
+          auth: { status: "authenticated" },
+          models: [],
+        },
+        {
+          instanceId: "claudeAgent",
+          driver: "claudeAgent",
+          enabled: false,
+          installed: true,
+          auth: { status: "authenticated" },
+          models: [],
+        },
+      ],
+    } as unknown as ServerConfig;
+
+    const usable = {
+      instanceId: ProviderInstanceId.make("codex"),
+      model: "gpt-5.6-sol",
+    };
+    const disabled = {
+      instanceId: ProviderInstanceId.make("claudeAgent"),
+      model: "claude-sonnet-5",
+    };
+    const removed = {
+      instanceId: ProviderInstanceId.make("codex_personal"),
+      model: "gpt-5.6-sol",
+    };
+
+    expect(resolveSelectableModelSelection(config, usable)).toBe(usable);
+    expect(resolveSelectableModelSelection(config, disabled)).toBeNull();
+    expect(resolveSelectableModelSelection(config, removed)).toBeNull();
+    // No config (environment offline) — nothing to validate against.
+    expect(resolveSelectableModelSelection(null, disabled)).toBe(disabled);
+  });
+
+  it("keeps legacy models out of implicit defaults", () => {
+    const config = {
+      providers: [
+        {
+          instanceId: "codex",
+          driver: "codex",
+          displayName: "Codex",
+          enabled: true,
+          installed: true,
+          auth: { status: "authenticated" },
+          models: [
+            { slug: "gpt-5.6-sol", name: "GPT-5.6 Sol", isCustom: false, capabilities: null },
+            {
+              slug: "gpt-5.4",
+              name: "GPT-5.4",
+              isCustom: false,
+              isLegacy: true,
+              capabilities: null,
+            },
+          ],
+        },
+      ],
+    } as unknown as ServerConfig;
+
+    const current = { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.6-sol" };
+    const legacy = { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" };
+
+    expect(resolveDefaultableModelSelection(config, current)).toBe(current);
+    // A legacy last-used selection falls through to the provider default.
+    expect(resolveDefaultableModelSelection(config, legacy)).toBeNull();
+    // Offline: nothing to validate against, selection passes through.
+    expect(resolveDefaultableModelSelection(null, legacy)).toBe(legacy);
+  });
 });

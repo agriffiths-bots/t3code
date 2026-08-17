@@ -112,6 +112,12 @@ function isResolvableContextWindowActivity(activity: OrchestrationThreadActivity
 }
 
 /**
+ * Matches the validity rule in `deriveLatestContextWindowSnapshot` (and the
+ * server's snapshot-side `dropStaleContextWindowActivities`): rows without a
+ * finite, non-negative `usedTokens` are skipped during the consumer's backward
+ * walk, so they must not replace an earlier resolvable row here.
+ */
+/**
  * Apply a single orchestration event to an `OrchestrationThread`, returning
  * the updated thread, a deletion signal, or an "unchanged" marker when the
  * event doesn't affect this thread.

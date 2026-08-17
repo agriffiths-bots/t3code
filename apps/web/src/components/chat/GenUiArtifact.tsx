@@ -1,6 +1,8 @@
 import { ShieldCheckIcon, SparklesIcon } from "lucide-react";
 import { memo, useMemo } from "react";
 
+import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
+
 import {
   buildGenUiFenceSource,
   buildGenUiSrcdoc,
@@ -41,13 +43,20 @@ function GenUiArtifactShell({
           <SparklesIcon className="size-3.5" aria-hidden />
           Generated UI
         </span>
-        <span
-          className="flex items-center gap-1 text-[11px] text-muted-foreground"
-          title="Rendered in a sandboxed, isolated-origin iframe with no access to the parent page, cookies, or storage"
-        >
-          <ShieldCheckIcon className="size-3.5" aria-hidden />
-          Sandboxed
-        </span>
+        <Tooltip>
+          <TooltipTrigger
+            render={
+              <span className="flex items-center gap-1 text-[11px] text-muted-foreground">
+                <ShieldCheckIcon className="size-3.5" aria-hidden />
+                Sandboxed
+              </span>
+            }
+          />
+          <TooltipPopup side="top" className="max-w-80 whitespace-normal leading-tight">
+            Rendered in a sandboxed, isolated-origin iframe with no access to the parent page,
+            cookies, or storage
+          </TooltipPopup>
+        </Tooltip>
       </div>
       {children}
     </div>

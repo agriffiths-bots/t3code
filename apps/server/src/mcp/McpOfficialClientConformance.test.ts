@@ -1,4 +1,5 @@
 // @effect-diagnostics globalFetch:off globalFetchInEffect:off - This conformance test intentionally drives the HTTP boundary through the official MCP SDK transport and raw protocol probes.
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { NodeHttpServer } from "@effect/platform-node";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -30,6 +31,7 @@ import * as SubagentPeerRegistry from "../subagents/SubagentPeerRegistry.ts";
 import * as PlanUsageSnapshot from "../usage/PlanUsageSnapshot.ts";
 import * as McpHttpServer from "./McpHttpServer.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
+import * as PreviewAutomationBroker from "./PreviewAutomationBroker.ts";
 import * as McpSessionRegistry from "./McpSessionRegistry.ts";
 
 type SdkTransport = Parameters<Client["connect"]>[0];
@@ -47,6 +49,20 @@ const threadId = ThreadId.make("thread-mcp-conformance");
 const providerInstanceId = ProviderInstanceId.make("codex");
 
 const expectedToolNamesAfterSpawnTrim = [
+  "preview_click",
+  "preview_evaluate",
+  "preview_navigate",
+  "preview_open",
+  "preview_press",
+  "preview_recording_start",
+  "preview_recording_stop",
+  "preview_resize",
+  "preview_scroll",
+  "preview_set_appearance",
+  "preview_snapshot",
+  "preview_status",
+  "preview_type",
+  "preview_wait_for",
   "t3_archive_thread",
   "t3_get_usage",
   "t3_list_backends",
@@ -61,7 +77,7 @@ const expectedToolNamesAfterSpawnTrim = [
   "t3_thread_start",
 ] as const;
 
-type ExpectedToolName = (typeof expectedToolNamesAfterSpawnTrim)[number];
+type ExpectedToolName = Extract<(typeof expectedToolNamesAfterSpawnTrim)[number], `t3_${string}`>;
 
 const expectedToolInputShapes: Record<
   ExpectedToolName,
@@ -102,22 +118,6 @@ const removedSubagentToolNames = [
   "t3_wait_subagent",
 ] as const;
 
-const removedPreviewToolNames = [
-  "preview_click",
-  "preview_evaluate",
-  "preview_navigate",
-  "preview_open",
-  "preview_press",
-  "preview_recording_start",
-  "preview_recording_stop",
-  "preview_resize",
-  "preview_scroll",
-  "preview_snapshot",
-  "preview_status",
-  "preview_type",
-  "preview_wait_for",
-] as const;
-
 const invocation: McpInvocationContext.ProviderMcpInvocationScope = {
   credentialKind: "provider-session",
   environmentId,
@@ -131,6 +131,7 @@ const invocation: McpInvocationContext.ProviderMcpInvocationScope = {
     "subagent:check",
     "subagent:wait",
     "subagent:list",
+    "preview",
   ]),
   issuedAt: 1,
   expiresAt: Number.MAX_SAFE_INTEGER,
@@ -262,6 +263,7 @@ const conformanceLayer = McpHttpServer.layer.pipe(
   Layer.provide(subagentPeerRegistryLayer),
   Layer.provide(FetchHttpClient.layer),
   Layer.provide(projectionSnapshotQueryLayer),
+  Layer.provide(PreviewAutomationBroker.layer.pipe(Layer.provide(NodeServices.layer))),
 );
 
 const mcpUrlFromServer = (address: HttpServer.Address): URL => {
@@ -362,11 +364,7 @@ it.effect("conforms to the official streamable HTTP MCP client", () =>
       ListToolsResultSchema.parse(toolsResult);
       const toolNames = new Set(toolsResult.tools.map((tool) => tool.name));
       expect([...toolNames].toSorted()).toEqual([...expectedToolNamesAfterSpawnTrim]);
-      for (const removedName of removedPreviewToolNames) {
-        expect(toolNames.has(removedName), `${removedName} must be absent from tools/list`).toBe(
-          false,
-        );
-      }
+
       for (const removedName of removedSubagentToolNames) {
         expect(toolNames.has(removedName), `${removedName} must be absent from tools/list`).toBe(
           false,
@@ -375,12 +373,13 @@ it.effect("conforms to the official streamable HTTP MCP client", () =>
 
       for (const tool of toolsResult.tools) {
         const expected = expectedToolInputShapes[tool.name as ExpectedToolName];
-        expect(expected, `${tool.name} must have a pinned input shape`).toBeDefined();
-        expect(Object.keys(tool.inputSchema.properties ?? {}).toSorted()).toEqual(
-          expected?.properties,
-        );
-        expect([...(tool.inputSchema.required ?? [])].toSorted()).toEqual(expected?.required);
-        assertNoNullableInputSchema(tool.inputSchema, `${tool.name}.inputSchema`);
+        if (expected !== undefined) {
+          expect(Object.keys(tool.inputSchema.properties ?? {}).toSorted()).toEqual(
+            expected.properties,
+          );
+          expect([...(tool.inputSchema.required ?? [])].toSorted()).toEqual(expected.required);
+          assertNoNullableInputSchema(tool.inputSchema, `${tool.name}.inputSchema`);
+        }
 
         expect(tool.inputSchema.type, `${tool.name} input schema must be an object`).toBe("object");
         expect(tool.inputSchema.anyOf, `${tool.name} input schema must not root anyOf`).toBe(

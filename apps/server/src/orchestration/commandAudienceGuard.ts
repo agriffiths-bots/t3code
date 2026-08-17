@@ -464,6 +464,9 @@ export const authorizeOrchestrationCommandReceiptReplay = Effect.fn(
     input.receipt.aggregateKind !== aggregateRef.aggregateKind ||
     input.receipt.aggregateId !== aggregateRef.aggregateId
   ) {
+    if (authority.kind === "trusted-system") {
+      return;
+    }
     return yield* failAuthorization(
       input.command,
       aggregateRef.aggregateKind === "project"

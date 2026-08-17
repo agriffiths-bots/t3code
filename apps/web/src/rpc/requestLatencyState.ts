@@ -28,6 +28,7 @@ interface PendingRpcAckRequest {
 }
 
 const pendingRpcAckRequests = new Map<string, PendingRpcAckRequest>();
+const untrackedRpcAckMethods = new Set<string>([WS_METHODS.previewAutomationConnect]);
 const longRunningRpcAckMethods = new Set<string>([
   WS_METHODS.serverUpdateProvider,
   WS_METHODS.serverRefreshProviders,
@@ -48,7 +49,11 @@ function getSlowRpcAckRequestsValue(): ReadonlyArray<SlowRpcAckRequest> {
 }
 
 function shouldTrackRpcAck(method: string): boolean {
-  return !method.includes("subscribe");
+  return (
+    !method.includes("subscribe") &&
+    !method.startsWith("pullRequests.") &&
+    !untrackedRpcAckMethods.has(method)
+  );
 }
 
 function rpcAckThresholdMs(method: string): number {

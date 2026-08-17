@@ -130,6 +130,18 @@ function browserApiCorsHeaders(input: {
       : {}),
   };
 }
+const SVG_CONTENT_SECURITY_POLICY = "default-src 'none'; style-src 'unsafe-inline'; sandbox";
+
+export function assetResponseHeaders(filePath: string): Record<string, string> {
+  return {
+    "Cache-Control": "private, max-age=3600",
+    "X-Content-Type-Options": "nosniff",
+    ...(filePath.toLowerCase().endsWith(".svg")
+      ? { "Content-Security-Policy": SVG_CONTENT_SECURITY_POLICY }
+      : {}),
+  };
+}
+
 export const httpCompressionLayer = HttpRouter.middleware(HttpMiddleware.compression(), {
   global: true,
 });
@@ -614,8 +626,8 @@ export const assetRouteLayer = HttpRouter.add(
       });
     }
     const responseHeaders = {
+      ...assetResponseHeaders(asset.path),
       "Cache-Control": "no-store",
-      "X-Content-Type-Options": "nosniff",
     };
     const contentType = Mime.getType(asset.path) ?? "application/octet-stream";
     if (request.method === "HEAD") {

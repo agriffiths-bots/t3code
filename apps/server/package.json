@@ -1,6 +1,6 @@
 {
   "name": "t3",
-  "version": "0.0.32",
+  "version": "0.0.33",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -32,6 +32,7 @@
     "@pierre/diffs": "catalog:",
     "croner": "^9.0.0",
     "effect": "catalog:",
+    "msgpackr-extract": "3.0.4",
     "node-pty": "^1.1.0",
     "web-push": "^3.6.7",
     "yaml": "catalog:"

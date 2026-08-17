@@ -37,15 +37,16 @@ import {
 } from "./methods/updates.ts";
 import {
   ackNotificationActions,
-  confirm,
   closeNotification,
   drainNotificationActions,
   getAppBranding,
   getLocalEnvironmentBootstraps,
   getLocalEnvironmentBearerToken,
+  getSystemLocale,
   getWindowFullscreenState,
   isNotificationSupported,
   openExternal,
+  probeRemoteEditors,
   pickFolder,
   pickThemeFiles,
   setTheme,
@@ -60,6 +61,7 @@ export const installDesktopIpcHandlers = Effect.fn("desktop.ipc.installHandlers"
   yield* PreviewIpc.installPreviewEventForwarding();
 
   yield* ipc.handleSync(getAppBranding);
+  yield* ipc.handleSync(getSystemLocale);
   yield* ipc.handleSync(getWindowFullscreenState);
   yield* ipc.handleSync(getLocalEnvironmentBootstraps);
   yield* ipc.handle(getLocalEnvironmentBearerToken);
@@ -94,7 +96,6 @@ export const installDesktopIpcHandlers = Effect.fn("desktop.ipc.installHandlers"
 
   yield* ipc.handle(pickFolder);
   yield* ipc.handle(pickThemeFiles);
-  yield* ipc.handle(confirm);
   yield* ipc.handle(setTheme);
   yield* ipc.handle(showContextMenu);
   yield* ipc.handle(openExternal);
@@ -103,6 +104,7 @@ export const installDesktopIpcHandlers = Effect.fn("desktop.ipc.installHandlers"
   yield* ipc.handle(closeNotification);
   yield* ipc.handle(drainNotificationActions);
   yield* ipc.handle(ackNotificationActions);
+  yield* ipc.handle(probeRemoteEditors);
   yield* ipc.handle(getUpdateState);
   yield* ipc.handle(setUpdateChannel);
   yield* ipc.handle(downloadUpdate);

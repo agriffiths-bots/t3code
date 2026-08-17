@@ -109,6 +109,7 @@ import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
 import * as GitManager from "./git/GitManager.ts";
 import * as Keybindings from "./keybindings.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
+import * as RemoteOpenTargets from "./environment/RemoteOpenTargets.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
 import * as BootstrapTurnStartDispatcher from "./orchestration/Services/BootstrapTurnStartDispatcher.ts";
 import { WorktreeLifecycleCoordinatorLive } from "./orchestration/Services/WorktreeLifecycleCoordinator.ts";
@@ -1119,6 +1120,11 @@ const buildAppUnderTest = (options?: {
           hasCredential: Effect.succeed(false),
           clear: Effect.void,
           ...options?.layers?.cloudCliTokenManager,
+        }),
+      ),
+      Layer.provide(
+        Layer.succeed(RemoteOpenTargets.RemoteOpenTargets, {
+          resolveTargets: () => Effect.succeed([]),
         }),
       ),
       Layer.provideMerge(makeAuthTestLayer()),
@@ -5380,6 +5386,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
                 },
                 branch: "feature/demo",
                 worktreePath: null,
+                isOnPullRequestHead: true,
               }),
           },
           gitVcsDriver: {

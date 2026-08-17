@@ -1,6 +1,7 @@
 import {
   type AuthSessionId,
   type EnvironmentId,
+  PreviewAutomationUnavailableError,
   type ProviderInstanceId,
   type ThreadId,
 } from "@t3tools/contracts";
@@ -9,6 +10,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
 export const McpCapability = Schema.Literals([
+  "preview",
   "thread-management",
   "notification",
   "subagent:spawn",
@@ -93,6 +95,25 @@ export const requireMcpCapability = Effect.fn("mcp.requireCapability")(function*
     });
   }
   return invocation;
+});
+
+export const requirePreviewMcpCapability = Effect.fn("mcp.requirePreviewCapability")(function* () {
+  const invocation = yield* McpInvocationContext;
+  if (isProviderInvocationScope(invocation) && invocation.capabilities.has("preview")) {
+    return invocation;
+  }
+  return yield* new PreviewAutomationUnavailableError({
+    capability: "preview",
+    environmentId: invocation.environmentId,
+    credentialKind: invocation.credentialKind,
+    ...(isProviderInvocationScope(invocation)
+      ? {
+          threadId: invocation.threadId,
+          providerSessionId: invocation.providerSessionId,
+          providerInstanceId: invocation.providerInstanceId,
+        }
+      : {}),
+  });
 });
 
 export const requireAnyMcpCapability = Effect.fn("mcp.requireAnyCapability")(function* (
