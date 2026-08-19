@@ -104,6 +104,12 @@ import { useCopyToClipboard } from "../hooks/useCopyToClipboard";
 import { useNowMinute } from "../hooks/useNowMinute";
 import { useEnvironments, usePrimaryEnvironmentId } from "../state/environments";
 import { useProjects, useThreadShells } from "../state/entities";
+import {
+  matrixBridgeEnvironment,
+  matrixBridgeFailureMessage,
+  selectMatrixBridgeMenuState,
+  useMatrixBridgeStates,
+} from "../state/matrixBridge";
 import { environmentServerConfigsAtom, primaryServerKeybindingsAtom } from "../state/server";
 import { vcsEnvironment } from "../state/vcs";
 import { threadEnvironment } from "../state/threads";
@@ -1596,6 +1602,12 @@ export default function Sidebar() {
   const updateThreadMetadata = useAtomCommand(threadEnvironment.updateMetadata, {
     reportFailure: false,
   });
+  const setMatrixBridgeOwner = useAtomCommand(matrixBridgeEnvironment.setOwner, {
+    reportFailure: false,
+  });
+  // Holding the status subscription here keeps the owner label correct the
+  // first time a menu opens, instead of after the first click.
+  const matrixBridgeStates = useMatrixBridgeStates();
   const { copyToClipboard: copyPathToClipboard } = useCopyToClipboard<{ path: string }>({
     onCopy: ({ path }) => {
       toastManager.add({
@@ -2922,6 +2934,7 @@ export default function Sidebar() {
                 titleRegeneration: supportsTitleRegeneration,
               },
               snoozePresets,
+              matrixBridge: selectMatrixBridgeMenuState(matrixBridgeStates, threadRef),
             }),
             position,
           ),
@@ -2973,6 +2986,39 @@ export default function Sidebar() {
           case "unpin":
             attemptUnpin(threadRef);
             return;
+          case "bridge-to-matrix":
+          case "unbridge-matrix": {
+            const stopping = clicked.value === "unbridge-matrix";
+            const result = await setMatrixBridgeOwner({
+              environmentId: threadRef.environmentId,
+              input: { ownerThreadId: stopping ? null : threadRef.threadId },
+            });
+            if (result._tag === "Failure") {
+              if (!isAtomCommandInterrupted(result)) {
+                toastManager.add(
+                  stackedThreadToast({
+                    type: "error",
+                    title: stopping
+                      ? "Failed to stop the Matrix bridge"
+                      : "Failed to bridge this thread to Matrix",
+                    description: matrixBridgeFailureMessage(
+                      squashAtomCommandFailure(result),
+                      "An error occurred.",
+                    ),
+                  }),
+                );
+              }
+              return;
+            }
+            toastManager.add(
+              stackedThreadToast({
+                type: "success",
+                title: stopping ? "Matrix bridge stopped" : "Matrix bridge moved to this thread",
+                timeout: 5_000,
+              }),
+            );
+            return;
+          }
           case "rename":
             startThreadRename(threadRef, thread.title);
             return;
@@ -3059,8 +3105,10 @@ export default function Sidebar() {
       deleteThread,
       handleMultiSelectContextMenu,
       markThreadUnread,
+      matrixBridgeStates,
       projectCwdByKey,
       serverConfigs,
+      setMatrixBridgeOwner,
       startThreadRename,
       updateThreadMetadata,
       timestampFormat,

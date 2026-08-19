@@ -1,10 +1,17 @@
-import type { DesktopWslState } from "@t3tools/contracts";
+import type { DesktopWslState, MatrixBridgeStatus } from "@t3tools/contracts";
+import { ThreadId } from "@t3tools/contracts";
 import { describe, expect, it, vi } from "vite-plus/test";
 import {
   applyWslEnableSelection,
+  matrixBridgeConnectionMode,
+  matrixBridgeDraftAfterConfigure,
+  matrixBridgeSectionAccess,
+  matrixBridgeStatusLabel,
+  parseMatrixBridgeConfigureInput,
   parsePairingUrlFields,
   parseRemotePairingHostChange,
   parseRemotePairingFields,
+  showMatrixBridgeDisconnect,
 } from "./ConnectionsSettings.logic";
 
 const baseWslState: DesktopWslState = {
@@ -152,5 +159,159 @@ describe("remote pairing field parsing", () => {
         cloudflareAccessClientId: "client-id",
       }),
     ).toThrowError("Enter both Cloudflare Access service token fields.");
+  });
+});
+
+describe("matrixBridgeSectionAccess", () => {
+  it("hides the subsection on servers without the bridge capability", () => {
+    expect(matrixBridgeSectionAccess({ supported: false, canManageAccess: true })).toBe("hidden");
+  });
+
+  it("shows status without configuration to clients lacking access:write", () => {
+    expect(matrixBridgeSectionAccess({ supported: true, canManageAccess: false })).toBe(
+      "status-only",
+    );
+  });
+
+  it("allows configuration for clients with access:write", () => {
+    expect(matrixBridgeSectionAccess({ supported: true, canManageAccess: true })).toBe("manage");
+  });
+});
+
+describe("matrixBridgeStatusLabel", () => {
+  const baseStatus: MatrixBridgeStatus = {
+    state: "disabled",
+    ownerThreadId: null,
+    encryptionReady: false,
+    reason: null,
+  };
+  const statusView = (status: MatrixBridgeStatus) => ({ kind: "status", status }) as const;
+
+  it("waits rather than claiming the bridge is off before a snapshot arrives", () => {
+    expect(matrixBridgeStatusLabel({ kind: "pending" }).title).toBe("Checking");
+    expect(matrixBridgeStatusLabel(statusView(baseStatus)).title).toBe("Not connected");
+  });
+
+  it("says the status cannot be read rather than reporting it as off", () => {
+    expect(matrixBridgeStatusLabel({ kind: "unavailable" }).title).toBe("Status unavailable");
+  });
+
+  it("names each lifecycle state", () => {
+    expect(matrixBridgeStatusLabel(statusView({ ...baseStatus, state: "connecting" })).title).toBe(
+      "Connecting",
+    );
+    expect(
+      matrixBridgeStatusLabel(statusView({ ...baseStatus, state: "waiting-for-member" })).title,
+    ).toBe("Waiting for you to join");
+    expect(
+      matrixBridgeStatusLabel(statusView({ ...baseStatus, state: "awaiting-pairing" })).title,
+    ).toBe("Waiting for a pairing code");
+    expect(
+      matrixBridgeStatusLabel(
+        statusView({
+          ...baseStatus,
+          state: "active",
+          encryptionReady: true,
+          ownerThreadId: ThreadId.make("thread-a"),
+        }),
+      ).title,
+    ).toBe("Active");
+  });
+
+  it("prefers the server's sanitized reason for unhealthy states", () => {
+    expect(
+      matrixBridgeStatusLabel(
+        statusView({
+          ...baseStatus,
+          state: "degraded",
+          reason: "An unexpected member joined the room.",
+        }),
+      ).description,
+    ).toBe("An unexpected member joined the room.");
+    expect(
+      matrixBridgeStatusLabel(statusView({ ...baseStatus, state: "unavailable" })).description,
+    ).toBe("The bridge cannot run on this server right now.");
+  });
+});
+
+describe("matrixBridgeConnectionMode", () => {
+  const baseStatus: MatrixBridgeStatus = {
+    state: "disabled",
+    ownerThreadId: null,
+    encryptionReady: false,
+    reason: null,
+  };
+
+  it("offers a first connection only when the status says there is none", () => {
+    expect(matrixBridgeConnectionMode({ kind: "status", status: baseStatus })).toBe("connect");
+    expect(showMatrixBridgeDisconnect("connect")).toBe(false);
+  });
+
+  it("keeps disconnect available to a client that cannot read the status", () => {
+    // access:write without orchestration:read is a legitimate split: that
+    // session may configure and disconnect even though it cannot watch.
+    expect(matrixBridgeConnectionMode({ kind: "unavailable" })).toBe("unknown");
+    expect(matrixBridgeConnectionMode({ kind: "pending" })).toBe("unknown");
+    expect(showMatrixBridgeDisconnect("unknown")).toBe(true);
+  });
+
+  it("replaces the stored connection once one exists", () => {
+    expect(
+      matrixBridgeConnectionMode({
+        kind: "status",
+        status: { ...baseStatus, state: "awaiting-pairing" },
+      }),
+    ).toBe("reconfigure");
+    expect(showMatrixBridgeDisconnect("reconfigure")).toBe(true);
+  });
+});
+
+describe("Matrix bridge connection form", () => {
+  it("requires the bot token on every save, since the server never returns it", () => {
+    expect(() =>
+      parseMatrixBridgeConfigureInput({
+        homeserverUrl: "https://matrix.example.test",
+        accessToken: "  ",
+        allowedUserIds: "@you:beeper.com",
+      }),
+    ).toThrowError("Enter the bot access token.");
+  });
+
+  it("rejects text that is not a Matrix user ID", () => {
+    expect(() =>
+      parseMatrixBridgeConfigureInput({
+        homeserverUrl: "https://matrix.example.test",
+        accessToken: "syt_token",
+        allowedUserIds: "you@beeper.com",
+      }),
+    ).toThrowError('"you@beeper.com" is not a Matrix user ID. They look like @you:beeper.com.');
+  });
+
+  it("accepts several Matrix IDs across lines, commas, and spaces without duplicates", () => {
+    expect(
+      parseMatrixBridgeConfigureInput({
+        homeserverUrl: "  https://matrix.example.test  ",
+        accessToken: " syt_token ",
+        allowedUserIds: "@you:beeper.com, @you:beeper.com\n@phone:beeper.com",
+      }),
+    ).toEqual({
+      homeserverUrl: "https://matrix.example.test",
+      accessToken: "syt_token",
+      allowedUserIds: ["@you:beeper.com", "@phone:beeper.com"],
+    });
+  });
+
+  it("clears the token after a successful connect and keeps the readable fields", () => {
+    expect(
+      matrixBridgeDraftAfterConfigure({
+        homeserverUrl: "https://matrix.example.test/",
+        allowedUserIds: ["@you:beeper.com", "@phone:beeper.com"],
+        roomId: "!room:example.test",
+      }),
+    ).toEqual({
+      homeserverUrl: "https://matrix.example.test/",
+      accessToken: "",
+      allowedUserIds: "@you:beeper.com\n@phone:beeper.com",
+    });
   });
 });

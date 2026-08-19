@@ -1,4 +1,4 @@
-import type { ContextMenuItem } from "@t3tools/contracts";
+import type { ContextMenuItem, ThreadId } from "@t3tools/contracts";
 import type { SnoozePreset } from "@t3tools/client-runtime/state/thread-settled";
 
 /**
@@ -15,12 +15,62 @@ export type ThreadActionMenuId =
   | "snooze"
   | `snooze:${string}`
   | "unsnooze"
+  | MatrixBridgeMenuId
   | "rename"
   | "regenerate-title"
   | "mark-unread"
   | "copy-path"
   | "copy-branch"
   | "delete";
+
+/**
+ * Claiming and releasing the single Matrix bridge owner. Claiming is one
+ * server call whether or not another thread holds the bridge, so both labels
+ * dispatch the same id.
+ */
+export type MatrixBridgeMenuId = "bridge-to-matrix" | "unbridge-matrix";
+
+export interface MatrixBridgeMenuState {
+  /** `environment.capabilities.matrixBridge`. Absent or false hides the item. */
+  readonly supported: boolean;
+  /**
+   * Whether this client's session on that environment may call
+   * `matrixBridge.setOwner`, which needs `orchestration:operate`. A read-scoped
+   * client can watch the bridge, so capability alone is not enough to offer a
+   * control that would always be rejected.
+   */
+  readonly canOperate: boolean;
+  /**
+   * Owner thread from the bridge status stream, or null when nothing is
+   * bridged. The server owns this pointer; the client view is advisory, so a
+   * stale label can only mislabel a call that still lands correctly.
+   */
+  readonly ownerThreadId: ThreadId | null;
+  /** The thread this menu was opened on. */
+  readonly threadId: ThreadId;
+}
+
+/**
+ * The Matrix bridge item on its own, so the legacy sidebar's separate menu
+ * renders exactly what the shared menu renders instead of a second copy that
+ * can drift.
+ */
+export function buildMatrixBridgeMenuItems(
+  state: MatrixBridgeMenuState,
+): ReadonlyArray<ContextMenuItem<MatrixBridgeMenuId>> {
+  if (!state.supported || !state.canOperate) {
+    return [];
+  }
+  if (state.ownerThreadId === state.threadId) {
+    return [{ id: "unbridge-matrix", label: "Stop Matrix bridge" }];
+  }
+  return [
+    {
+      id: "bridge-to-matrix",
+      label: state.ownerThreadId === null ? "Bridge to Matrix" : "Move Matrix bridge here",
+    },
+  ];
+}
 
 export interface ThreadActionMenuState {
   readonly branch: string | null;
@@ -36,6 +86,7 @@ export interface ThreadActionMenuState {
     readonly titleRegeneration: boolean;
   };
   readonly snoozePresets: ReadonlyArray<SnoozePreset>;
+  readonly matrixBridge: MatrixBridgeMenuState;
 }
 
 /**
@@ -87,6 +138,9 @@ export function buildThreadActionMenuItems(
               },
         ]
       : []),
+    // Bridge ownership sits with the other lifecycle actions: it changes what
+    // the thread is for, not what you can copy out of it.
+    ...buildMatrixBridgeMenuItems(state.matrixBridge),
     { id: "rename", label: "Rename thread" },
     ...(state.supports.titleRegeneration
       ? [

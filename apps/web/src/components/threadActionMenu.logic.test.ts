@@ -1,6 +1,14 @@
+import { ThreadId } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { buildThreadActionMenuItems, type ThreadActionMenuState } from "./threadActionMenu.logic";
+import {
+  buildMatrixBridgeMenuItems,
+  buildThreadActionMenuItems,
+  type ThreadActionMenuState,
+} from "./threadActionMenu.logic";
+
+const thisThread = ThreadId.make("thread-this");
+const otherThread = ThreadId.make("thread-other");
 
 const baseState: ThreadActionMenuState = {
   branch: null,
@@ -13,6 +21,12 @@ const baseState: ThreadActionMenuState = {
   snoozePresets: [
     { id: "hour", label: "In 1 hour", whenLabel: "3:00 PM", snoozedUntil: "2026-08-07T15:00:00Z" },
   ],
+  matrixBridge: {
+    supported: false,
+    canOperate: true,
+    ownerThreadId: null,
+    threadId: thisThread,
+  },
 };
 
 function ids(state: ThreadActionMenuState): string[] {
@@ -62,5 +76,77 @@ describe("buildThreadActionMenuItems", () => {
   it("marks delete as destructive and keeps it last", () => {
     const items = buildThreadActionMenuItems({ ...baseState, branch: "main" });
     expect(items.at(-1)).toMatchObject({ id: "delete", destructive: true });
+  });
+
+  it("carries the Matrix bridge item into the shared menu when the server supports it", () => {
+    expect(ids(baseState)).not.toContain("bridge-to-matrix");
+    expect(
+      ids({
+        ...baseState,
+        matrixBridge: {
+          supported: true,
+          canOperate: true,
+          ownerThreadId: null,
+          threadId: thisThread,
+        },
+      }),
+    ).toContain("bridge-to-matrix");
+  });
+});
+
+describe("buildMatrixBridgeMenuItems", () => {
+  it("offers nothing when the server does not support the bridge", () => {
+    expect(
+      buildMatrixBridgeMenuItems({
+        supported: false,
+        canOperate: true,
+        ownerThreadId: otherThread,
+        threadId: thisThread,
+      }),
+    ).toEqual([]);
+  });
+
+  it("offers nothing to a client that cannot operate the environment", () => {
+    expect(
+      buildMatrixBridgeMenuItems({
+        supported: true,
+        canOperate: false,
+        ownerThreadId: thisThread,
+        threadId: thisThread,
+      }),
+    ).toEqual([]);
+  });
+
+  it("offers to bridge when no thread owns the bridge", () => {
+    expect(
+      buildMatrixBridgeMenuItems({
+        supported: true,
+        canOperate: true,
+        ownerThreadId: null,
+        threadId: thisThread,
+      }),
+    ).toEqual([{ id: "bridge-to-matrix", label: "Bridge to Matrix" }]);
+  });
+
+  it("offers to move the bridge when another thread owns it", () => {
+    expect(
+      buildMatrixBridgeMenuItems({
+        supported: true,
+        canOperate: true,
+        ownerThreadId: otherThread,
+        threadId: thisThread,
+      }),
+    ).toEqual([{ id: "bridge-to-matrix", label: "Move Matrix bridge here" }]);
+  });
+
+  it("offers to stop the bridge on the thread that owns it", () => {
+    expect(
+      buildMatrixBridgeMenuItems({
+        supported: true,
+        canOperate: true,
+        ownerThreadId: thisThread,
+        threadId: thisThread,
+      }),
+    ).toEqual([{ id: "unbridge-matrix", label: "Stop Matrix bridge" }]);
   });
 });

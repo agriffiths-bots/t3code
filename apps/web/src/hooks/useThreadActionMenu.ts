@@ -29,6 +29,12 @@ import {
   readEnvironmentSupportsTitleRegeneration,
   readThreadShell,
 } from "../state/entities";
+import {
+  matrixBridgeEnvironment,
+  matrixBridgeFailureMessage,
+  selectMatrixBridgeMenuState,
+  useMatrixBridgeStates,
+} from "../state/matrixBridge";
 import { readLocalApi } from "../localApi";
 import { useUiStateStore } from "../uiStateStore";
 import { useCopyToClipboard } from "./useCopyToClipboard";
@@ -77,6 +83,13 @@ export function useThreadActionMenu(input: {
   const updateThreadMetadata = useAtomCommand(threadEnvironment.updateMetadata, {
     reportFailure: false,
   });
+  const setMatrixBridgeOwner = useAtomCommand(matrixBridgeEnvironment.setOwner, {
+    reportFailure: false,
+  });
+  // Subscribed here rather than read imperatively: this surface can be the
+  // only one mounted, and without a live subscription the menu would offer to
+  // bridge a thread that already owns the bridge.
+  const matrixBridgeStates = useMatrixBridgeStates();
   const handleNewThread = useNewThreadHandler();
   const markThreadUnread = useUiStateStore((s) => s.markThreadUnread);
   const autoSettleAfterDays = useClientSettings((s) => s.sidebarAutoSettleAfterDays);
@@ -133,6 +146,7 @@ export function useThreadActionMenu(input: {
           isRegeneratingTitle,
           supports,
           snoozePresets,
+          matrixBridge: selectMatrixBridgeMenuState(matrixBridgeStates, threadRef),
         });
         const clicked = await settlePromise(() => api.contextMenu.show(items, position));
         if (clicked._tag === "Failure" || clicked.value === null) return;
@@ -207,6 +221,39 @@ export function useThreadActionMenu(input: {
           case "unpin":
             await reportFailure("Failed to unpin thread", () => unpinThread(threadRef));
             return;
+          case "bridge-to-matrix":
+          case "unbridge-matrix": {
+            const stopping = action === "unbridge-matrix";
+            const result = await setMatrixBridgeOwner({
+              environmentId: threadRef.environmentId,
+              input: { ownerThreadId: stopping ? null : threadRef.threadId },
+            });
+            if (result._tag === "Failure") {
+              if (!isAtomCommandInterrupted(result)) {
+                toastManager.add(
+                  stackedThreadToast({
+                    type: "error",
+                    title: stopping
+                      ? "Failed to stop the Matrix bridge"
+                      : "Failed to bridge this thread to Matrix",
+                    description: matrixBridgeFailureMessage(
+                      squashAtomCommandFailure(result),
+                      "An error occurred.",
+                    ),
+                  }),
+                );
+              }
+              return;
+            }
+            toastManager.add(
+              stackedThreadToast({
+                type: "success",
+                title: stopping ? "Matrix bridge stopped" : "Matrix bridge moved to this thread",
+                timeout: 5_000,
+              }),
+            );
+            return;
+          }
           case "rename":
             onStartRename();
             return;
@@ -281,9 +328,11 @@ export function useThreadActionMenu(input: {
       deleteThread,
       handleNewThread,
       markThreadUnread,
+      matrixBridgeStates,
       onStartRename,
       pinThread,
       projectCwd,
+      setMatrixBridgeOwner,
       settleThread,
       snoozeThread,
       threadRef,
