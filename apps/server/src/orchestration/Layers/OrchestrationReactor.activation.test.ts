@@ -12,6 +12,7 @@ import { ScheduledTasksReactor } from "../Services/ScheduledTasksReactor.ts";
 import { ThreadDeletionReactor } from "../Services/ThreadDeletionReactor.ts";
 import { makeOrchestrationReactor } from "./OrchestrationReactor.ts";
 import * as AgentAwarenessRelay from "../../relay/AgentAwarenessRelay.ts";
+import { MatrixBridgeReactor } from "../../matrix/MatrixBridgeReactor.ts";
 import { ServerActivation } from "../../serverActivation.ts";
 import * as VcsMaintenanceReactor from "../../vcs/VcsMaintenanceReactor.ts";
 
@@ -42,12 +43,13 @@ const inertDependencies = Layer.mergeAll(
   }),
 );
 
-it.effect("does not start scheduler or child coordination before activation", () =>
+it.effect("does not start activation-sensitive reactors before activation", () =>
   Effect.scoped(
     Effect.gen(function* () {
       const activation = yield* Deferred.make<void>();
       const childCoordinatorStarted = yield* Deferred.make<void>();
       const schedulerTicked = yield* Deferred.make<void>();
+      const matrixBridgeStarted = yield* Deferred.make<void>();
       const activationStartupReady = yield* Deferred.make<void>();
       const startOrder: string[] = [];
 
@@ -69,6 +71,15 @@ it.effect("does not start scheduler or child coordination before activation", ()
               }).pipe(Effect.andThen(Deferred.succeed(schedulerTicked, undefined))),
           }),
         ),
+        Layer.provideMerge(
+          Layer.succeed(MatrixBridgeReactor, {
+            start: () =>
+              Effect.sync(() => {
+                startOrder.push("matrix-bridge");
+              }).pipe(Effect.andThen(Deferred.succeed(matrixBridgeStarted, undefined))),
+            drain: Effect.void,
+          }),
+        ),
         Layer.provideMerge(Layer.succeed(ServerActivation, Deferred.await(activation))),
       );
 
@@ -85,13 +96,15 @@ it.effect("does not start scheduler or child coordination before activation", ()
         expect(yield* Deferred.isDone(childCoordinatorStarted)).toBe(false);
         expect(yield* Deferred.isDone(schedulerTicked)).toBe(false);
         expect(yield* Deferred.isDone(activationStartupReady)).toBe(false);
+        expect(yield* Deferred.isDone(matrixBridgeStarted)).toBe(false);
 
         yield* Deferred.succeed(activation, undefined);
         yield* Deferred.await(activationStartupReady);
 
         expect(yield* Deferred.isDone(childCoordinatorStarted)).toBe(true);
         expect(yield* Deferred.isDone(schedulerTicked)).toBe(true);
-        expect(startOrder).toEqual(["child-coordinator", "scheduler"]);
+        expect(yield* Deferred.isDone(matrixBridgeStarted)).toBe(true);
+        expect(startOrder).toEqual(["child-coordinator", "scheduler", "matrix-bridge"]);
       }).pipe(Effect.provide(layer));
     }),
   ),

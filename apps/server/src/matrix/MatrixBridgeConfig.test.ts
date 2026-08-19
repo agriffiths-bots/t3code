@@ -263,6 +263,37 @@ it.layer(NodeServices.layer)("MatrixBridgeConfig", (it) => {
     }),
   );
 
+  it.effect("clears an owner only when both the thread and epoch still match", () =>
+    Effect.gen(function* () {
+      const memory = makeMemorySecretStore();
+      const bridge = yield* makeService(memory.service);
+      yield* bridge.configure(validInput);
+
+      yield* bridge.setOwner(ownerA).pipe(Effect.provide(projectionLayer));
+      const staleOwner = Option.getOrThrow(yield* bridge.currentConfig);
+
+      yield* bridge.setOwner(ownerB).pipe(Effect.provide(projectionLayer));
+      const currentOwner = Option.getOrThrow(yield* bridge.currentConfig);
+      assert.equal(currentOwner.ownerThreadId, ownerB);
+
+      const unchanged = yield* bridge.clearOwnerIfMatches({
+        ownerThreadId: staleOwner.ownerThreadId!,
+        ownershipEpoch: staleOwner.ownershipEpoch,
+      });
+      assert.deepEqual(yield* bridge.currentConfig, Option.some(currentOwner));
+      assert.equal(unchanged.ownerThreadId, ownerB);
+
+      const cleared = yield* bridge.clearOwnerIfMatches({
+        ownerThreadId: ownerB,
+        ownershipEpoch: currentOwner.ownershipEpoch,
+      });
+      const afterClear = Option.getOrThrow(yield* bridge.currentConfig);
+      assert.equal(afterClear.ownerThreadId, null);
+      assert.equal(afterClear.ownershipEpoch, currentOwner.ownershipEpoch + 1);
+      assert.equal(cleared.ownerThreadId, null);
+    }),
+  );
+
   it.effect("publishes a persisted owner change before honoring interruption", () =>
     Effect.gen(function* () {
       let bytes: Uint8Array | undefined;

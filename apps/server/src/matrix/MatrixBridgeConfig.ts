@@ -170,6 +170,10 @@ export class MatrixBridgeConfig extends Context.Service<
       MatrixBridgeOperationError,
       ProjectionSnapshotQuery.ProjectionSnapshotQuery
     >;
+    readonly clearOwnerIfMatches: (expected: {
+      readonly ownerThreadId: ThreadId;
+      readonly ownershipEpoch: MatrixBridgeConfigV1["ownershipEpoch"];
+    }) => Effect.Effect<MatrixBridgeStatus, MatrixBridgeOperationError>;
   }
 >()("t3/matrix/MatrixBridgeConfig") {}
 
@@ -324,6 +328,41 @@ export const make = Effect.gen(function* () {
     ),
   );
 
+  const clearOwnerIfMatches = Effect.fn("MatrixBridgeConfig.clearOwnerIfMatches")(
+    (expected: {
+      readonly ownerThreadId: ThreadId;
+      readonly ownershipEpoch: MatrixBridgeConfigV1["ownershipEpoch"];
+    }) =>
+      mutationSemaphore.withPermits(1)(
+        Effect.gen(function* () {
+          const current = Option.getOrNull(yield* Ref.get(configRef));
+          if (
+            current === null ||
+            current.ownerThreadId !== expected.ownerThreadId ||
+            current.ownershipEpoch !== expected.ownershipEpoch
+          ) {
+            return yield* SubscriptionRef.get(statusRef);
+          }
+
+          const next: MatrixBridgeConfigV1 = {
+            ...current,
+            ownerThreadId: null,
+            ownershipEpoch: NonNegativeInt.make(current.ownershipEpoch + 1),
+          };
+          const currentStatus = yield* SubscriptionRef.get(statusRef);
+          const nextStatus: MatrixBridgeStatus = { ...currentStatus, ownerThreadId: null };
+          return yield* Effect.uninterruptible(
+            Effect.gen(function* () {
+              yield* persist(next);
+              yield* Ref.set(configRef, Option.some(next));
+              yield* SubscriptionRef.set(statusRef, nextStatus);
+              return nextStatus;
+            }),
+          );
+        }),
+      ),
+  );
+
   return MatrixBridgeConfig.of({
     currentConfig: Ref.get(configRef),
     status: SubscriptionRef.get(statusRef),
@@ -331,6 +370,7 @@ export const make = Effect.gen(function* () {
     configure,
     disconnect,
     setOwner,
+    clearOwnerIfMatches,
   });
 });
 

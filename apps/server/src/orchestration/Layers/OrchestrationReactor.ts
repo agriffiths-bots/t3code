@@ -13,6 +13,7 @@ import { ProviderRuntimeIngestionService } from "../Services/ProviderRuntimeInge
 import { ScheduledTasksReactor } from "../Services/ScheduledTasksReactor.ts";
 import { ThreadDeletionReactor } from "../Services/ThreadDeletionReactor.ts";
 import * as AgentAwarenessRelay from "../../relay/AgentAwarenessRelay.ts";
+import { MatrixBridgeReactor } from "../../matrix/MatrixBridgeReactor.ts";
 import { forkParked, ServerActivation } from "../../serverActivation.ts";
 import * as VcsMaintenanceReactor from "../../vcs/VcsMaintenanceReactor.ts";
 
@@ -25,11 +26,13 @@ export const makeOrchestrationReactor = Effect.gen(function* () {
   const vcsMaintenanceReactor = yield* VcsMaintenanceReactor.VcsMaintenanceReactor;
   const childThreadCoordinator = yield* ChildThreadCoordinator;
   const scheduledTasksReactor = yield* ScheduledTasksReactor;
+  const matrixBridgeReactor = yield* MatrixBridgeReactor;
   const activationReady = yield* Deferred.make<void>();
 
   const startActivationSensitiveReactors = Effect.gen(function* () {
     yield* childThreadCoordinator.start();
     yield* scheduledTasksReactor.start();
+    yield* matrixBridgeReactor.start();
   }).pipe(Effect.onExit((exit) => Deferred.done(activationReady, exit).pipe(Effect.asVoid)));
 
   const start: OrchestrationReactorShape["start"] = Effect.fn("start")(function* () {

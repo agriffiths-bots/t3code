@@ -86,6 +86,7 @@ import { GitWorkflowService } from "../src/git/GitWorkflowService.ts";
 import * as VcsProcess from "../src/vcs/VcsProcess.ts";
 import * as AgentAwarenessRelay from "../src/relay/AgentAwarenessRelay.ts";
 import * as VcsMaintenanceReactor from "../src/vcs/VcsMaintenanceReactor.ts";
+import { MatrixBridgeReactor } from "../src/matrix/MatrixBridgeReactor.ts";
 
 const decodeCodexSettings = Schema.decodeEffect(CodexSettings);
 
@@ -397,6 +398,9 @@ export const makeOrchestrationIntegrationHarness = (
         }),
       ),
       Layer.provideMerge(Layer.succeed(ScheduledTasksReactor, { start: () => Effect.void })),
+      Layer.provideMerge(
+        Layer.succeed(MatrixBridgeReactor, { start: () => Effect.void, drain: Effect.void }),
+      ),
     );
     const layer = Layer.empty.pipe(
       Layer.provideMerge(runtimeServicesLayer),

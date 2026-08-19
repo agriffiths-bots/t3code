@@ -14,6 +14,7 @@ import { ScheduledTasksReactor } from "../Services/ScheduledTasksReactor.ts";
 import { ThreadDeletionReactor } from "../Services/ThreadDeletionReactor.ts";
 import { makeOrchestrationReactor } from "./OrchestrationReactor.ts";
 import * as AgentAwarenessRelay from "../../relay/AgentAwarenessRelay.ts";
+import { MatrixBridgeReactor } from "../../matrix/MatrixBridgeReactor.ts";
 import * as VcsMaintenanceReactor from "../../vcs/VcsMaintenanceReactor.ts";
 
 describe("OrchestrationReactor", () => {
@@ -101,6 +102,15 @@ describe("OrchestrationReactor", () => {
             },
           }),
         ),
+        Layer.provideMerge(
+          Layer.succeed(MatrixBridgeReactor, {
+            start: () => {
+              started.push("matrix-bridge-reactor");
+              return Effect.void;
+            },
+            drain: Effect.void,
+          }),
+        ),
       ),
     );
 
@@ -117,8 +127,8 @@ describe("OrchestrationReactor", () => {
       "vcs-maintenance-reactor",
       "child-thread-coordinator",
       "scheduled-tasks-reactor",
+      "matrix-bridge-reactor",
     ]);
-
     await Effect.runPromise(Scope.close(scope, Exit.void));
   });
 });
