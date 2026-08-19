@@ -98,6 +98,7 @@ import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import { authHttpApiLayer, environmentAuthenticatedAuthLayer } from "./auth/http.ts";
 import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
+import * as MatrixBridgeConfig from "./matrix/MatrixBridgeConfig.ts";
 import {
   connectHttpApiLayer,
   pendingServiceUpdateExists,
@@ -447,6 +448,7 @@ const RuntimeCoreDependenciesLive = RuntimeCoreDependenciesBaseLive.pipe(
   Layer.provideMerge(ServerEnvironment.layer),
   Layer.provideMerge(AuthLayerLive),
   Layer.provideMerge(ServerSecretStore.layer),
+  Layer.provideMerge(MatrixBridgeConfig.layer.pipe(Layer.provide(ServerSecretStore.layer))),
   Layer.provideMerge(DeviceNotificationsLayerLive),
   Layer.provideMerge(
     Layer.mergeAll(

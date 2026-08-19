@@ -122,6 +122,7 @@ import * as BootstrapTurnStartDispatcher from "./orchestration/Services/Bootstra
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as BackgroundPolicy from "./background/BackgroundPolicy.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
+import * as MatrixBridgeConfig from "./matrix/MatrixBridgeConfig.ts";
 import { requiredScopeForRpcMethod } from "./auth/RpcAuthorization.ts";
 import {
   isAudienceScopedReadRpcMethod,
@@ -404,6 +405,7 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
       const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
       const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
       const serverEnvironment = yield* ServerEnvironment.ServerEnvironment;
+      const matrixBridge = yield* MatrixBridgeConfig.MatrixBridgeConfig;
       const backgroundPolicy = yield* BackgroundPolicy.BackgroundPolicy;
       const rpcClientIds = yield* Ref.make(new Set<RpcClientId>());
       yield* Effect.addFinalizer(() =>
@@ -1821,6 +1823,24 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
         [WS_METHODS.serverGetConfig]: (_input) =>
           observeRpcEffect(WS_METHODS.serverGetConfig, loadServerConfig, {
             "rpc.aggregate": "server",
+          }),
+        [WS_METHODS.matrixBridgeConfigure]: (input) =>
+          observeRpcEffect(WS_METHODS.matrixBridgeConfigure, matrixBridge.configure(input), {
+            "rpc.aggregate": "matrix",
+          }),
+        [WS_METHODS.matrixBridgeDisconnect]: (_input) =>
+          observeRpcEffect(WS_METHODS.matrixBridgeDisconnect, matrixBridge.disconnect, {
+            "rpc.aggregate": "matrix",
+          }),
+        [WS_METHODS.matrixBridgeSetOwner]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.matrixBridgeSetOwner,
+            matrixBridge.setOwner(input.ownerThreadId),
+            { "rpc.aggregate": "matrix" },
+          ),
+        [WS_METHODS.matrixBridgeSubscribeStatus]: (_input) =>
+          observeRpcStream(WS_METHODS.matrixBridgeSubscribeStatus, matrixBridge.statusChanges, {
+            "rpc.aggregate": "matrix",
           }),
         [WS_METHODS.serverRefreshProviders]: (input) =>
           observeRpcEffect(

@@ -121,6 +121,11 @@ import {
 import {
   ServerConfigStreamEvent,
   ServerConfig,
+  MatrixBridgeConfigView,
+  MatrixBridgeConfigureInput,
+  MatrixBridgeOperationError,
+  MatrixBridgeSetOwnerInput,
+  MatrixBridgeStatus,
   ServerProviderUpdateError,
   ServerProviderUpdateInput,
   ServerLifecycleStreamEvent,
@@ -253,6 +258,12 @@ export const WS_METHODS = {
   serverGetBackgroundPolicy: "server.getBackgroundPolicy",
   serverGetUsageSummary: "server.getUsageSummary",
 
+  // Matrix bridge methods
+  matrixBridgeConfigure: "matrixBridge.configure",
+  matrixBridgeDisconnect: "matrixBridge.disconnect",
+  matrixBridgeSetOwner: "matrixBridge.setOwner",
+  matrixBridgeSubscribeStatus: "matrixBridge.subscribeStatus",
+
   // Cloud environment methods
   cloudGetRelayClientStatus: "cloud.getRelayClientStatus",
   cloudInstallRelayClient: "cloud.installRelayClient",
@@ -298,6 +309,31 @@ export const WsServerGetConfigRpc = Rpc.make(WS_METHODS.serverGetConfig, {
   payload: Schema.Struct({}),
   success: ServerConfig,
   error: Schema.Union([KeybindingsConfigError, ServerSettingsError, EnvironmentAuthorizationError]),
+});
+
+export const WsMatrixBridgeConfigureRpc = Rpc.make(WS_METHODS.matrixBridgeConfigure, {
+  payload: MatrixBridgeConfigureInput,
+  success: MatrixBridgeConfigView,
+  error: Schema.Union([MatrixBridgeOperationError, EnvironmentAuthorizationError]),
+});
+
+export const WsMatrixBridgeDisconnectRpc = Rpc.make(WS_METHODS.matrixBridgeDisconnect, {
+  payload: Schema.Struct({}),
+  success: MatrixBridgeStatus,
+  error: Schema.Union([MatrixBridgeOperationError, EnvironmentAuthorizationError]),
+});
+
+export const WsMatrixBridgeSetOwnerRpc = Rpc.make(WS_METHODS.matrixBridgeSetOwner, {
+  payload: MatrixBridgeSetOwnerInput,
+  success: MatrixBridgeStatus,
+  error: Schema.Union([MatrixBridgeOperationError, EnvironmentAuthorizationError]),
+});
+
+export const WsMatrixBridgeSubscribeStatusRpc = Rpc.make(WS_METHODS.matrixBridgeSubscribeStatus, {
+  payload: Schema.Struct({}),
+  success: MatrixBridgeStatus,
+  error: EnvironmentAuthorizationError,
+  stream: true,
 });
 
 export const WsServerRefreshProvidersRpc = Rpc.make(WS_METHODS.serverRefreshProviders, {
@@ -877,6 +913,10 @@ export const WsSubscribeResourceTelemetryRpc = Rpc.make(WS_METHODS.subscribeReso
 export const WsRpcGroup = RpcGroup.make(
   WsServerProbeRpc,
   WsServerGetConfigRpc,
+  WsMatrixBridgeConfigureRpc,
+  WsMatrixBridgeDisconnectRpc,
+  WsMatrixBridgeSetOwnerRpc,
+  WsMatrixBridgeSubscribeStatusRpc,
   WsServerRefreshProvidersRpc,
   WsServerUpdateProviderRpc,
   WsServerUpdateServerRpc,

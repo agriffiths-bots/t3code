@@ -149,6 +149,7 @@ import * as ReviewService from "./review/ReviewService.ts";
 import * as SourceControlRepositoryService from "./sourceControl/SourceControlRepositoryService.ts";
 import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
+import * as MatrixBridgeConfig from "./matrix/MatrixBridgeConfig.ts";
 import * as CloudManagedEndpointRuntime from "./cloud/ManagedEndpointRuntime.ts";
 import * as CloudCliTokenManager from "./cloud/CliTokenManager.ts";
 import * as ProcessDiagnostics from "./diagnostics/ProcessDiagnostics.ts";
@@ -193,6 +194,11 @@ import {
 const defaultProjectId = ProjectId.make("project-default");
 const defaultThreadId = ThreadId.make("thread-default");
 const defaultDesktopBootstrapToken = "test-desktop-bootstrap-token";
+const matrixBridgeConfigureInput = {
+  homeserverUrl: "https://matrix.example.test",
+  accessToken: "matrix-server-test-token",
+  allowedUserIds: ["@adam:beeper.com"],
+};
 const defaultModelSelection = {
   instanceId: ProviderInstanceId.make("codex"),
   model: "gpt-5-codex",
@@ -1133,6 +1139,7 @@ const buildAppUnderTest = (options?: {
         }),
       ),
       Layer.provideMerge(makeAuthTestLayer()),
+      Layer.provideMerge(MatrixBridgeConfig.layer.pipe(Layer.provide(ServerSecretStore.layer))),
       Layer.provideMerge(ServerSecretStore.layer),
       Layer.provide(workspaceAndProjectServicesLayer),
       Layer.provideMerge(FetchHttpClient.layer),
@@ -4255,6 +4262,196 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       );
       assert.equal(result.path, snapshotPath);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("Matrix bridge rejects missing and archived owner threads", () =>
+    Effect.gen(function* () {
+      const archivedThreadId = ThreadId.make("thread-matrix-archived");
+      yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getThreadShellByIdIncludingArchived: (threadId) =>
+              Effect.succeed(
+                threadId === archivedThreadId
+                  ? Option.some(
+                      makeDefaultOrchestrationThreadShell({
+                        id: archivedThreadId,
+                        archivedAt: "2026-08-19T10:00:00.000Z",
+                      }),
+                    )
+                  : Option.none(),
+              ),
+          },
+        },
+      });
+      const wsUrl = yield* getWsServerUrl("/ws");
+
+      yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          Effect.gen(function* () {
+            yield* client[WS_METHODS.matrixBridgeConfigure](matrixBridgeConfigureInput);
+
+            const missing = yield* Effect.flip(
+              client[WS_METHODS.matrixBridgeSetOwner]({
+                ownerThreadId: ThreadId.make("thread-matrix-missing"),
+              }),
+            );
+            assert.equal(missing._tag, "MatrixBridgeOperationError");
+            if (missing._tag === "MatrixBridgeOperationError") {
+              assert.equal(missing.reason, "threadNotFound");
+            }
+
+            const archived = yield* Effect.flip(
+              client[WS_METHODS.matrixBridgeSetOwner]({ ownerThreadId: archivedThreadId }),
+            );
+            assert.equal(archived._tag, "MatrixBridgeOperationError");
+            if (archived._tag === "MatrixBridgeOperationError") {
+              assert.equal(archived.reason, "threadArchived");
+            }
+          }),
+        ),
+      );
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("Matrix bridge sets, moves, unsets, streams, and disconnects ownership", () =>
+    Effect.gen(function* () {
+      const firstOwner = ThreadId.make("thread-matrix-first-owner");
+      const secondOwner = ThreadId.make("thread-matrix-second-owner");
+      yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getThreadShellByIdIncludingArchived: (threadId) =>
+              Effect.succeed(Option.some(makeDefaultOrchestrationThreadShell({ id: threadId }))),
+          },
+        },
+      });
+      const wsUrl = yield* getWsServerUrl("/ws");
+
+      yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          Effect.gen(function* () {
+            const view = yield* client[WS_METHODS.matrixBridgeConfigure](
+              matrixBridgeConfigureInput,
+            );
+            assert.deepEqual(view, {
+              homeserverUrl: "https://matrix.example.test/",
+              allowedUserIds: ["@adam:beeper.com"],
+              roomId: null,
+            });
+
+            const initialStatusSeen = yield* Deferred.make<void>();
+            const statusesFiber = yield* client[WS_METHODS.matrixBridgeSubscribeStatus]({}).pipe(
+              Stream.tap(() => Deferred.succeed(initialStatusSeen, undefined)),
+              Stream.take(2),
+              Stream.runCollect,
+              Effect.forkChild,
+            );
+            yield* Deferred.await(initialStatusSeen);
+
+            assert.equal(
+              (yield* client[WS_METHODS.matrixBridgeSetOwner]({
+                ownerThreadId: firstOwner,
+              })).ownerThreadId,
+              firstOwner,
+            );
+            assert.deepEqual(Array.from(yield* Fiber.join(statusesFiber)), [
+              {
+                state: "connecting",
+                ownerThreadId: null,
+                encryptionReady: false,
+                reason: null,
+              },
+              {
+                state: "connecting",
+                ownerThreadId: firstOwner,
+                encryptionReady: false,
+                reason: null,
+              },
+            ]);
+
+            assert.equal(
+              (yield* client[WS_METHODS.matrixBridgeSetOwner]({
+                ownerThreadId: secondOwner,
+              })).ownerThreadId,
+              secondOwner,
+            );
+            assert.equal(
+              (yield* client[WS_METHODS.matrixBridgeSetOwner]({ ownerThreadId: null }))
+                .ownerThreadId,
+              null,
+            );
+
+            assert.deepEqual(yield* client[WS_METHODS.matrixBridgeDisconnect]({}), {
+              state: "disabled",
+              ownerThreadId: null,
+              encryptionReady: false,
+              reason: null,
+            });
+          }),
+        ),
+      );
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect(
+    "Matrix bridge rejects unauthorized configuration, owner, status, and disconnect calls",
+    () =>
+      Effect.gen(function* () {
+        yield* buildAppUnderTest();
+
+        const operateUrl = yield* getScopedWsServerUrl("orchestration:operate");
+        const configureError = yield* Effect.flip(
+          Effect.scoped(
+            withWsRpcClient(operateUrl, (client) =>
+              client[WS_METHODS.matrixBridgeConfigure](matrixBridgeConfigureInput),
+            ),
+          ),
+        );
+        assert.equal(configureError._tag, "EnvironmentAuthorizationError");
+        if (configureError._tag === "EnvironmentAuthorizationError") {
+          assert.equal(configureError.requiredScope, "access:write");
+        }
+
+        const accessWriteUrl = yield* getScopedWsServerUrl("access:write");
+        const ownerError = yield* Effect.scoped(
+          withWsRpcClient(accessWriteUrl, (client) =>
+            Effect.gen(function* () {
+              yield* client[WS_METHODS.matrixBridgeConfigure](matrixBridgeConfigureInput);
+              return yield* Effect.flip(
+                client[WS_METHODS.matrixBridgeSetOwner]({ ownerThreadId: defaultThreadId }),
+              );
+            }),
+          ),
+        );
+        assert.equal(ownerError._tag, "EnvironmentAuthorizationError");
+        if (ownerError._tag === "EnvironmentAuthorizationError") {
+          assert.equal(ownerError.requiredScope, "orchestration:operate");
+        }
+
+        const statusError = yield* Effect.flip(
+          Effect.scoped(
+            withWsRpcClient(operateUrl, (client) =>
+              client[WS_METHODS.matrixBridgeSubscribeStatus]({}).pipe(Stream.runHead),
+            ),
+          ),
+        );
+        assert.equal(statusError._tag, "EnvironmentAuthorizationError");
+        if (statusError._tag === "EnvironmentAuthorizationError") {
+          assert.equal(statusError.requiredScope, "orchestration:read");
+        }
+
+        const readUrl = yield* getScopedWsServerUrl("orchestration:read");
+        const disconnectError = yield* Effect.flip(
+          Effect.scoped(
+            withWsRpcClient(readUrl, (client) => client[WS_METHODS.matrixBridgeDisconnect]({})),
+          ),
+        );
+        assert.equal(disconnectError._tag, "EnvironmentAuthorizationError");
+        if (disconnectError._tag === "EnvironmentAuthorizationError") {
+          assert.equal(disconnectError.requiredScope, "access:write");
+        }
+      }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
   it.effect("returns typed busy and write failures from the heap snapshot RPC", () =>
