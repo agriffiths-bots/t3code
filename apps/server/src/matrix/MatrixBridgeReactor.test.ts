@@ -1,4 +1,5 @@
 import {
+  CheckpointRef,
   EnvironmentId,
   EventId,
   MessageId,
@@ -190,6 +191,49 @@ function toolEvent(threadId: ThreadId, turnId: TurnId, at: string): Orchestratio
   };
 }
 
+function terminalMarkerEvent(input: {
+  readonly kind: "session" | "turn-diff";
+  readonly threadId?: ThreadId;
+  readonly turnId: TurnId;
+  readonly at: string;
+  readonly sessionStatus?: "ready" | "idle" | "interrupted" | "stopped" | "error";
+}): OrchestrationEvent {
+  const threadId = input.threadId ?? threadA;
+  if (input.kind === "session") {
+    const sessionStatus = input.sessionStatus ?? "ready";
+    return {
+      ...eventBase(threadId, `event-session-${sessionStatus}-${input.turnId}`, input.at),
+      type: "thread.session-set",
+      payload: {
+        threadId,
+        session: {
+          threadId,
+          status: sessionStatus,
+          providerName: "codex",
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          lastError: sessionStatus === "error" ? "turn failed" : null,
+          updatedAt: input.at,
+        },
+      },
+    };
+  }
+  return {
+    ...eventBase(threadId, `event-turn-diff-terminal-${input.turnId}`, input.at),
+    type: "thread.turn-diff-completed",
+    payload: {
+      threadId,
+      turnId: input.turnId,
+      checkpointTurnCount: NonNegativeInt.make(1),
+      checkpointRef: CheckpointRef.make(`refs/t3/checkpoints/${threadId}/${input.turnId}`),
+      status: "ready",
+      files: [],
+      assistantMessageId: null,
+      completedAt: input.at,
+    },
+  };
+}
+
 function lifecycleEvent(
   type: "thread.archived" | "thread.deleted",
   threadId: ThreadId,
@@ -299,7 +343,11 @@ function withHarness<A, E>(
               status(Option.isSome(current) ? current.value.ownerThreadId : null),
             ),
           ),
-          statusChanges: Stream.empty,
+          statusChanges: SubscriptionRef.changes(configRef).pipe(
+            Stream.map((current) =>
+              status(Option.isSome(current) ? current.value.ownerThreadId : null),
+            ),
+          ),
           configure: () => unsupported(),
           disconnect: unsupported(),
           setOwner,
@@ -440,6 +488,70 @@ it.effect("sends only the final text after two mid-turn assistant completions an
       const sent = yield* harness.fake.sent;
       expect(sent.map((entry) => entry.content.body)).toEqual(["The final projected answer."]);
     }),
+  ),
+);
+
+it.effect("re-evaluates a pending final once when each terminal marker arrives", () =>
+  Effect.forEach(
+    [
+      { kind: "session", sessionStatus: "ready" },
+      { kind: "session", sessionStatus: "idle" },
+      { kind: "session", sessionStatus: "interrupted" },
+      { kind: "session", sessionStatus: "stopped" },
+      { kind: "session", sessionStatus: "error" },
+      { kind: "turn-diff" },
+    ] as const,
+    (marker) =>
+      withHarness((harness) =>
+        Effect.gen(function* () {
+          const markerName = marker.kind === "session" ? marker.sessionStatus : marker.kind;
+          const turnId = TurnId.make(`turn-terminal-race-${markerName}`);
+          const final = message({
+            id: `message-terminal-race-${markerName}`,
+            role: "assistant",
+            text: `Final after ${markerName} terminal marker`,
+            turnId,
+            at: "2026-08-19T10:00:09.000Z",
+          });
+          yield* harness.setThread(
+            thread({
+              turnId,
+              state: "running",
+              messages: [final],
+            }),
+          );
+
+          const assistantFinalEvent = assistantEvent({
+            turnId,
+            messageId: `message-terminal-race-${markerName}`,
+            at: final.updatedAt,
+          });
+          yield* harness.publish(assistantFinalEvent);
+          expect(yield* harness.fake.sent).toEqual([]);
+
+          yield* harness.setThread(
+            thread({
+              turnId,
+              state: "completed",
+              messages: [final],
+              terminalAt: "2026-08-19T10:00:10.000Z",
+            }),
+          );
+          const terminalEvent = terminalMarkerEvent({
+            kind: marker.kind,
+            turnId,
+            at: "2026-08-19T10:00:10.000Z",
+            ...(marker.kind === "session" ? { sessionStatus: marker.sessionStatus } : {}),
+          });
+          yield* harness.publish(terminalEvent);
+          yield* harness.publish(assistantFinalEvent);
+          yield* harness.publish(terminalEvent);
+
+          expect((yield* harness.fake.sent).map((entry) => entry.content.body)).toEqual([
+            `Final after ${markerName} terminal marker`,
+          ]);
+        }),
+      ),
   ),
 );
 

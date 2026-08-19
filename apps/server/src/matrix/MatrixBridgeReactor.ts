@@ -193,6 +193,41 @@ export const make = Effect.gen(function* () {
   const environmentId = yield* (yield* ServerEnvironment.ServerEnvironment).getEnvironmentId;
   const seenTurns = new Map<ThreadId, Set<TurnId>>();
   const seenTurnOrder: Array<readonly [ThreadId, TurnId]> = [];
+  const pendingCandidates = new Map<ThreadId, TerminalCandidate>();
+
+  const retainPendingCandidate = (candidate: TerminalCandidate) => {
+    for (const [threadId, pending] of pendingCandidates) {
+      if (threadId !== candidate.threadId || pending.ownershipEpoch !== candidate.ownershipEpoch) {
+        pendingCandidates.delete(threadId);
+      }
+    }
+    pendingCandidates.set(candidate.threadId, candidate);
+  };
+
+  const forgetPendingCandidate = (candidate: TerminalCandidate) => {
+    const pending = pendingCandidates.get(candidate.threadId);
+    if (
+      pending?.turnId === candidate.turnId &&
+      pending.ownershipEpoch === candidate.ownershipEpoch
+    ) {
+      pendingCandidates.delete(candidate.threadId);
+    }
+  };
+
+  const prunePendingCandidates = Effect.fn("MatrixBridgeReactor.prunePendingCandidates")(
+    function* () {
+      const config = yield* configService.currentConfig;
+      for (const [threadId, candidate] of pendingCandidates) {
+        if (
+          Option.isNone(config) ||
+          config.value.ownerThreadId !== threadId ||
+          config.value.ownershipEpoch !== candidate.ownershipEpoch
+        ) {
+          pendingCandidates.delete(threadId);
+        }
+      }
+    },
+  );
 
   const ownerStillMatches = Effect.fn("MatrixBridgeReactor.ownerStillMatches")(function* (
     job: TerminalCandidate,
@@ -257,6 +292,7 @@ export const make = Effect.gen(function* () {
         beforeRead.pairing.state !== "paired" ||
         beforeRead.roomId === null
       ) {
+        forgetPendingCandidate(candidate);
         return;
       }
 
@@ -266,6 +302,7 @@ export const make = Effect.gen(function* () {
         detail.value.archivedAt !== null ||
         detail.value.deletedAt !== null
       ) {
+        forgetPendingCandidate(candidate);
         yield* configService
           .clearOwnerIfMatches({
             ownerThreadId: candidate.threadId,
@@ -296,7 +333,10 @@ export const make = Effect.gen(function* () {
       );
       if (terminalAt === null) return;
       const latestUserAt = latestUserMessageAt(detail.value);
-      if (latestUserAt !== null && latestUserAt > terminalAt) return;
+      if (latestUserAt !== null && latestUserAt > terminalAt) {
+        forgetPendingCandidate(candidate);
+        return;
+      }
 
       const afterRead = currentOwner(yield* configService.currentConfig, candidate.threadId);
       if (
@@ -305,10 +345,15 @@ export const make = Effect.gen(function* () {
         afterRead.pairing.state !== "paired" ||
         afterRead.roomId === null
       ) {
+        forgetPendingCandidate(candidate);
         return;
       }
 
-      if (!rememberBounded(seenTurns, seenTurnOrder, candidate.threadId, candidate.turnId)) return;
+      if (!rememberBounded(seenTurns, seenTurnOrder, candidate.threadId, candidate.turnId)) {
+        forgetPendingCandidate(candidate);
+        return;
+      }
+      forgetPendingCandidate(candidate);
 
       const enqueuedAt = yield* Clock.currentTimeMillis;
       const accepted = yield* outboundWorker.enqueue({
@@ -339,8 +384,21 @@ export const make = Effect.gen(function* () {
 
   const terminalWorker = yield* makeDrainableWorker(inspectTerminalCandidate);
 
+  const recheckPendingCandidate = (threadId: ThreadId, turnId?: TurnId) =>
+    Effect.gen(function* () {
+      const candidate = pendingCandidates.get(threadId);
+      if (candidate === undefined || (turnId !== undefined && candidate.turnId !== turnId)) return;
+      const current = currentOwner(yield* configService.currentConfig, threadId);
+      if (current === null || current.ownershipEpoch !== candidate.ownershipEpoch) {
+        forgetPendingCandidate(candidate);
+        return;
+      }
+      yield* terminalWorker.enqueue(candidate);
+    });
+
   const clearInactiveOwner = (threadId: ThreadId) =>
     Effect.gen(function* () {
+      pendingCandidates.delete(threadId);
       const current = currentOwner(yield* configService.currentConfig, threadId);
       if (current === null) return;
       yield* configService
@@ -361,22 +419,29 @@ export const make = Effect.gen(function* () {
     if (event.type === "thread.archived" || event.type === "thread.deleted") {
       return clearInactiveOwner(event.payload.threadId);
     }
+    if (event.type === "thread.turn-diff-completed") {
+      return recheckPendingCandidate(event.payload.threadId, event.payload.turnId);
+    }
+    if (event.type === "thread.session-set") {
+      return recheckPendingCandidate(event.payload.threadId);
+    }
     if (
       event.type !== "thread.message-sent" ||
       event.payload.role !== "assistant" ||
       event.payload.streaming ||
       event.payload.turnId === null
-    ) {
+    )
       return Effect.void;
-    }
     return Effect.gen(function* () {
       const current = currentOwner(yield* configService.currentConfig, event.payload.threadId);
       if (current === null) return;
-      yield* terminalWorker.enqueue({
+      const candidate = {
         threadId: event.payload.threadId,
         turnId: event.payload.turnId as TurnId,
         ownershipEpoch: current.ownershipEpoch,
-      });
+      };
+      retainPendingCandidate(candidate);
+      yield* terminalWorker.enqueue(candidate);
     });
   };
 
@@ -388,6 +453,15 @@ export const make = Effect.gen(function* () {
             Cause.hasInterruptsOnly(cause)
               ? Effect.failCause(cause)
               : Effect.logWarning("Matrix bridge domain-event consumer stopped"),
+          ),
+        ),
+      );
+      yield* forkParked(
+        Stream.runForEach(configService.statusChanges, () => prunePendingCandidates()).pipe(
+          Effect.catchCause((cause) =>
+            Cause.hasInterruptsOnly(cause)
+              ? Effect.failCause(cause)
+              : Effect.logWarning("Matrix bridge ownership observer stopped"),
           ),
         ),
       );
