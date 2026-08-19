@@ -1100,6 +1100,62 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
     }).pipe(Effect.provide(testLayer)),
   );
 
+  it.effect("refuses to send after the connection has been replaced", () =>
+    Effect.gen(function* () {
+      const sdk = makeFakeSdk();
+      const configService = yield* configureBridge();
+      const client = yield* startAdapter(sdk);
+      yield* awaitStatusState(configService, "waiting-for-member");
+
+      // An allowlist edit mints a new connection identity while a send is in
+      // flight; the captured connection must not deliver into the old room.
+      yield* configService.configure({
+        homeserverUrl: HOMESERVER_URL,
+        accessToken: "matrix-secret-token",
+        allowedUserIds: [ALLOWED_USER_ID, "@second:beeper.com"],
+      });
+
+      const result = yield* Effect.result(
+        client.sendText({
+          roomId: ROOM_ID,
+          transactionId: "t3-stale-connection",
+          content: { msgtype: "m.text", body: "must not be delivered" },
+        }),
+      );
+      // Refused either as a retired connection or as no connection at all,
+      // depending on how far the teardown has run; what matters is that
+      // nothing reached the room the operator just replaced.
+      assert.equal(result._tag, "Failure");
+      assert.lengthOf(
+        sdk.requests.filter((request) => request.method === "PUT"),
+        0,
+      );
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("restores readiness when identical settings are resubmitted", () =>
+    Effect.gen(function* () {
+      const sdk = makeFakeSdk();
+      const configService = yield* configureBridge();
+      yield* startAdapter(sdk);
+      yield* awaitStatusState(configService, "waiting-for-member");
+
+      // Connect with unchanged settings keeps this connection alive, so the
+      // status it publishes has to come back rather than stick on connecting.
+      yield* configService.configure({
+        homeserverUrl: HOMESERVER_URL,
+        accessToken: "matrix-secret-token",
+        allowedUserIds: [ALLOWED_USER_ID],
+      });
+      yield* awaitStatusState(configService, "waiting-for-member");
+
+      const status = yield* configService.status;
+      assert.equal(status.state, "waiting-for-member");
+      assert.isTrue(status.encryptionReady);
+      assert.lengthOf(sdk.startedFilters, 1);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
   it.effect("delivers decrypted room text and ignores the bot's own events", () =>
     Effect.gen(function* () {
       const sdk = makeFakeSdk();

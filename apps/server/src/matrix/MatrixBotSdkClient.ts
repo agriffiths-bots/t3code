@@ -1013,10 +1013,19 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
         Option.isSome(current) && current.value === connection ? Option.none() : current,
       ),
     );
-    yield* configService.reportTransportStateIfMatches({
+    const publishReady = configService.reportTransportStateIfMatches({
       cryptoStoreGeneration: config.cryptoStoreGeneration,
       transport: { state: "ready" },
     });
+    yield* publishReady;
+    // Resubmitting identical settings republishes `connecting` without
+    // replacing this connection, so the live transport restores the truth
+    // rather than leaving the status stuck mid-connect.
+    yield* Effect.forkScoped(
+      Stream.runForEach(configService.statusChanges, (status) =>
+        status.state === "connecting" ? Effect.asVoid(publishReady) : Effect.void,
+      ),
+    );
     yield* Effect.logInfo("Matrix bridge transport connected");
     return yield* Effect.never;
   });
@@ -1099,6 +1108,24 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
     }
 
     const encrypted = yield* encryptOnce(connection, message);
+
+    // Reconfiguration and disconnect happen while a send is in flight, and the
+    // connection captured above may already be retired: check the live
+    // configuration immediately before the request so output cannot reach a
+    // room the operator has just replaced or left.
+    const live = Option.getOrNull(yield* configService.currentConfig);
+    if (
+      live === null ||
+      live.cryptoStoreGeneration !== connection.cryptoStoreGeneration ||
+      live.roomId !== connection.roomId
+    ) {
+      return yield* clientError(
+        "send",
+        "The Matrix connection was replaced before the message could be sent.",
+        "permanent",
+      );
+    }
+
     // The transaction ID makes the send idempotent across retries: the
     // homeserver returns the original event for a repeated PUT.
     yield* request("send", "The Matrix message could not be delivered.", () =>
