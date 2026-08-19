@@ -99,6 +99,8 @@ import { authHttpApiLayer, environmentAuthenticatedAuthLayer } from "./auth/http
 import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import * as MatrixBridgeConfig from "./matrix/MatrixBridgeConfig.ts";
+import * as MatrixBridgeClient from "./matrix/MatrixBridgeClient.ts";
+import * as MatrixBridgeReactor from "./matrix/MatrixBridgeReactor.ts";
 import {
   connectHttpApiLayer,
   pendingServiceUpdateExists,
@@ -269,6 +271,9 @@ const ReactorLayerLive = Layer.empty.pipe(
   Layer.provideMerge(ChildThreadCoordinatorLive.pipe(Layer.provide(PendingDispatchRepositoryLive))),
   Layer.provideMerge(AgentAwarenessRelay.layer.pipe(Layer.provide(ServerSecretStore.layer))),
   Layer.provideMerge(RuntimeReceiptBusLive),
+  Layer.provideMerge(
+    MatrixBridgeReactor.layer.pipe(Layer.provide(MatrixBridgeClient.unavailableLayer)),
+  ),
 );
 
 const ProviderSessionDirectoryLayerLive = ProviderSessionDirectoryLive.pipe(

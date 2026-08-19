@@ -4,6 +4,7 @@ import {
   NonNegativeInt,
   ThreadId,
   TrimmedNonEmptyString,
+  TurnId,
   type MatrixBridgeConfigureInput,
   type MatrixBridgeConfigView,
   type MatrixBridgeStatus,
@@ -36,7 +37,7 @@ const MatrixBridgePairing = Schema.Union([
   }),
 ]);
 
-export const MatrixBridgeConfigV1 = Schema.Struct({
+const matrixBridgeConfigV1Fields = {
   version: Schema.Literal(1),
   homeserverUrl: TrimmedNonEmptyString,
   accessToken: TrimmedNonEmptyString,
@@ -46,12 +47,38 @@ export const MatrixBridgeConfigV1 = Schema.Struct({
   ownerThreadId: Schema.NullOr(ThreadId),
   ownershipEpoch: NonNegativeInt,
   cryptoStoreGeneration: TrimmedNonEmptyString,
+};
+
+export const MatrixBridgeConfigV1 = Schema.Struct({
+  ...matrixBridgeConfigV1Fields,
+  lastDeliveredTurnId: Schema.NullOr(TurnId),
+  deliveryBaselineSequence: NonNegativeInt,
+  deliveryCheckpointInitialized: Schema.Boolean,
 });
 export type MatrixBridgeConfigV1 = typeof MatrixBridgeConfigV1.Type;
 
 const MatrixBridgeConfigJson = Schema.fromJsonString(MatrixBridgeConfigV1);
+const StoredMatrixBridgeConfigJson = Schema.fromJsonString(
+  Schema.Struct({
+    ...matrixBridgeConfigV1Fields,
+    lastDeliveredTurnId: Schema.optionalKey(Schema.NullOr(TurnId)),
+    deliveryBaselineSequence: Schema.optionalKey(NonNegativeInt),
+    deliveryCheckpointInitialized: Schema.optionalKey(Schema.Boolean),
+  }),
+);
 export const encodeMatrixBridgeConfigJson = Schema.encodeEffect(MatrixBridgeConfigJson);
-export const decodeMatrixBridgeConfigJson = Schema.decodeUnknownOption(MatrixBridgeConfigJson);
+const decodeStoredMatrixBridgeConfigJson = Schema.decodeUnknownOption(StoredMatrixBridgeConfigJson);
+export const decodeMatrixBridgeConfigJson = (input: unknown): Option.Option<MatrixBridgeConfigV1> =>
+  Option.map(decodeStoredMatrixBridgeConfigJson(input), (config) => {
+    const hasDeliveryBaseline = config.deliveryBaselineSequence !== undefined;
+    return {
+      ...config,
+      lastDeliveredTurnId: config.lastDeliveredTurnId ?? null,
+      deliveryBaselineSequence: config.deliveryBaselineSequence ?? NonNegativeInt.make(0),
+      deliveryCheckpointInitialized:
+        (config.deliveryCheckpointInitialized ?? false) && hasDeliveryBaseline,
+    };
+  });
 
 const MatrixBridgePublicConfigureFields = Schema.Struct({
   homeserverUrl: TrimmedNonEmptyString,
@@ -68,6 +95,9 @@ const DISABLED_STATUS: MatrixBridgeStatus = {
   encryptionReady: false,
   reason: null,
 };
+
+const PERMANENT_SEND_FAILURE_REASON =
+  "Matrix delivery is unavailable. Check the bridge credentials, room, and bot permissions.";
 
 const LOOPBACK_HTTP_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
@@ -170,6 +200,32 @@ export class MatrixBridgeConfig extends Context.Service<
       MatrixBridgeOperationError,
       ProjectionSnapshotQuery.ProjectionSnapshotQuery
     >;
+    readonly clearOwnerIfMatches: (expected: {
+      readonly ownerThreadId: ThreadId;
+      readonly ownershipEpoch: MatrixBridgeConfigV1["ownershipEpoch"];
+    }) => Effect.Effect<MatrixBridgeStatus, MatrixBridgeOperationError>;
+    readonly initializeDeliveryCheckpointIfMissing: (expected: {
+      readonly ownerThreadId: ThreadId;
+      readonly ownershipEpoch: MatrixBridgeConfigV1["ownershipEpoch"];
+      readonly cryptoStoreGeneration: MatrixBridgeConfigV1["cryptoStoreGeneration"];
+      readonly roomId: string;
+      readonly baselineTurnId: TurnId | null;
+      readonly baselineSequence: MatrixBridgeConfigV1["deliveryBaselineSequence"];
+    }) => Effect.Effect<boolean, MatrixBridgeOperationError>;
+    readonly markDeliveredIfMatches: (expected: {
+      readonly ownerThreadId: ThreadId;
+      readonly ownershipEpoch: MatrixBridgeConfigV1["ownershipEpoch"];
+      readonly cryptoStoreGeneration: MatrixBridgeConfigV1["cryptoStoreGeneration"];
+      readonly roomId: string;
+      readonly turnId: TurnId;
+      readonly turnSequence: MatrixBridgeConfigV1["deliveryBaselineSequence"];
+    }) => Effect.Effect<boolean, MatrixBridgeOperationError>;
+    readonly reportPermanentSendFailureIfMatches: (expected: {
+      readonly ownerThreadId: ThreadId;
+      readonly ownershipEpoch: MatrixBridgeConfigV1["ownershipEpoch"];
+      readonly cryptoStoreGeneration: MatrixBridgeConfigV1["cryptoStoreGeneration"];
+      readonly roomId: string;
+    }) => Effect.Effect<boolean>;
   }
 >()("t3/matrix/MatrixBridgeConfig") {}
 
@@ -238,6 +294,9 @@ export const make = Effect.gen(function* () {
               ownerThreadId: null,
               ownershipEpoch: NonNegativeInt.make(0),
               cryptoStoreGeneration: generation,
+              lastDeliveredTurnId: null,
+              deliveryBaselineSequence: NonNegativeInt.make(0),
+              deliveryCheckpointInitialized: true,
             }
           : current;
         const nextStatus = configStatus(next);
@@ -279,10 +338,12 @@ export const make = Effect.gen(function* () {
           );
         }
 
+        let baselineTurnId: TurnId | null = null;
+        let baselineSequence = NonNegativeInt.make(0);
         if (ownerThreadId !== null) {
           const projection = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
-          const thread = yield* projection
-            .getThreadShellByIdIncludingArchived(ownerThreadId)
+          const snapshot = yield* projection
+            .getThreadShellSnapshotByIdIncludingArchived(ownerThreadId)
             .pipe(
               Effect.mapError(() =>
                 operationError(
@@ -291,24 +352,29 @@ export const make = Effect.gen(function* () {
                 ),
               ),
             );
-          if (Option.isNone(thread)) {
+          if (Option.isNone(snapshot.thread)) {
             return yield* operationError(
               "threadNotFound",
               "The selected owner thread was not found.",
             );
           }
-          if (thread.value.archivedAt !== null) {
+          if (snapshot.thread.value.archivedAt !== null) {
             return yield* operationError(
               "threadArchived",
               "An archived thread cannot own the Matrix bridge.",
             );
           }
+          baselineTurnId = snapshot.thread.value.latestTurn?.turnId ?? null;
+          baselineSequence = NonNegativeInt.make(snapshot.snapshotSequence);
         }
 
         const next: MatrixBridgeConfigV1 = {
           ...current,
           ownerThreadId,
           ownershipEpoch: NonNegativeInt.make(current.ownershipEpoch + 1),
+          lastDeliveredTurnId: baselineTurnId,
+          deliveryBaselineSequence: baselineSequence,
+          deliveryCheckpointInitialized: true,
         };
         const currentStatus = yield* SubscriptionRef.get(statusRef);
         const nextStatus: MatrixBridgeStatus = { ...currentStatus, ownerThreadId };
@@ -324,6 +390,163 @@ export const make = Effect.gen(function* () {
     ),
   );
 
+  const clearOwnerIfMatches = Effect.fn("MatrixBridgeConfig.clearOwnerIfMatches")(
+    (expected: {
+      readonly ownerThreadId: ThreadId;
+      readonly ownershipEpoch: MatrixBridgeConfigV1["ownershipEpoch"];
+    }) =>
+      mutationSemaphore.withPermits(1)(
+        Effect.gen(function* () {
+          const current = Option.getOrNull(yield* Ref.get(configRef));
+          if (
+            current === null ||
+            current.ownerThreadId !== expected.ownerThreadId ||
+            current.ownershipEpoch !== expected.ownershipEpoch
+          ) {
+            return yield* SubscriptionRef.get(statusRef);
+          }
+
+          const next: MatrixBridgeConfigV1 = {
+            ...current,
+            ownerThreadId: null,
+            ownershipEpoch: NonNegativeInt.make(current.ownershipEpoch + 1),
+            lastDeliveredTurnId: null,
+            deliveryBaselineSequence: NonNegativeInt.make(0),
+            deliveryCheckpointInitialized: true,
+          };
+          const currentStatus = yield* SubscriptionRef.get(statusRef);
+          const nextStatus: MatrixBridgeStatus = { ...currentStatus, ownerThreadId: null };
+          return yield* Effect.uninterruptible(
+            Effect.gen(function* () {
+              yield* persist(next);
+              yield* Ref.set(configRef, Option.some(next));
+              yield* SubscriptionRef.set(statusRef, nextStatus);
+              return nextStatus;
+            }),
+          );
+        }),
+      ),
+  );
+
+  const initializeDeliveryCheckpointIfMissing = Effect.fn(
+    "MatrixBridgeConfig.initializeDeliveryCheckpointIfMissing",
+  )(
+    (expected: {
+      readonly ownerThreadId: ThreadId;
+      readonly ownershipEpoch: MatrixBridgeConfigV1["ownershipEpoch"];
+      readonly cryptoStoreGeneration: MatrixBridgeConfigV1["cryptoStoreGeneration"];
+      readonly roomId: string;
+      readonly baselineTurnId: TurnId | null;
+      readonly baselineSequence: MatrixBridgeConfigV1["deliveryBaselineSequence"];
+    }) =>
+      mutationSemaphore.withPermits(1)(
+        Effect.gen(function* () {
+          const current = Option.getOrNull(yield* Ref.get(configRef));
+          if (
+            current === null ||
+            current.ownerThreadId !== expected.ownerThreadId ||
+            current.ownershipEpoch !== expected.ownershipEpoch ||
+            current.cryptoStoreGeneration !== expected.cryptoStoreGeneration ||
+            current.roomId !== expected.roomId ||
+            current.pairing.state !== "paired"
+          ) {
+            return false;
+          }
+          if (current.deliveryCheckpointInitialized) return true;
+
+          const next: MatrixBridgeConfigV1 = {
+            ...current,
+            lastDeliveredTurnId: expected.baselineTurnId,
+            deliveryBaselineSequence: expected.baselineSequence,
+            deliveryCheckpointInitialized: true,
+          };
+          return yield* Effect.uninterruptible(
+            Effect.gen(function* () {
+              yield* persist(next);
+              yield* Ref.set(configRef, Option.some(next));
+              return true;
+            }),
+          );
+        }),
+      ),
+  );
+
+  const markDeliveredIfMatches = Effect.fn("MatrixBridgeConfig.markDeliveredIfMatches")(
+    (expected: {
+      readonly ownerThreadId: ThreadId;
+      readonly ownershipEpoch: MatrixBridgeConfigV1["ownershipEpoch"];
+      readonly cryptoStoreGeneration: MatrixBridgeConfigV1["cryptoStoreGeneration"];
+      readonly roomId: string;
+      readonly turnId: TurnId;
+      readonly turnSequence: MatrixBridgeConfigV1["deliveryBaselineSequence"];
+    }) =>
+      mutationSemaphore.withPermits(1)(
+        Effect.gen(function* () {
+          const current = Option.getOrNull(yield* Ref.get(configRef));
+          if (
+            current === null ||
+            current.ownerThreadId !== expected.ownerThreadId ||
+            current.ownershipEpoch !== expected.ownershipEpoch ||
+            current.cryptoStoreGeneration !== expected.cryptoStoreGeneration ||
+            current.roomId !== expected.roomId ||
+            current.pairing.state !== "paired"
+          ) {
+            return false;
+          }
+          if (current.lastDeliveredTurnId === expected.turnId) return true;
+
+          const next: MatrixBridgeConfigV1 = {
+            ...current,
+            lastDeliveredTurnId: expected.turnId,
+            deliveryBaselineSequence: expected.turnSequence,
+            deliveryCheckpointInitialized: true,
+          };
+          return yield* Effect.uninterruptible(
+            Effect.gen(function* () {
+              yield* persist(next);
+              yield* Ref.set(configRef, Option.some(next));
+              return true;
+            }),
+          );
+        }),
+      ),
+  );
+
+  const reportPermanentSendFailureIfMatches = Effect.fn(
+    "MatrixBridgeConfig.reportPermanentSendFailureIfMatches",
+  )(
+    (expected: {
+      readonly ownerThreadId: ThreadId;
+      readonly ownershipEpoch: MatrixBridgeConfigV1["ownershipEpoch"];
+      readonly cryptoStoreGeneration: MatrixBridgeConfigV1["cryptoStoreGeneration"];
+      readonly roomId: string;
+    }) =>
+      mutationSemaphore.withPermits(1)(
+        Effect.gen(function* () {
+          const current = Option.getOrNull(yield* Ref.get(configRef));
+          if (
+            current === null ||
+            current.ownerThreadId !== expected.ownerThreadId ||
+            current.ownershipEpoch !== expected.ownershipEpoch ||
+            current.cryptoStoreGeneration !== expected.cryptoStoreGeneration ||
+            current.roomId !== expected.roomId ||
+            current.pairing.state !== "paired"
+          ) {
+            return false;
+          }
+
+          const status = yield* SubscriptionRef.get(statusRef);
+          yield* SubscriptionRef.set(statusRef, {
+            ...status,
+            state: "degraded",
+            ownerThreadId: expected.ownerThreadId,
+            reason: PERMANENT_SEND_FAILURE_REASON,
+          });
+          return true;
+        }),
+      ),
+  );
+
   return MatrixBridgeConfig.of({
     currentConfig: Ref.get(configRef),
     status: SubscriptionRef.get(statusRef),
@@ -331,6 +554,10 @@ export const make = Effect.gen(function* () {
     configure,
     disconnect,
     setOwner,
+    clearOwnerIfMatches,
+    initializeDeliveryCheckpointIfMissing,
+    markDeliveredIfMatches,
+    reportPermanentSendFailureIfMatches,
   });
 });
 
