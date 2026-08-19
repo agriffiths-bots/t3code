@@ -92,6 +92,9 @@ function sleep(ms) {
  * writes outside its own temp root.
  */
 function writeOwnedFile(filePath, contents) {
+  // Validate before opening: the diagnostic paths are overridable, and O_TRUNC
+  // on a live database would destroy it before any later check could object.
+  assertSafePath(filePath);
   try {
     const stat = NodeFS.lstatSync(filePath);
     if (stat.isSymbolicLink()) throw new Error(`refusing to follow symlink ${filePath}`);
@@ -568,6 +571,51 @@ function spawnCaptured(command, args, options, kind, prove) {
   return { child, record, lines, closed };
 }
 
+/** Socket inodes listening on a loopback port, read straight from /proc. */
+function listeningInodes(port) {
+  const wanted = port.toString(16).toUpperCase().padStart(4, "0");
+  const inodes = new Set();
+  for (const table of ["/proc/net/tcp", "/proc/net/tcp6"]) {
+    let text;
+    try {
+      text = NodeFS.readFileSync(table, "utf8");
+    } catch {
+      continue;
+    }
+    for (const line of text.split("\n").slice(1)) {
+      const fields = line.trim().split(/\s+/);
+      // local_address, connection state, inode.
+      if (fields.length < 10 || fields[3] !== "0A") continue;
+      if (!fields[1].endsWith(`:${wanted}`)) continue;
+      inodes.add(fields[9]);
+    }
+  }
+  return inodes;
+}
+
+/**
+ * Does this process hold the listening socket on `port`? Answered from /proc,
+ * which the harness already depends on for process identity, rather than from
+ * an external tool that may be absent: an unanswerable question here has to
+ * fail, never pass.
+ */
+function ownsListeningSocket(pid, port) {
+  const inodes = listeningInodes(port);
+  if (inodes.size === 0) return false;
+  const held = new Set();
+  const fdDir = `/proc/${pid}/fd`;
+  for (const entry of NodeFS.readdirSync(fdDir)) {
+    try {
+      const link = NodeFS.readlinkSync(NodePath.join(fdDir, entry));
+      const match = link.match(/^socket:\[(\d+)\]$/);
+      if (match) held.add(match[1]);
+    } catch {
+      // The descriptor closed underneath us; it cannot be the listener.
+    }
+  }
+  return [...inodes].some((inode) => held.has(inode));
+}
+
 async function startConduwuit(binary, configPath, port, dataDir) {
   const spawned = spawnCaptured(
     binary,
@@ -576,7 +624,43 @@ async function startConduwuit(binary, configPath, port, dataDir) {
     "conduwuit",
     (pid) => cwdIs(pid, dataDir) && envHas(pid, `MATRIX_E2E_RUN=${RUN_ID}`),
   );
-  await waitHttpOk(`http://127.0.0.1:${port}/_matrix/client/versions`);
+  let exited = null;
+  spawned.child.on("exit", (code, signal) => {
+    exited = { code, signal };
+  });
+  const raced = async () => {
+    await Promise.race([spawned.closed, sleep(2_000)]);
+    const error = new Error(`conduwuit did not come up on ${port}`);
+    error.portInUse = spawned.lines.some((line) => line.includes("Address already in use"));
+    return error;
+  };
+  try {
+    await waitHttpOk(`http://127.0.0.1:${port}/_matrix/client/versions`);
+  } catch (error) {
+    if (exited) throw await raced();
+    await stopPid(spawned.record);
+    throw error;
+  }
+  if (exited) throw await raced();
+  // A probe against a shared loopback URL cannot tell our homeserver from
+  // another run's on the same port. Adopting theirs would register this run's
+  // fixed account names against their server and corrupt both.
+  let owned = false;
+  try {
+    owned = ownsListeningSocket(spawned.child.pid, port);
+  } catch (error) {
+    await stopPid(spawned.record);
+    throw new Error(`cannot establish who is listening on ${port}`, { cause: error });
+  }
+  if (!owned) {
+    // Stop this attempt before returning: the caller rewrites the same config
+    // and reuses the same database directory, which a lingering child could
+    // still be reading or locking.
+    await stopPid(spawned.record);
+    const error = new Error(`port ${port} is not served by this run's conduwuit`);
+    error.portInUse = true;
+    throw error;
+  }
   return spawned;
 }
 
@@ -1093,8 +1177,6 @@ async function bringUp(mode) {
   for (const dir of [t3Home, workspace, dbPath]) {
     NodeFS.mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
-  const matrixPort = await randomFreePort(MATRIX_PORT_MIN, MATRIX_PORT_MAX);
-
   // T3 comes up first so the release gate can refuse a server without the
   // capability before paying for a homeserver download and a Matrix bring-up
   // it is about to throw away.
@@ -1125,19 +1207,30 @@ async function bringUp(mode) {
   for (const secret of [registrationToken, botPassword, ownerPassword]) rememberSecret(secret);
   NodeFS.writeFileSync(tokenPath, `${registrationToken}\n`, { mode: 0o600 });
   const configPath = NodePath.join(conduwuitDir, "conduwuit.toml");
-  NodeFS.writeFileSync(
-    configPath,
-    NodeFS.readFileSync(FIXTURE_PATH, "utf8")
-      .replaceAll('"__PORT__"', String(matrixPort))
-      .replaceAll("__DATABASE_PATH__", dbPath)
-      .replaceAll("__REGISTRATION_TOKEN_FILE__", tokenPath)
-      .replaceAll("__WELL_KNOWN_SERVER__", `127.0.0.1:${matrixPort}`)
-      .replaceAll("__WELL_KNOWN_CLIENT__", `http://127.0.0.1:${matrixPort}`),
-  );
-  const homeserver = `http://127.0.0.1:${matrixPort}`;
+  const fixture = NodeFS.readFileSync(FIXTURE_PATH, "utf8");
 
-  heartbeat("2", `conduwuit :${matrixPort}`);
-  const conduwuit = await startConduwuit(conduwuitBin, configPath, matrixPort, conduwuitDir);
+  heartbeat("2", "conduwuit");
+  let conduwuit = null;
+  let matrixPort = 0;
+  for (let attempt = 1; conduwuit === null; attempt += 1) {
+    matrixPort = await randomFreePort(MATRIX_PORT_MIN, MATRIX_PORT_MAX);
+    NodeFS.writeFileSync(
+      configPath,
+      fixture
+        .replaceAll('"__PORT__"', String(matrixPort))
+        .replaceAll("__DATABASE_PATH__", dbPath)
+        .replaceAll("__REGISTRATION_TOKEN_FILE__", tokenPath)
+        .replaceAll("__WELL_KNOWN_SERVER__", `127.0.0.1:${matrixPort}`)
+        .replaceAll("__WELL_KNOWN_CLIENT__", `http://127.0.0.1:${matrixPort}`),
+    );
+    try {
+      conduwuit = await startConduwuit(conduwuitBin, configPath, matrixPort, conduwuitDir);
+    } catch (error) {
+      if (!error.portInUse || attempt >= 5) throw error;
+      log(`homeserver port ${matrixPort} was taken while starting; retrying on another`);
+    }
+  }
+  const homeserver = `http://127.0.0.1:${matrixPort}`;
 
   heartbeat("3", "register bot and owner accounts");
   const botCli = new MatrixCli("bot");
@@ -1975,6 +2068,11 @@ function teardown() {
 function report(error) {
   console.error(redact(error instanceof Error ? (error.stack ?? error.message) : String(error)));
 }
+
+// Piping this harness into `head` closes stdout early. Left alone the next
+// write raises EPIPE, which killed teardown half way through its sweep and
+// orphaned a homeserver; diagnostics are never worth a leaked process.
+for (const stream of [process.stdout, process.stderr]) stream.on("error", () => {});
 
 for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
   process.on(signal, () => {
