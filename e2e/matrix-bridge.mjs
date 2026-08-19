@@ -788,6 +788,40 @@ async function waitThread(t3, threadId, predicate, timeoutMs, label) {
   );
 }
 
+const TERMINAL_TURN_STATES = ["completed", "error", "interrupted"];
+
+/**
+ * A thread's turn position, taken before dispatching work.
+ *
+ * Every completion wait in this file has to be bound to one of these. T3 keeps
+ * the previous turn as `latestTurn` until the new turn is identified, and it
+ * projects the inbound user message before that happens, so a predicate that
+ * only names a state matches the OLD turn and hands back a final that was
+ * already delivered. The whole gate rests on negatives, and a stale final
+ * makes those negatives vacuous.
+ */
+function turnMarker(thread) {
+  return { turnId: thread.latestTurn?.turnId ?? null, turns: thread.turns.length };
+}
+
+function isNewTurn(thread, marker) {
+  return (
+    thread.latestTurn?.turnId != null &&
+    thread.latestTurn.turnId !== marker.turnId &&
+    thread.turns.length === marker.turns + 1
+  );
+}
+
+function waitNewTurnSettled(t3, threadId, marker, label, states = TERMINAL_TURN_STATES) {
+  return waitThread(
+    t3,
+    threadId,
+    (thread) => isNewTurn(thread, marker) && states.includes(thread.latestTurn.state),
+    TURN_MS,
+    label,
+  );
+}
+
 async function waitStatus(getStatus, predicate, timeoutMs, label) {
   const started = Date.now();
   let last = getStatus();
@@ -816,10 +850,15 @@ function lastAssistant(thread, turnId) {
   );
 }
 
-function userMessages(thread, turnId) {
-  return thread.messages.filter(
-    (message) => message.role === "user" && (turnId == null || message.turnId === turnId),
-  );
+/**
+ * T3 emits the inbound user message with `turnId: null` and never rebinds it
+ * to the turn it starts (`decider.ts`, the `thread.turn.start` branch), so
+ * user messages are matched by text and turns are identified separately by
+ * id. Scoping a user-message lookup by turn id here would silently match
+ * nothing.
+ */
+function userMessages(thread) {
+  return thread.messages.filter((message) => message.role === "user");
 }
 
 /**
@@ -1160,24 +1199,35 @@ async function runReleaseGate(ctx) {
    */
   const bridgeWitness = async (controlThreadId, marker, restoreOwnerThreadId) => {
     await setOwner(controlThreadId, `${marker} witness owner`);
+    const before = turnMarker((await threadSnapshot(t3, controlThreadId)).thread);
     const text = `${marker}_WITNESS_${NodeCrypto.randomBytes(4).toString("hex")}`;
     await activeCli.request({ op: "send", roomId, body: text });
-    await waitThread(
+    // The user message is projected before the turn it starts exists, and a
+    // pending turn carries a null id, so "the message is here" and "a turn is
+    // completed" can both be true while `latestTurn` is still the PREVIOUS
+    // turn holding its old final. Waiting on that would hand the caller a
+    // stale reply and prove nothing about the bridge draining. The witness
+    // must name a new, identified turn that arrived with this message.
+    const dispatched = await waitThread(
       t3,
       controlThreadId,
-      (thread) => userMessages(thread).some((message) => message.text === text),
+      (thread) =>
+        isNewTurn(thread, before) && userMessages(thread).some((message) => message.text === text),
       INBOUND_MS,
-      `${marker} witness message reached T3`,
+      `${marker} witness message started a new turn`,
     );
+    const witnessTurnId = dispatched.latestTurn.turnId;
     const settled = await waitThread(
       t3,
       controlThreadId,
       (thread) =>
-        thread.latestTurn?.state === "completed" && lastAssistant(thread, thread.latestTurn.turnId),
+        thread.latestTurn?.turnId === witnessTurnId &&
+        thread.latestTurn.state === "completed" &&
+        lastAssistant(thread, witnessTurnId),
       TURN_MS,
-      `${marker} witness turn`,
+      `${marker} witness turn completed`,
     );
-    const final = lastAssistant(settled, settled.latestTurn.turnId).text.trim();
+    const final = lastAssistant(settled, witnessTurnId).text.trim();
     await activeCli.request(
       { op: "waitText", roomId, from: botMxid, body: final, timeoutMs: LOCAL_SEND_MS },
       LOCAL_SEND_MS + 1_000,
@@ -1306,6 +1356,7 @@ async function runReleaseGate(ctx) {
   const botCount = async () =>
     (await ownerCli.request({ op: "messages", roomId, from: botMxid })).texts.length;
   const botBefore = await botCount();
+  const streamMarker = turnMarker((await threadSnapshot(t3, threadA)).thread);
   await startTurn(
     t3,
     threadA,
@@ -1314,7 +1365,9 @@ async function runReleaseGate(ctx) {
   );
   const streamDeadline = Date.now() + TURN_MS;
   const terminalWithFinal = (thread) =>
-    thread.latestTurn?.state === "completed" && lastAssistant(thread, thread.latestTurn.turnId);
+    isNewTurn(thread, streamMarker) &&
+    thread.latestTurn.state === "completed" &&
+    lastAssistant(thread, thread.latestTurn.turnId);
   let terminalA = null;
   while (Date.now() < streamDeadline) {
     const { thread } = await threadSnapshot(t3, threadA);
@@ -1348,41 +1401,53 @@ async function runReleaseGate(ctx) {
   assert(outboundA.event.encrypted === true, "the assistant final was not encrypted on the wire");
   assert((await botCount()) === botBefore + 1, "expected exactly one bot message for the turn");
 
-  heartbeat("9", "inbound message on an idle thread, and no self-echo turn");
-  // The bot's own final is a room event it must ignore. The inbound message
-  // below is the witness for that: Matrix orders the room, so once this later
-  // message has observably become a turn, the bot has already consumed its own
-  // event, and the turn count proves it created nothing. Counting the harness
-  // client's /sync cycles instead would prove only that the harness polled.
+  heartbeat("9", "the bot's own event starts no turn");
+  // The bot's final is a room event it must ignore, and the witness for that
+  // must not touch thread A. Sending the next owner message here would let a
+  // wrongly created echo turn absorb it as a steer, leaving exactly the turn
+  // count a correct bridge produces. Bridging thread B instead makes the bot
+  // dispatch somewhere else, which by room ordering proves it already consumed
+  // its own event, and thread A has to be untouched at that point.
+  const echoMarker = turnMarker(terminalA);
+  await bridgeWitness(threadB, "ECHO", threadA);
+  const afterEcho = (await threadSnapshot(t3, threadA)).thread;
+  assert(
+    afterEcho.turns.length === echoMarker.turns &&
+      afterEcho.latestTurn?.turnId === echoMarker.turnId,
+    "the bot's own Matrix event created a turn on the owner thread",
+  );
+
+  heartbeat("10", "inbound message on an idle thread");
   const inboundIdle = `INBOUND_IDLE_${NodeCrypto.randomBytes(4).toString("hex")}`;
-  const idleTurns = terminalA.turns.length;
+  const idleMarker = turnMarker(afterEcho);
   await ownerCli.request({ op: "send", roomId, body: inboundIdle });
-  await waitThread(
+  const idleDispatched = await waitThread(
     t3,
     threadA,
     (thread) =>
-      userMessages(thread).some((m) => m.text === inboundIdle) &&
-      thread.turns.length === idleTurns + 1 &&
-      userMessages(thread, thread.latestTurn?.turnId).some((m) => m.text === inboundIdle),
+      isNewTurn(thread, idleMarker) && userMessages(thread).some((m) => m.text === inboundIdle),
     INBOUND_MS,
-    "inbound idle dispatch, and the bot's own event created no turn",
+    "inbound idle dispatch",
   );
+  const idleTurnId = idleDispatched.latestTurn.turnId;
   const idleTerminal = await waitThread(
     t3,
     threadA,
     (thread) =>
-      thread.latestTurn?.state === "completed" && lastAssistant(thread, thread.latestTurn.turnId),
+      thread.latestTurn?.turnId === idleTurnId &&
+      thread.latestTurn.state === "completed" &&
+      lastAssistant(thread, idleTurnId),
     TURN_MS,
     "inbound idle final",
   );
-  const idleFinal = lastAssistant(idleTerminal, idleTerminal.latestTurn.turnId).text.trim();
+  const idleFinal = lastAssistant(idleTerminal, idleTurnId).text.trim();
   await ownerCli.request(
     { op: "waitText", roomId, from: botMxid, body: idleFinal, timeoutMs: LOCAL_SEND_MS },
     LOCAL_SEND_MS + 1_000,
   );
 
-  heartbeat("10", "inbound message steers a running turn");
-  const steerTurns = idleTerminal.turns.length;
+  heartbeat("11", "inbound message steers a running turn");
+  const steerMarker = turnMarker(idleTerminal);
   await ownerCli.request({
     op: "send",
     roomId,
@@ -1391,22 +1456,26 @@ async function runReleaseGate(ctx) {
   const running = await waitThread(
     t3,
     threadA,
-    (thread) => thread.latestTurn?.state === "running" && thread.turns.length === steerTurns + 1,
+    (thread) => isNewTurn(thread, steerMarker) && thread.latestTurn.state === "running",
     INBOUND_MS,
     "slow inbound turn running",
   );
   const runningTurnId = running.latestTurn.turnId;
+  const userMessagesBeforeSteer = userMessages(running).length;
   await ownerCli.request({
     op: "send",
     roomId,
     body: "Stop waiting. Reply with the exact word STEERED_FINAL and nothing else.",
   });
+  // Both messages land on the thread while the turn count stays put: that is
+  // what makes this a steer rather than a second turn.
   const steered = await waitThread(
     t3,
     threadA,
     (thread) =>
-      thread.turns.length === steerTurns + 1 &&
-      userMessages(thread, runningTurnId).length >= 2 &&
+      thread.turns.length === steerMarker.turns + 1 &&
+      userMessages(thread).length === userMessagesBeforeSteer + 1 &&
+      thread.latestTurn?.turnId === runningTurnId &&
       thread.latestTurn?.state === "completed",
     TURN_MS,
     "steered turn complete",
@@ -1422,33 +1491,46 @@ async function runReleaseGate(ctx) {
     LOCAL_SEND_MS + 1_000,
   );
 
-  heartbeat("11", "owner move drops the old final");
+  heartbeat("12", "owner move drops the old final");
+  const moveMarker = turnMarker(steered);
   await startTurn(
     t3,
     threadA,
     "Run the command `sleep 15` then reply with the exact word OWNER_A_FINAL and nothing else.",
     modelSelection,
   );
-  await waitThread(
+  const moveRunning = await waitThread(
     t3,
     threadA,
-    (thread) => thread.latestTurn?.state === "running",
+    (thread) => isNewTurn(thread, moveMarker) && thread.latestTurn.state === "running",
     20_000,
     "owner-move turn running",
   );
+  const movedTurnId = moveRunning.latestTurn.turnId;
   await rpc.call("matrixBridge.setOwner", { ownerThreadId: threadB });
+  // Completed with a real final, not merely settled: an errored or interrupted
+  // turn produces nothing to suppress, which would make the drop assertion
+  // below true for the wrong reason.
   const finishedA = await waitThread(
     t3,
     threadA,
-    (thread) => thread.latestTurn?.state === "completed",
+    (thread) =>
+      thread.latestTurn?.turnId === movedTurnId &&
+      thread.latestTurn.state === "completed" &&
+      lastAssistant(thread, movedTurnId),
     TURN_MS,
     "owner-move thread A finished",
   );
-  const droppedText = lastAssistant(finishedA, finishedA.latestTurn.turnId)?.text.trim() ?? "";
+  const droppedText = lastAssistant(finishedA, movedTurnId).text.trim();
+  assert(
+    droppedText.length > 0,
+    "the moved-away turn produced no final, so the drop was never exercised",
+  );
   // The new owner's turn is the witness for the dropped one. Its final is
   // queued after thread A's, so once it has arrived the outbound worker has
   // drained past the abandoned job; a fixed sleep would instead declare the
   // drop while a delayed or retrying send was still in flight.
+  const ownerBMarker = turnMarker((await threadSnapshot(t3, threadB)).thread);
   await startTurn(
     t3,
     threadB,
@@ -1459,7 +1541,9 @@ async function runReleaseGate(ctx) {
     t3,
     threadB,
     (thread) =>
-      thread.latestTurn?.state === "completed" && lastAssistant(thread, thread.latestTurn.turnId),
+      isNewTurn(thread, ownerBMarker) &&
+      thread.latestTurn.state === "completed" &&
+      lastAssistant(thread, thread.latestTurn.turnId),
     TURN_MS,
     "new owner final",
   );
@@ -1470,12 +1554,13 @@ async function runReleaseGate(ctx) {
   );
   const afterDrop = await ownerCli.request({ op: "messages", roomId, from: botMxid });
   assert(
-    droppedText.length === 0 || !afterDrop.texts.some((item) => item.body === droppedText),
+    !afterDrop.texts.some((item) => item.body === droppedText),
     "the old owner's final was posted after the move",
   );
 
-  heartbeat("12", "homeserver outage and recovery");
+  heartbeat("13", "homeserver outage and recovery");
   await stopPid(ctx.conduwuit.record);
+  const queuedMarker = turnMarker(doneB);
   await startTurn(
     t3,
     threadB,
@@ -1486,7 +1571,9 @@ async function runReleaseGate(ctx) {
     t3,
     threadB,
     (thread) =>
-      thread.latestTurn?.state === "completed" && lastAssistant(thread, thread.latestTurn.turnId),
+      isNewTurn(thread, queuedMarker) &&
+      thread.latestTurn.state === "completed" &&
+      lastAssistant(thread, thread.latestTurn.turnId),
     TURN_MS,
     "queued turn terminal",
   );
@@ -1573,7 +1660,7 @@ async function runReleaseGate(ctx) {
    */
   const assertOutboundSilent = async (silentThreadId, marker, label, prompt, { requireFinal }) => {
     const before = (await threadSnapshot(t3, silentThreadId)).thread;
-    const beforeTurnId = before.latestTurn?.turnId ?? null;
+    const probeMarker = turnMarker(before);
     const botBefore = (await activeCli.request({ op: "messages", roomId, from: botMxid })).texts
       .length;
     const dispatched = await startTurn(t3, silentThreadId, prompt, modelSelection).then(
@@ -1585,17 +1672,10 @@ async function runReleaseGate(ctx) {
     );
     let final = "";
     if (dispatched) {
-      // The predicate must name a *new* turn: the thread's previous turn is
-      // already terminal, so a state-only check matches instantly and would
-      // hand the witness a stale reply while the real probe still runs.
-      const settled = await waitThread(
+      const settled = await waitNewTurnSettled(
         t3,
         silentThreadId,
-        (thread) =>
-          thread.turns.length === before.turns.length + 1 &&
-          thread.latestTurn?.turnId !== beforeTurnId &&
-          ["completed", "error", "interrupted"].includes(thread.latestTurn?.state),
-        TURN_MS,
+        probeMarker,
         `${label} probe turn terminal`,
       );
       final = lastAssistant(settled, settled.latestTurn.turnId)?.text.trim() ?? "";
@@ -1620,7 +1700,7 @@ async function runReleaseGate(ctx) {
     );
   };
 
-  heartbeat("13", "unbridge is silent in both directions");
+  heartbeat("14", "unbridge is silent in both directions");
   await setOwner(null, "owner cleared");
   await assertInboundSilent(threadB, "UNBRIDGED", "unbridged");
   await assertOutboundSilent(
@@ -1656,7 +1736,7 @@ async function runReleaseGate(ctx) {
     { requireFinal: false },
   );
 
-  heartbeat("14", "close clients");
+  heartbeat("15", "close clients");
   statusSub.interrupt();
   // A subscription that never acknowledges the interrupt must not hold the run
   // open; the socket close below ends it either way.
