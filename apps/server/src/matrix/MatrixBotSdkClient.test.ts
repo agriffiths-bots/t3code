@@ -51,6 +51,10 @@ interface FakeSdkOptions {
   readonly joinedRooms?: ReadonlyArray<string>;
   readonly syncToken?: string | null;
   readonly storedFilter?: MatrixSdkFilterInfo | null;
+  readonly roomMembership?: Record<string, string>;
+  readonly roomCreator?: string;
+  readonly roomCreateContent?: Record<string, unknown>;
+  readonly deviceId?: string | null;
   /** Content of the catch-up batch each `start()` delivers, as a server would. */
   readonly catchUp?: {
     readonly roomKeys?: ReadonlyArray<string>;
@@ -96,6 +100,7 @@ interface FakeSdk {
   }>;
   readonly syncStorePaths: Array<string>;
   readonly cryptoStores: Array<{ readonly storagePath: string; readonly storeType: number }>;
+  readonly invitations: Array<{ readonly userId: string; readonly roomId: string }>;
   /** Mirrors one processed sync batch: cursor first, then crypto, then events. */
   readonly deliverSyncBatch: (batch: {
     readonly cursor: string;
@@ -121,6 +126,11 @@ const makeFakeSdk = (options: FakeSdkOptions = {}): FakeSdk => {
   const cryptoStores: Array<{ readonly storagePath: string; readonly storeType: number }> = [];
   const handlers = new Map<string, Set<MatrixSdkEventHandler>>();
   const knownRoomKeys = new Set<string>();
+  const invitations: Array<{ readonly userId: string; readonly roomId: string }> = [];
+  const roomMembership = new Map<string, string>([
+    [BOT_USER_ID, "join"],
+    ...Object.entries(options.roomMembership ?? {}),
+  ]);
   const started = Deferred.makeUnsafe<void>();
   let liveClient: { readonly storage: MatrixSdkStorageProvider } | null = null;
   const failSends = [...(options.failSendsWith ?? [])];
@@ -150,8 +160,8 @@ const makeFakeSdk = (options: FakeSdkOptions = {}): FakeSdk => {
   };
 
   class FakeStorageProvider implements MatrixSdkStorageProvider {
-    constructor(filename: string) {
-      syncStorePaths.push(filename);
+    constructor(filename: string, persistent = true) {
+      if (persistent) syncStorePaths.push(filename);
     }
     getSyncToken(): string | null {
       return syncToken;
@@ -201,31 +211,58 @@ const makeFakeSdk = (options: FakeSdkOptions = {}): FakeSdk => {
     constructor(
       homeserverUrl: string,
       accessToken: string,
-      storage: MatrixSdkStorageProvider,
-      cryptoStore: unknown,
+      storage?: MatrixSdkStorageProvider,
+      cryptoStore?: unknown,
     ) {
-      this.storage = storage;
+      // The identity probe owns no persistent state, exactly like the SDK's
+      // default in-memory storage.
+      this.storage = storage ?? new FakeStorageProvider("memory", false);
       this.cryptoStore = cryptoStore;
-      liveClient = { storage };
-      clientOptions.push({ homeserverUrl, accessToken });
-    }
-
-    getUserId(): Promise<string> {
-      return Promise.resolve(BOT_USER_ID);
+      if (storage !== undefined) {
+        liveClient = { storage };
+        clientOptions.push({ homeserverUrl, accessToken });
+      }
     }
 
     getJoinedRooms(): Promise<ReadonlyArray<string>> {
       return Promise.resolve(options.joinedRooms ?? [ROOM_ID]);
     }
 
-    getRoomStateEvent(_roomId: string, type: string, _stateKey: string): Promise<unknown> {
-      const state = roomState[type];
-      return state === undefined ? Promise.reject(httpError(404)) : Promise.resolve(state);
+    getRoomState(_roomId: string): Promise<ReadonlyArray<unknown>> {
+      const events: Array<unknown> = [
+        {
+          type: "m.room.create",
+          state_key: "",
+          sender: options.roomCreator ?? BOT_USER_ID,
+          // Version 11 is what current homeservers create, Beeper included.
+          content: options.roomCreateContent ?? { room_version: "11" },
+        },
+        ...Object.entries(roomState).map(([type, content]) => ({
+          type,
+          state_key: "",
+          sender: BOT_USER_ID,
+          content,
+        })),
+        ...[...roomMembership].map(([userId, membership]) => ({
+          type: "m.room.member",
+          state_key: userId,
+          sender: userId,
+          content: { membership },
+        })),
+      ];
+      return Promise.resolve(events);
     }
 
     createRoom(createOptions: MatrixCreateRoomOptions): Promise<string> {
       createdRooms.push(createOptions);
+      for (const userId of createOptions.invite) roomMembership.set(userId, "invite");
       return Promise.resolve(ROOM_ID);
+    }
+
+    inviteUser(userId: string, roomId: string): Promise<unknown> {
+      invitations.push({ userId, roomId });
+      roomMembership.set(userId, "invite");
+      return Promise.resolve({});
     }
 
     doRequest(method: string, endpoint: string, qs?: unknown, body?: unknown): Promise<unknown> {
@@ -235,6 +272,12 @@ const makeFakeSdk = (options: FakeSdkOptions = {}): FakeSdk => {
       }
       if (endpoint.endsWith("/filter")) {
         return Promise.resolve({ filter_id: "server-filter-id" });
+      }
+      if (endpoint === "/_matrix/client/v3/account/whoami") {
+        return Promise.resolve({
+          user_id: BOT_USER_ID,
+          ...(options.deviceId === null ? {} : { device_id: options.deviceId ?? "T3DEVICE" }),
+        });
       }
       const failure = failSends.shift();
       if (failure !== undefined) return Promise.reject(failure);
@@ -297,6 +340,7 @@ const makeFakeSdk = (options: FakeSdkOptions = {}): FakeSdk => {
     clientOptions,
     syncStorePaths,
     cryptoStores,
+    invitations,
     deliverSyncBatch,
     started,
   };
@@ -392,15 +436,12 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
     }).pipe(Effect.provide(testLayer)),
   );
 
-  it.effect("keeps sync and crypto stores paired with the connection across restarts", () =>
+  it.effect("keeps one store per Matrix device across restarts and allowlist edits", () =>
     Effect.gen(function* () {
       const configService = yield* configureBridge();
-      const generation = Option.getOrThrow(
-        yield* configService.currentConfig,
-      ).cryptoStoreGeneration;
       const serverConfig = yield* ServerConfig.ServerConfig;
       const path = yield* Path.Path;
-      const expectedDir = path.join(serverConfig.secretsDir, "matrix-bridge", generation);
+      const bridgeDir = path.join(serverConfig.secretsDir, "matrix-bridge");
 
       const first = makeFakeSdk();
       yield* Effect.scoped(
@@ -410,21 +451,84 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
         }),
       );
 
-      const second = makeFakeSdk({ syncToken: "fence-cursor" });
-      yield* startAdapter(second);
-      yield* Deferred.await(second.started);
+      // An allowlist edit keeps the same access token, so it must keep the same
+      // encryption store: a Matrix device can only upload keys from one store.
+      yield* configService.configure({
+        homeserverUrl: HOMESERVER_URL,
+        accessToken: "matrix-secret-token",
+        allowedUserIds: [ALLOWED_USER_ID, "@second:beeper.com"],
+      });
+      const second = makeFakeSdk({ syncToken: "stored-cursor" });
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          yield* startAdapter(second);
+          yield* Deferred.await(second.started);
+        }),
+      );
 
-      const expectedSyncStore = path.join(expectedDir, "sync.json");
-      const expectedCryptoStore = path.join(expectedDir, "crypto");
-      assert.deepEqual([...first.syncStorePaths], [expectedSyncStore]);
-      assert.deepEqual([...second.syncStorePaths], [expectedSyncStore]);
+      const storeDir = path.dirname(first.syncStorePaths[0] ?? "");
+      assert.equal(path.dirname(storeDir), bridgeDir);
+      assert.deepEqual([...second.syncStorePaths], [...first.syncStorePaths]);
+      assert.deepEqual([...second.cryptoStores], [...first.cryptoStores]);
       assert.deepEqual(
         [...first.cryptoStores],
-        [{ storagePath: expectedCryptoStore, storeType: 0 }],
+        [{ storagePath: path.join(storeDir, "crypto"), storeType: 0 }],
       );
-      assert.deepEqual([...second.cryptoStores], [...first.cryptoStores]);
-      const storeStat = yield* (yield* FileSystem.FileSystem).stat(expectedDir);
+      const storeStat = yield* (yield* FileSystem.FileSystem).stat(storeDir);
       assert.equal(storeStat.mode & 0o777, 0o700);
+
+      // A refreshed token that still names the same device keeps the store,
+      // because the device is what may upload keys from exactly one store.
+      yield* configService.configure({
+        homeserverUrl: HOMESERVER_URL,
+        accessToken: "refreshed-token",
+        allowedUserIds: [ALLOWED_USER_ID],
+      });
+      const refreshed = makeFakeSdk({ syncToken: "stored-cursor" });
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          yield* startAdapter(refreshed);
+          yield* Deferred.await(refreshed.started);
+        }),
+      );
+      assert.deepEqual([...refreshed.syncStorePaths], [...first.syncStorePaths]);
+
+      // A different device does get its own store.
+      const rotated = makeFakeSdk({ deviceId: "T3DEVICE-2" });
+      yield* startAdapter(rotated);
+      yield* Deferred.await(rotated.started);
+      assert.notDeepEqual([...rotated.syncStorePaths], [...first.syncStorePaths]);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("moves a generation-named store to the device path on upgrade", () =>
+    Effect.gen(function* () {
+      const configService = yield* configureBridge();
+      const generation = Option.getOrThrow(
+        yield* configService.currentConfig,
+      ).cryptoStoreGeneration;
+      const serverConfig = yield* ServerConfig.ServerConfig;
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+
+      // The layout an earlier build of this branch left behind.
+      const bridgeDir = path.join(serverConfig.secretsDir, "matrix-bridge");
+      const legacyDir = path.join(bridgeDir, generation);
+      yield* fs.makeDirectory(legacyDir, { recursive: true });
+      yield* fs.writeFileString(path.join(legacyDir, "sync.json"), '{"syncToken":"legacy"}');
+
+      const sdk = makeFakeSdk();
+      yield* startAdapter(sdk);
+      yield* Deferred.await(sdk.started);
+
+      const storeDir = path.dirname(sdk.syncStorePaths[0] ?? "");
+      assert.notEqual(storeDir, legacyDir);
+      assert.isFalse(yield* fs.exists(legacyDir));
+      // The device keeps its one store, contents and all.
+      assert.equal(
+        yield* fs.readFileString(path.join(storeDir, "sync.json")),
+        '{"syncToken":"legacy"}',
+      );
     }).pipe(Effect.provide(testLayer)),
   );
 
@@ -495,6 +599,256 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
       const status = yield* configService.status;
       assert.include(status.reason ?? "", "invite other accounts");
       assert.lengthOf(sdk.startedFilters, 0);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("accepts a version 12 room the bot created without listing itself", () =>
+    Effect.gen(function* () {
+      // Version 12 forbids listing creators in the power levels, because they
+      // hold unbounded power in their own right.
+      const sdk = makeFakeSdk({
+        roomCreateContent: { room_version: "12" },
+        roomState: {
+          "m.room.join_rules": { join_rule: "invite" },
+          "m.room.encryption": { algorithm: MEGOLM_ALGORITHM },
+          "m.room.power_levels": { users_default: 0, invite: 100, state_default: 100 },
+        },
+      });
+      const configService = yield* configureBridge();
+      yield* configService.recordRoomIfMatches({
+        cryptoStoreGeneration: Option.getOrThrow(yield* configService.currentConfig)
+          .cryptoStoreGeneration,
+        roomId: ROOM_ID,
+      });
+      yield* startAdapter(sdk);
+      yield* awaitStatusState(configService, "waiting-for-member");
+
+      assert.isTrue((yield* configService.status).encryptionReady);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("refuses a version 12 room whose create event only claims the bot", () =>
+    Effect.gen(function* () {
+      // From version 11 the sender is the only authority, so a `creator` field
+      // naming the bot cannot launder someone else's room.
+      const sdk = makeFakeSdk({
+        roomCreator: "@someone-else:matrix.example.test",
+        roomCreateContent: { room_version: "12", creator: BOT_USER_ID },
+      });
+      const configService = yield* configureBridge();
+      yield* configService.recordRoomIfMatches({
+        cryptoStoreGeneration: Option.getOrThrow(yield* configService.currentConfig)
+          .cryptoStoreGeneration,
+        roomId: ROOM_ID,
+      });
+      yield* startAdapter(sdk);
+      yield* awaitStatusState(configService, "unavailable");
+
+      assert.include((yield* configService.status).reason ?? "", "created by another account");
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("refuses a room whose version it does not verify", () =>
+    Effect.gen(function* () {
+      // Version identifiers are opaque: a homeserver dialect, a version whose
+      // rules predate this check, and a future number are all refused.
+      const sdk = makeFakeSdk({ roomCreateContent: { room_version: "org.example.unstable" } });
+      const configService = yield* configureBridge();
+      yield* configService.recordRoomIfMatches({
+        cryptoStoreGeneration: Option.getOrThrow(yield* configService.currentConfig)
+          .cryptoStoreGeneration,
+        roomId: ROOM_ID,
+      });
+      yield* startAdapter(sdk);
+      yield* awaitStatusState(configService, "unavailable");
+
+      assert.include((yield* configService.status).reason ?? "", "does not verify");
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("refuses a room version newer than the rules it implements", () =>
+    Effect.gen(function* () {
+      // Version identifiers are opaque strings with no ordering, so a higher
+      // number is not a safe bet either.
+      const sdk = makeFakeSdk({ roomCreateContent: { room_version: "13" } });
+      const configService = yield* configureBridge();
+      yield* configService.recordRoomIfMatches({
+        cryptoStoreGeneration: Option.getOrThrow(yield* configService.currentConfig)
+          .cryptoStoreGeneration,
+        roomId: ROOM_ID,
+      });
+      yield* startAdapter(sdk);
+      yield* awaitStatusState(configService, "unavailable");
+
+      assert.include((yield* configService.status).reason ?? "", "does not verify");
+      assert.lengthOf(sdk.startedFilters, 0);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("refuses a room another account created", () =>
+    Effect.gen(function* () {
+      // Room version 12 gives creators unbounded power whatever the power
+      // levels say, so a room the bot did not create can never be trusted.
+      const sdk = makeFakeSdk({ roomCreator: "@someone-else:matrix.example.test" });
+      const configService = yield* configureBridge();
+      yield* configService.recordRoomIfMatches({
+        cryptoStoreGeneration: Option.getOrThrow(yield* configService.currentConfig)
+          .cryptoStoreGeneration,
+        roomId: ROOM_ID,
+      });
+      yield* startAdapter(sdk);
+      yield* awaitStatusState(configService, "unavailable");
+
+      assert.include((yield* configService.status).reason ?? "", "created by another account");
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("refuses a room with an additional creator", () =>
+    Effect.gen(function* () {
+      const sdk = makeFakeSdk({
+        roomCreateContent: { additional_creators: ["@someone-else:matrix.example.test"] },
+      });
+      const configService = yield* configureBridge();
+      yield* configService.recordRoomIfMatches({
+        cryptoStoreGeneration: Option.getOrThrow(yield* configService.currentConfig)
+          .cryptoStoreGeneration,
+        roomId: ROOM_ID,
+      });
+      yield* startAdapter(sdk);
+      yield* awaitStatusState(configService, "unavailable");
+
+      assert.include((yield* configService.status).reason ?? "", "created by another account");
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("reads power levels written as integer strings", () =>
+    Effect.gen(function* () {
+      // Older stable room versions allow these, and treating them as absent
+      // would silently fall back to the permissive Matrix defaults.
+      const sdk = makeFakeSdk({
+        roomState: {
+          "m.room.join_rules": { join_rule: "invite" },
+          "m.room.encryption": { algorithm: MEGOLM_ALGORITHM },
+          "m.room.power_levels": {
+            users_default: "0",
+            invite: "100",
+            state_default: "0",
+            users: { [BOT_USER_ID]: "100" },
+          },
+        },
+      });
+      const configService = yield* configureBridge();
+      yield* configService.recordRoomIfMatches({
+        cryptoStoreGeneration: Option.getOrThrow(yield* configService.currentConfig)
+          .cryptoStoreGeneration,
+        roomId: ROOM_ID,
+      });
+      yield* startAdapter(sdk);
+      yield* awaitStatusState(configService, "unavailable");
+
+      assert.include((yield* configService.status).reason ?? "", "change its access rules");
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("refuses a room joined by someone outside the allowed list", () =>
+    Effect.gen(function* () {
+      const sdk = makeFakeSdk({
+        roomMembership: { [ALLOWED_USER_ID]: "join", "@stranger:matrix.example.test": "join" },
+      });
+      const configService = yield* configureBridge();
+      yield* configService.recordRoomIfMatches({
+        cryptoStoreGeneration: Option.getOrThrow(yield* configService.currentConfig)
+          .cryptoStoreGeneration,
+        roomId: ROOM_ID,
+      });
+      yield* startAdapter(sdk);
+      yield* awaitStatusState(configService, "unavailable");
+
+      assert.include((yield* configService.status).reason ?? "", "outside the allowed list");
+      assert.lengthOf(sdk.startedFilters, 0);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("refuses a room with a pending invitation outside the allowed list", () =>
+    Effect.gen(function* () {
+      // An invitation left over from an earlier allowlist can still be
+      // accepted, so it is as unsafe as a joined stranger.
+      const sdk = makeFakeSdk({
+        roomMembership: { [ALLOWED_USER_ID]: "join", "@removed:matrix.example.test": "invite" },
+      });
+      const configService = yield* configureBridge();
+      yield* configService.recordRoomIfMatches({
+        cryptoStoreGeneration: Option.getOrThrow(yield* configService.currentConfig)
+          .cryptoStoreGeneration,
+        roomId: ROOM_ID,
+      });
+      yield* startAdapter(sdk);
+      yield* awaitStatusState(configService, "unavailable");
+
+      assert.include((yield* configService.status).reason ?? "", "pending invitation");
+      assert.lengthOf(sdk.startedFilters, 0);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("refuses a room whose members can change its access rules", () =>
+    Effect.gen(function* () {
+      const sdk = makeFakeSdk({
+        roomState: {
+          "m.room.join_rules": { join_rule: "invite" },
+          "m.room.encryption": { algorithm: MEGOLM_ALGORITHM },
+          // Only the bot can invite, but anyone may publish the room by
+          // rewriting its join rules.
+          "m.room.power_levels": {
+            users_default: 0,
+            invite: 100,
+            state_default: 0,
+            users: { [BOT_USER_ID]: 100 },
+          },
+        },
+      });
+      const configService = yield* configureBridge();
+      yield* configService.recordRoomIfMatches({
+        cryptoStoreGeneration: Option.getOrThrow(yield* configService.currentConfig)
+          .cryptoStoreGeneration,
+        roomId: ROOM_ID,
+      });
+      yield* startAdapter(sdk);
+      yield* awaitStatusState(configService, "unavailable");
+
+      assert.include((yield* configService.status).reason ?? "", "change its access rules");
+      assert.lengthOf(sdk.startedFilters, 0);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("re-invites an allowed user who left the bridged room", () =>
+    Effect.gen(function* () {
+      const sdk = makeFakeSdk({ roomMembership: { [ALLOWED_USER_ID]: "leave" } });
+      const configService = yield* configureBridge();
+      yield* configService.recordRoomIfMatches({
+        cryptoStoreGeneration: Option.getOrThrow(yield* configService.currentConfig)
+          .cryptoStoreGeneration,
+        roomId: ROOM_ID,
+      });
+      yield* startAdapter(sdk);
+      yield* awaitStatusState(configService, "waiting-for-member");
+
+      assert.deepEqual([...sdk.invitations], [{ userId: ALLOWED_USER_ID, roomId: ROOM_ID }]);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("leaves a joined allowed user alone", () =>
+    Effect.gen(function* () {
+      const sdk = makeFakeSdk({ roomMembership: { [ALLOWED_USER_ID]: "join" } });
+      const configService = yield* configureBridge();
+      yield* configService.recordRoomIfMatches({
+        cryptoStoreGeneration: Option.getOrThrow(yield* configService.currentConfig)
+          .cryptoStoreGeneration,
+        roomId: ROOM_ID,
+      });
+      yield* startAdapter(sdk);
+      yield* awaitStatusState(configService, "waiting-for-member");
+
+      assert.lengthOf(sdk.invitations, 0);
     }).pipe(Effect.provide(testLayer)),
   );
 

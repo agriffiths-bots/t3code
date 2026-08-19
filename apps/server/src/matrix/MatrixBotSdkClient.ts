@@ -1,3 +1,4 @@
+import * as Crypto from "effect/Crypto";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -22,6 +23,8 @@ export const MEGOLM_ALGORITHM = "m.megolm.v1.aes-sha2";
 export const MATRIX_STORE_DIRECTORY_NAME = "matrix-bridge";
 export const MATRIX_SYNC_STORE_FILE_NAME = "sync.json";
 export const MATRIX_CRYPTO_STORE_DIRECTORY_NAME = "crypto";
+/** 128 bits of the device digest: collision-free in practice, short on disk. */
+const MATRIX_STORE_KEY_BYTES = 16;
 /**
  * `RustSdkCryptoStoreType.Sqlite`. The crypto package declares it as a
  * TypeScript `const enum`, so the value is erased from the shipped JavaScript
@@ -136,10 +139,10 @@ export interface MatrixSdkCryptoClient {
 /** The slice of `matrix-bot-sdk`'s MatrixClient this bridge depends on. */
 export interface MatrixSdkClient {
   readonly crypto?: MatrixSdkCryptoClient | undefined;
-  getUserId(): Promise<string>;
   getJoinedRooms(): Promise<ReadonlyArray<string>>;
-  getRoomStateEvent(roomId: string, type: string, stateKey: string): Promise<unknown>;
+  getRoomState(roomId: string): Promise<ReadonlyArray<unknown>>;
   createRoom(options: MatrixCreateRoomOptions): Promise<string>;
+  inviteUser(userId: string, roomId: string): Promise<unknown>;
   doRequest(method: string, endpoint: string, qs?: unknown, body?: unknown): Promise<unknown>;
   start(filter?: unknown): Promise<unknown>;
   stop(): void;
@@ -151,8 +154,8 @@ export interface MatrixSdkModule {
   readonly MatrixClient: new (
     homeserverUrl: string,
     accessToken: string,
-    storage: MatrixSdkStorageProvider,
-    cryptoStore: unknown,
+    storage?: MatrixSdkStorageProvider,
+    cryptoStore?: unknown,
   ) => MatrixSdkClient;
   readonly SimpleFsStorageProvider: new (filename: string) => MatrixSdkStorageProvider;
   readonly RustSdkCryptoStorageProvider: new (storagePath: string, storeType: number) => unknown;
@@ -166,6 +169,30 @@ export interface MatrixSdkModule {
     }): void;
   };
 }
+
+export interface MatrixBotIdentity {
+  readonly userId: string;
+  readonly deviceId: string | null;
+}
+
+/**
+ * Confirms who the bot is and, when the homeserver reports it, which device the
+ * access token belongs to. The device is what an encryption store is tied to.
+ */
+export const whoami = Effect.fn("MatrixBotSdkClient.whoami")(function* (client: MatrixSdkClient) {
+  const response = yield* request("listen", "The Matrix bot identity could not be confirmed.", () =>
+    client.doRequest("GET", "/_matrix/client/v3/account/whoami"),
+  );
+  const userId = readString(response, "user_id");
+  if (userId === null) {
+    return yield* clientError(
+      "listen",
+      "The homeserver did not identify the Matrix bot account.",
+      "permanent",
+    );
+  }
+  return { userId, deviceId: readString(response, "device_id") } satisfies MatrixBotIdentity;
+});
 
 export type MatrixSdkLoader = () => Promise<MatrixSdkModule>;
 
@@ -186,9 +213,6 @@ export const loadMatrixBotSdk: MatrixSdkLoader = async () => {
   }
   return module as MatrixSdkModule;
 };
-
-/** Distinguishes "the homeserver has no such state event" from a read failure. */
-const MISSING_STATE_EVENT = "missing-state-event" as const;
 
 /** Matches matrix-bot-sdk's own stored-filter comparison byte for byte. */
 const sameSyncFilter = (left: unknown, right: unknown) =>
@@ -264,42 +288,188 @@ function toInboundText(
   };
 }
 
-function readNumber(record: Record<string, unknown> | null, key: string): number | null {
-  const value = record?.[key];
-  return typeof value === "number" ? value : null;
+/** Older stable room versions allow integer strings in power-level content. */
+function readPowerLevel(value: unknown): number | null | "invalid" {
+  if (value === undefined) return null;
+  if (typeof value === "number") return Number.isInteger(value) ? value : "invalid";
+  if (typeof value === "string" && /^-?\d+$/u.test(value)) return Number.parseInt(value, 10);
+  return "invalid";
+}
+
+/** State whose change would widen the room or undo its protections. */
+const PROTECTED_ROOM_STATE_TYPES = [
+  "m.room.join_rules",
+  "m.room.power_levels",
+  "m.room.encryption",
+] as const;
+
+/**
+ * Only the bot may widen the room. Members can send messages and nothing else,
+ * so no member's device can pull an unlisted account in, publish the room, or
+ * take encryption off it, and read later bridge output.
+ *
+ * Anything unparseable is a refusal rather than a default, because the Matrix
+ * defaults (invite 0, state_default 50) are the permissive direction.
+ */
+function roomIsBotAdministered(
+  powerLevels: unknown,
+  botUserId: string,
+  botHasCreatorPower: boolean,
+): boolean {
+  const record = readRecord(powerLevels);
+  if (record === null) return false;
+
+  const usersDefault = readPowerLevel(record.users_default) ?? 0;
+  const stateDefault = readPowerLevel(record.state_default) ?? 50;
+  const inviteLevel = readPowerLevel(record.invite) ?? 0;
+  if (usersDefault === "invalid" || stateDefault === "invalid" || inviteLevel === "invalid") {
+    return false;
+  }
+
+  const users = readRecord(record.users) ?? {};
+  // Room version 12 gives creators unbounded power and forbids listing them
+  // here, so the bot's own entry is absent by design in a correct room.
+  const listedBotLevel = readPowerLevel(users[botUserId]) ?? usersDefault;
+  if (listedBotLevel === "invalid") return false;
+  const botLevel = botHasCreatorPower ? Number.POSITIVE_INFINITY : listedBotLevel;
+
+  let highestMemberLevel = usersDefault;
+  for (const [userId, value] of Object.entries(users)) {
+    if (userId === botUserId) continue;
+    const level = readPowerLevel(value) ?? usersDefault;
+    if (level === "invalid") return false;
+    highestMemberLevel = Math.max(highestMemberLevel, level);
+  }
+
+  const events = readRecord(record.events) ?? {};
+  const requiredLevels: Array<number> = [inviteLevel];
+  for (const type of PROTECTED_ROOM_STATE_TYPES) {
+    const level = readPowerLevel(events[type]) ?? stateDefault;
+    if (level === "invalid") return false;
+    requiredLevels.push(level);
+  }
+
+  return requiredLevels.every((level) => level > highestMemberLevel && botLevel >= level);
+}
+
+interface MatrixRoomStateEvent {
+  readonly type: string;
+  readonly stateKey: string;
+  readonly sender: string | null;
+  readonly content: Record<string, unknown> | null;
+}
+
+function readRoomState(events: ReadonlyArray<unknown>): ReadonlyArray<MatrixRoomStateEvent> {
+  const parsed: Array<MatrixRoomStateEvent> = [];
+  for (const event of events) {
+    const record = readRecord(event);
+    const type = readString(record, "type");
+    const stateKey = readString(record, "state_key");
+    if (record === null || type === null || stateKey === null) continue;
+    parsed.push({
+      type,
+      stateKey,
+      sender: readString(record, "sender"),
+      content: readRecord(record.content),
+    });
+  }
+  return parsed;
+}
+
+function findStateContent(
+  state: ReadonlyArray<MatrixRoomStateEvent>,
+  type: string,
+): Record<string, unknown> | null {
+  return state.find((event) => event.type === type && event.stateKey === "")?.content ?? null;
+}
+
+/** Version 12 and later grant the room's creators unbounded power. */
+const MATRIX_CREATOR_POWER_ROOM_VERSION = 12;
+/**
+ * Room versions whose authorization rules this bridge implements. Identifiers
+ * are opaque strings with no ordering, so they are matched exactly: an
+ * unlisted one (a future version, or a homeserver's own dialect) is refused
+ * rather than assumed to behave like its neighbours. Versions below 10 are
+ * excluded because they permit floating-point and loosely formatted power
+ * levels that this verification deliberately does not interpret.
+ */
+const MATRIX_SUPPORTED_ROOM_VERSIONS = new Map([
+  ["10", 10],
+  ["11", 11],
+  ["12", 12],
+]);
+
+interface MatrixRoomCreation {
+  readonly version: number;
+  readonly creatorsAreBotOnly: boolean;
+  readonly botHasCreatorPower: boolean;
 }
 
 /**
- * Only the bot may widen the room. Everyone else is a member who can send
- * messages, so a member's device cannot pull an unlisted account into the room
- * and read later bridge output.
+ * Reads who really controls the room.
+ *
+ * A room someone else created can never be trusted from version 12 onwards,
+ * because its creators keep unbounded power whatever the power levels say, and
+ * a forged `content.creator` must not be able to claim otherwise: from version
+ * 11 the create event's sender is the only authority. An unrecognised room
+ * version is refused rather than guessed at.
  */
-function inviteIsBotOnly(powerLevels: unknown, botUserId: string): boolean {
-  const record = readRecord(powerLevels);
-  if (record === null) return false;
-  const usersDefault = readNumber(record, "users_default") ?? 0;
-  // The Matrix default invite level is 0, so an absent value is a failure.
-  const inviteLevel = readNumber(record, "invite");
-  if (inviteLevel === null) return false;
-  const users = readRecord(record.users) ?? {};
-  const botLevel = readNumber(users, botUserId) ?? usersDefault;
-  const highestMemberLevel = Object.entries(users).reduce(
-    (highest, [userId, level]) =>
-      userId === botUserId || typeof level !== "number" ? highest : Math.max(highest, level),
-    usersDefault,
+function readRoomCreation(
+  state: ReadonlyArray<MatrixRoomStateEvent>,
+  botUserId: string,
+): MatrixRoomCreation | null {
+  const createEvent = state.find(
+    (event) => event.type === "m.room.create" && event.stateKey === "",
   );
-  return inviteLevel > highestMemberLevel && botLevel >= inviteLevel;
+  if (createEvent === undefined) return null;
+
+  const rawVersion = readString(createEvent.content, "room_version") ?? "1";
+  const version = MATRIX_SUPPORTED_ROOM_VERSIONS.get(rawVersion);
+  if (version === undefined) return null;
+
+  // `content.creator` was removed in version 11; from there the create event's
+  // sender is the only authority, so a `creator` field cannot claim otherwise.
+  const creator = createEvent.sender;
+  const additional = createEvent.content?.additional_creators;
+  const additionalAreBotOnly =
+    additional === undefined ||
+    (Array.isArray(additional) && additional.every((entry) => entry === botUserId));
+
+  const creatorsAreBotOnly = creator === botUserId && additionalAreBotOnly;
+  return {
+    version,
+    creatorsAreBotOnly,
+    botHasCreatorPower: creatorsAreBotOnly && version >= MATRIX_CREATOR_POWER_ROOM_VERSION,
+  };
+}
+
+/** Joined members and outstanding invitations: both can read what comes next. */
+function activeMembers(state: ReadonlyArray<MatrixRoomStateEvent>): ReadonlyArray<string> {
+  return state
+    .filter((event) => {
+      if (event.type !== "m.room.member") return false;
+      const membership = readString(event.content, "membership");
+      return membership === "join" || membership === "invite";
+    })
+    .map((event) => event.stateKey);
+}
+
+function membershipOf(state: ReadonlyArray<MatrixRoomStateEvent>, userId: string): string | null {
+  const event = state.find((entry) => entry.type === "m.room.member" && entry.stateKey === userId);
+  return readString(event?.content ?? null, "membership");
 }
 
 /**
  * Fails closed unless the bot is joined to an invite-only, Megolm-encrypted
- * room that only the bot can widen. Shared with the live homeserver smoke so
- * both check the same state.
+ * room that only the bot created, only the bot can widen, and nobody outside
+ * the allowed list has joined. Shared with the live homeserver smoke so both
+ * check the same state.
  */
 export const verifyEncryptedRoom = Effect.fn("MatrixBotSdkClient.verifyEncryptedRoom")(function* (
   client: MatrixSdkClient,
   roomId: string,
   botUserId: string,
+  allowedUserIds: ReadonlyArray<string>,
 ) {
   const joinedRooms = yield* request("listen", "The bridged Matrix room could not be read.", () =>
     client.getJoinedRooms(),
@@ -312,12 +482,22 @@ export const verifyEncryptedRoom = Effect.fn("MatrixBotSdkClient.verifyEncrypted
     );
   }
 
-  const joinRules = yield* request(
-    "listen",
-    "The bridged Matrix room join rules could not be read.",
-    () => client.getRoomStateEvent(roomId, "m.room.join_rules", ""),
+  const state = readRoomState(
+    yield* request("listen", "The bridged Matrix room state could not be read.", () =>
+      client.getRoomState(roomId),
+    ),
   );
-  if (readString(joinRules, "join_rule") !== "invite") {
+
+  const creation = readRoomCreation(state, botUserId);
+  if (creation === null || !creation.creatorsAreBotOnly) {
+    return yield* clientError(
+      "listen",
+      "The configured Matrix room was created by another account, or uses a room version this bridge does not verify (10, 11, and 12 are supported), so control of it cannot be established.",
+      "permanent",
+    );
+  }
+
+  if (readString(findStateContent(state, "m.room.join_rules"), "join_rule") !== "invite") {
     return yield* clientError(
       "listen",
       "The configured Matrix room is not invite-only.",
@@ -325,23 +505,7 @@ export const verifyEncryptedRoom = Effect.fn("MatrixBotSdkClient.verifyEncrypted
     );
   }
 
-  // A missing encryption event is a plaintext room, not a transport fault.
-  const encryption = yield* Effect.tryPromise({
-    try: () => client.getRoomStateEvent(roomId, "m.room.encryption", ""),
-    catch: (cause) =>
-      readStatusCode(cause) === 404
-        ? MISSING_STATE_EVENT
-        : clientError(
-            "listen",
-            "The bridged Matrix room encryption state could not be read.",
-            retryabilityFor(cause),
-          ),
-  }).pipe(
-    Effect.catch((error) =>
-      error === MISSING_STATE_EVENT ? Effect.succeed(null) : Effect.fail(error),
-    ),
-  );
-  if (readString(encryption, "algorithm") !== MEGOLM_ALGORITHM) {
+  if (readString(findStateContent(state, "m.room.encryption"), "algorithm") !== MEGOLM_ALGORITHM) {
     return yield* clientError(
       "listen",
       "The configured Matrix room is not end-to-end encrypted. Encryption cannot be added to a room that already has plaintext history.",
@@ -349,28 +513,67 @@ export const verifyEncryptedRoom = Effect.fn("MatrixBotSdkClient.verifyEncrypted
     );
   }
 
-  const powerLevels = yield* request(
-    "listen",
-    "The bridged Matrix room power levels could not be read.",
-    () => client.getRoomStateEvent(roomId, "m.room.power_levels", ""),
-  );
-  if (!inviteIsBotOnly(powerLevels, botUserId)) {
+  if (
+    !roomIsBotAdministered(
+      findStateContent(state, "m.room.power_levels"),
+      botUserId,
+      creation.botHasCreatorPower,
+    )
+  ) {
     return yield* clientError(
       "listen",
-      "The configured Matrix room lets its members invite other accounts, so bridge output could reach someone outside the allowed list.",
+      "The configured Matrix room lets its members invite other accounts or change its access rules, so bridge output could reach someone outside the allowed list.",
       "permanent",
+    );
+  }
+
+  const allowed = new Set([botUserId, ...allowedUserIds]);
+  if (activeMembers(state).some((userId) => !allowed.has(userId))) {
+    // Removing someone from the room is the operator's call, so the bridge
+    // stops rather than keeps talking to a room somebody outside the list can
+    // read. A pending invitation counts: it can still be accepted later.
+    return yield* clientError(
+      "listen",
+      "The bridged Matrix room has a member or a pending invitation outside the allowed list, so the bridge stays disabled until the room membership matches it.",
+      "permanent",
+    );
+  }
+
+  return state;
+});
+
+/**
+ * Re-invites allowed users who never accepted or have left.
+ *
+ * The room is created with its invitations, but leaving would otherwise be a
+ * one-way door: the room is reused forever and nothing invites again. A failure
+ * here is logged rather than fatal, because an otherwise healthy encrypted room
+ * should not be taken offline by one unreachable invitee.
+ */
+export const reconcileAllowedMembership = Effect.fn(
+  "MatrixBotSdkClient.reconcileAllowedMembership",
+)(function* (
+  client: MatrixSdkClient,
+  roomId: string,
+  allowedUserIds: ReadonlyArray<string>,
+  state: ReadonlyArray<MatrixRoomStateEvent>,
+) {
+  for (const userId of allowedUserIds) {
+    const membership = membershipOf(state, userId);
+    if (membership === "join" || membership === "invite") continue;
+
+    yield* request("listen", "An allowed Matrix user could not be invited.", () =>
+      client.inviteUser(userId, roomId),
+    ).pipe(
+      Effect.matchEffect({
+        onSuccess: () => Effect.logInfo("Matrix bridge invited an allowed user to the room"),
+        onFailure: () =>
+          Effect.logWarning("Matrix bridge could not invite an allowed user to the room"),
+      }),
     );
   }
 });
 
-/**
- * Registers the sync filter before the cursor is fenced.
- *
- * `MatrixClient.start` creates a missing or mismatched filter itself and clears
- * the stored sync token when it does, which would discard the fence and replay
- * room history on the first sync. Creating the identical filter here makes that
- * branch a no-op.
- */
 export const ensureSyncFilter = Effect.fn("MatrixBotSdkClient.ensureSyncFilter")(function* (
   client: MatrixSdkClient,
   storage: MatrixSdkStorageProvider,
@@ -492,6 +695,7 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
   loadModule: MatrixSdkLoader = loadMatrixBotSdk,
 ) {
   const configService = yield* MatrixBridgeConfig;
+  const crypto = yield* Crypto.Crypto;
   const serverConfig = yield* ServerConfig.ServerConfig;
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -558,11 +762,59 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
       });
     });
 
+  /**
+   * Names the store after the Matrix device rather than the configuration.
+   *
+   * A device may upload one-time keys from exactly one crypto store, so the
+   * store has to outlive an allowlist edit, a disconnect and reconnect, and a
+   * token refresh, all of which keep the same device. The homeserver's own
+   * answer for the session is therefore the key; the access token is only a
+   * fallback for a server that reports no device. The digest is one-way and
+   * sits inside the 0700 secrets directory.
+   */
+  const deviceStoreKey = Effect.fn("MatrixBotSdkClient.deviceStoreKey")(function* (
+    config: MatrixBridgeConfigV1,
+    identity: MatrixBotIdentity,
+  ) {
+    const identifier =
+      identity.deviceId === null
+        ? `${config.homeserverUrl}\ntoken\n${config.accessToken}`
+        : `${config.homeserverUrl}\ndevice\n${identity.userId}\n${identity.deviceId}`;
+    const digest = yield* crypto
+      .digest("SHA-256", new TextEncoder().encode(identifier))
+      .pipe(
+        Effect.mapError(() =>
+          clientError("listen", "The Matrix encryption store could not be located.", "permanent"),
+        ),
+      );
+    return Array.from(digest.subarray(0, MATRIX_STORE_KEY_BYTES))
+      .map((byte) => byte.toString(16).padStart(2, "0"))
+      .join("");
+  });
+
   const prepareStoreDirectory = Effect.fn("MatrixBotSdkClient.prepareStoreDirectory")(function* (
-    cryptoStoreGeneration: string,
+    storeKey: string,
+    legacyStoreKey: string,
   ) {
     const bridgeDir = path.join(serverConfig.secretsDir, MATRIX_STORE_DIRECTORY_NAME);
-    const storeDir = path.join(bridgeDir, cryptoStoreGeneration);
+    const storeDir = path.join(bridgeDir, storeKey);
+
+    // Stores were once named after the configuration generation. Moving that
+    // directory keeps the device's one store rather than starting an empty
+    // second one the homeserver would reject.
+    const legacyDir = path.join(bridgeDir, legacyStoreKey);
+    const exists = (directory: string) =>
+      fs.exists(directory).pipe(Effect.orElseSucceed(() => false));
+    if (legacyDir !== storeDir && !(yield* exists(storeDir)) && (yield* exists(legacyDir))) {
+      yield* fs
+        .rename(legacyDir, storeDir)
+        .pipe(
+          Effect.mapError(() =>
+            clientError("listen", "The Matrix encryption store could not be moved.", "transient"),
+          ),
+        );
+      yield* Effect.logInfo("Matrix bridge moved its encryption store to the device-named path");
+    }
     yield* fs
       .makeDirectory(storeDir, { recursive: true })
       .pipe(
@@ -586,7 +838,13 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
     botUserId: string,
   ) {
     if (config.roomId !== null) {
-      yield* verifyEncryptedRoom(client, config.roomId, botUserId);
+      const state = yield* verifyEncryptedRoom(
+        client,
+        config.roomId,
+        botUserId,
+        config.allowedUserIds,
+      );
+      yield* reconcileAllowedMembership(client, config.roomId, config.allowedUserIds, state);
       return config.roomId;
     }
 
@@ -621,7 +879,7 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
     // Presets and power levels are homeserver-implemented: confirm the room
     // really came back invite-only, encrypted, and bot-administered before
     // anything is sent to it.
-    yield* verifyEncryptedRoom(client, roomId, botUserId);
+    yield* verifyEncryptedRoom(client, roomId, botUserId, config.allowedUserIds);
     return roomId;
   });
 
@@ -640,7 +898,22 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
     });
     yield* installQuietSdkLogger(module);
 
-    const storeDir = yield* prepareStoreDirectory(config.cryptoStoreGeneration);
+    // The store is named after the device, and only the homeserver can say
+    // which device this token belongs to, so identity is resolved first with a
+    // client that owns no persistent state.
+    const identity = yield* Effect.acquireRelease(
+      Effect.try({
+        try: () => new module.MatrixClient(config.homeserverUrl, config.accessToken),
+        catch: () => clientError("listen", "The Matrix client could not be created.", "permanent"),
+      }),
+      (probe) => Effect.sync(() => probe.stop()),
+    ).pipe(Effect.flatMap(whoami));
+    const botUserId = identity.userId;
+    const storeDir = yield* prepareStoreDirectory(
+      yield* deviceStoreKey(config, identity),
+      config.cryptoStoreGeneration,
+    );
+
     const { client, storage, fence } = yield* Effect.acquireRelease(
       Effect.try({
         try: () => {
@@ -677,11 +950,6 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
       ({ client }) => Effect.sync(() => client.stop()),
     );
 
-    const botUserId = yield* request(
-      "listen",
-      "The Matrix bot identity could not be confirmed.",
-      () => client.getUserId(),
-    );
     const roomId = yield* ensureRoom(client, config, botUserId);
     const syncFilter = buildSyncFilter(roomId);
     // Registering a filter clears the stored cursor, so it happens before the

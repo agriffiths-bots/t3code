@@ -18,7 +18,9 @@ import {
   createFencedSyncStorage,
   ensureSyncFilter,
   loadMatrixBotSdk,
+  reconcileAllowedMembership,
   verifyEncryptedRoom,
+  whoami,
   type FencedSyncStorage,
   type MatrixSdkClient,
 } from "./MatrixBotSdkClient.ts";
@@ -118,7 +120,8 @@ describeSmoke("MatrixBotSdkClient live homeserver smoke", () => {
           (live) => Effect.sync(() => live.stop()),
         );
 
-        const botUserId = yield* Effect.promise(() => client.getUserId());
+        const identity = yield* whoami(client);
+        const botUserId = identity.userId;
         assert.equal(botUserId, credentials.userId);
 
         // Left on the way out so the smoke leaves no joined room behind.
@@ -135,7 +138,10 @@ describeSmoke("MatrixBotSdkClient live homeserver smoke", () => {
             ),
         );
 
-        yield* verifyEncryptedRoom(client, roomId, botUserId);
+        const state = yield* verifyEncryptedRoom(client, roomId, botUserId, []);
+        // No invitee is configured, so this proves the reconcile pass is inert
+        // rather than inviting anyone from a smoke run.
+        yield* reconcileAllowedMembership(client, roomId, [], state);
         const syncFilter = buildSyncFilter(roomId);
         yield* ensureSyncFilter(client, fence.storage, botUserId, syncFilter);
 
