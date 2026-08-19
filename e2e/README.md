@@ -1,4 +1,42 @@
-# t3 sub-agent + scheduler — e2e harness assets
+# t3 e2e harness assets
+
+Manual, non-CI end-to-end harnesses. Neither runs in CI, neither drives a
+browser, and neither points at live T3 state.
+
+## Matrix bridge
+
+`matrix-bridge.mjs` owns a disposable loopback conduwuit homeserver, two
+registered Matrix accounts, an encrypted JSON-lines Matrix client
+(`matrix-cli.mjs`), and an ephemeral T3 server on its own home. It has two
+modes:
+
+```
+node e2e/matrix-bridge.mjs            # release gate: the full bridge flow
+node e2e/matrix-bridge.mjs --smoke    # self-check: the harness itself
+```
+
+The release gate asserts pairing (rejection then acceptance), final-output-only
+outbound, inbound turns, mid-turn steering, owner moves, homeserver outage
+recovery, and unbridge silence. It needs a server that advertises
+`environment.capabilities.matrixBridge` and an authenticated provider; without
+the capability it stops immediately and says so.
+
+The self-check skips the bridge entirely: the two accounts create, join, and
+talk in an encrypted invite-only room by themselves. It proves the homeserver,
+registration, E2EE client, and T3 boot all work, so a red release gate can be
+read as a bridge failure rather than a harness failure.
+
+Both modes own every temp path, loopback port, and spawned PID, and both tear
+all of it down on every exit path. The pinned conduwuit `v0.5.0-rc4` static
+musl binary is checksummed and cached under `~/.cache/t3-matrix-e2e`, then run
+from a copy in the temp root. Progress: `/tmp/t3-matrix-e2e.progress`. A
+failure keeps redacted logs at `/tmp/t3-matrix-e2e-failure.log` and still
+deletes the temp root, because it holds access tokens and a crypto store.
+
+See [docs/internals/matrix-bridge.md](../docs/internals/matrix-bridge.md) and
+[the rollout runbook](../docs/operations/matrix-bridge-rollout.md).
+
+## Sub-agent and scheduler
 
 Manual (non-CI) end-to-end verification that a real Claude agent running INSIDE
 a t3 thread drives the sub-agent + scheduler MCP tools (migrations 033/034,
@@ -13,7 +51,7 @@ tables + `scheduled_tasks`, plus MCP tool returns captured in a `claude -p`
 transcript and measured wall-clock. The state DB is opened **read-only**
 (`mode=ro`) at `<T3CODE_HOME>/userdata/state.sqlite`.
 
-## Boot recipe (verified)
+### Boot recipe (verified)
 
 ```
 cd /tmp/t3code-inspect/apps/server && \
@@ -24,7 +62,7 @@ cd /tmp/t3code-inspect/apps/server && \
 Use ports 13910–13920, temp homes under `/tmp`. Exit 124 under `timeout` means
 healthy. **Always kill any server you start when done.**
 
-## Assets
+### Assets
 
 | File                     | Purpose                                                                                                                                                                                                                                                                                                                                                              |
 | ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -32,7 +70,7 @@ healthy. **Always kill any server you start when done.**
 | `assert.mjs`             | Read-only SQLite reader helpers (`node:sqlite`, `mode=ro`): `openState`, `turnCountForThread`, `turnTimestamps`, `childrenOf`, `scheduledTask`, `listScheduledTasks`, `threadShell`, `assistantMessages`.                                                                                                                                                            |
 | `drive.mjs` / `drive.sh` | (pre-existing) Programmatically create a project/thread and dispatch a user turn over the Environment HTTP API, then poll projections until the turn settles. Used for bring-up + pre-flight.                                                                                                                                                                        |
 
-### `assert.mjs` helpers vs. schema
+#### `assert.mjs` helpers vs. schema
 
 - `turnCountForThread` / `turnTimestamps` → `projection_turns` (migration 005).
 - `childrenOf` → `projection_threads WHERE parent_thread_id = ?` (migration 034).
@@ -41,9 +79,9 @@ healthy. **Always kill any server you start when done.**
 - `assistantMessages` → `projection_thread_messages` (pass `role:"user"` to find
   the coordinator wake injection `[sub-agent <id> completed]`).
 
-## Scenario → asset/assertion map
+### Scenario → asset/assertion map
 
-### (a) Same-thread schedule fires repeatedly — `e2ePlan.md` §(a)
+#### (a) Same-thread schedule fires repeatedly — `e2ePlan.md` §(a)
 
 - Agent calls `t3_schedule_create({threadId:root, intervalSeconds:60})`.
 - Poll with `turnCountForThread(db, root)` — increases ~1/60s; `scheduledTask`
@@ -53,7 +91,7 @@ healthy. **Always kill any server you start when done.**
   shows no duplicate within one interval. Busy/skip: `scheduledTask` shows
   `last_status='skipped'`, `skipped_count++`, `next_run_at` still advances.
 
-### (b) Cross-provider spawn (claude+codex+cursor) — `e2ePlan.md` §(b)
+#### (b) Cross-provider spawn (claude+codex+cursor) — `e2ePlan.md` §(b)
 
 - After `t3_spawn_subagent` ×3 (one required model/title pair per provider):
   `childrenOf(db, root)` returns 3 rows with `parent_thread_id=root`; the
@@ -65,7 +103,7 @@ healthy. **Always kill any server you start when done.**
   the `[sub-agent <id> completed]` injection(s) — one turn carrying both for the
   two-child consolidation case.
 
-### (c) Long-running child wakes its parent (opt-in `E2E_ENABLE_1H=1`) — `e2ePlan.md` §(c)
+#### (c) Long-running child wakes its parent (opt-in `E2E_ENABLE_1H=1`) — `e2ePlan.md` §(c)
 
 - Child prompt runs `fib-sleep.sh` (default `FIB_SCALE=60`, 54 min cumulative),
   keeping its turn alive script-driven (reliable, not model-driven).
@@ -77,7 +115,7 @@ healthy. **Always kill any server you start when done.**
 - For local iteration, set the child prompt to use `FIB_SCALE=1` (54s) to
   exercise the same wake-on-completion path without the 1h hold.
 
-### (d) Killed child → parent receives failure wake — `e2ePlan.md` §(d)
+#### (d) Killed child → parent receives failure wake — `e2ePlan.md` §(d)
 
 - Spawn a ~10 min child (`FIB_SCALE` tuned), then let the parent continue.
 - Kill via (i) `thread.delete`, (ii) `kill -9` the provider process,

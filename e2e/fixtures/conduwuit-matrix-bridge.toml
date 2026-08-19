@@ -1,0 +1,22 @@
+# Disposable local Matrix homeserver for the T3 Matrix bridge E2E harness.
+# Rendered by e2e/matrix-bridge.mjs. Loopback-only, federation off, token-gated
+# registration. Placeholders are replaced before launch. Port is quoted in the
+# template so the TOML stays valid; the orchestrator substitutes a number.
+[global]
+server_name = "localhost"
+address = "127.0.0.1"
+port = "__PORT__"
+database_path = "__DATABASE_PATH__"
+allow_registration = true
+registration_token_file = "__REGISTRATION_TOKEN_FILE__"
+allow_encryption = true
+allow_federation = false
+allow_public_room_directory_over_federation = false
+allow_device_name_federation = false
+new_user_displayname_suffix = ""
+trusted_servers = []
+allow_check_for_updates = false
+
+[global.well_known]
+server = "__WELL_KNOWN_SERVER__"
+client = "__WELL_KNOWN_CLIENT__"
