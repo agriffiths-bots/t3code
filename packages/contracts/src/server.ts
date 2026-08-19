@@ -572,6 +572,65 @@ export const ServerNotifyResult = Schema.Struct({
 });
 export type ServerNotifyResult = typeof ServerNotifyResult.Type;
 
+export const MatrixBridgeLifecycleState = Schema.Literals([
+  "disabled",
+  "connecting",
+  "waiting-for-member",
+  "awaiting-pairing",
+  "active",
+  "degraded",
+  "unavailable",
+]);
+export type MatrixBridgeLifecycleState = typeof MatrixBridgeLifecycleState.Type;
+
+/** Read-scoped bridge state. Secrets, allowed user ids, room ids, message
+ * bodies, and native failure details must never be added to this view. */
+export const MatrixBridgeStatus = Schema.Struct({
+  state: MatrixBridgeLifecycleState,
+  ownerThreadId: Schema.NullOr(ThreadId),
+  encryptionReady: Schema.Boolean,
+  reason: Schema.NullOr(TrimmedNonEmptyString),
+});
+export type MatrixBridgeStatus = typeof MatrixBridgeStatus.Type;
+
+/** Access-write response for connection management. The access token remains
+ * write-only and is intentionally absent. */
+export const MatrixBridgeConfigView = Schema.Struct({
+  homeserverUrl: TrimmedNonEmptyString,
+  allowedUserIds: Schema.Array(TrimmedNonEmptyString).check(Schema.isNonEmpty()),
+  roomId: Schema.NullOr(TrimmedNonEmptyString),
+});
+export type MatrixBridgeConfigView = typeof MatrixBridgeConfigView.Type;
+
+// The service performs field-by-field validation so a parse failure for a
+// public field can never echo the write-only token as part of a payload error.
+export const MatrixBridgeConfigureInput = Schema.Struct({
+  homeserverUrl: Schema.String,
+  accessToken: Schema.String,
+  allowedUserIds: Schema.Array(Schema.String),
+});
+export type MatrixBridgeConfigureInput = typeof MatrixBridgeConfigureInput.Type;
+
+export const MatrixBridgeSetOwnerInput = Schema.Struct({
+  ownerThreadId: Schema.NullOr(ThreadId),
+});
+export type MatrixBridgeSetOwnerInput = typeof MatrixBridgeSetOwnerInput.Type;
+
+export class MatrixBridgeOperationError extends Schema.TaggedErrorClass<MatrixBridgeOperationError>()(
+  "MatrixBridgeOperationError",
+  {
+    reason: Schema.Literals([
+      "invalidConfiguration",
+      "persistenceFailed",
+      "notConfigured",
+      "threadNotFound",
+      "threadArchived",
+      "threadLookupFailed",
+    ]),
+    message: TrimmedNonEmptyString,
+  },
+) {}
+
 export const ServerConfig = Schema.Struct({
   environment: ExecutionEnvironmentDescriptor,
   auth: ServerAuthDescriptor,

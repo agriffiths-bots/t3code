@@ -37,6 +37,17 @@ describe("RPC authorization scopes", () => {
     );
   });
 
+  it("assigns Matrix configuration, ownership, and status scopes", () => {
+    expect(requiredScopeForRpcMethod(WS_METHODS.matrixBridgeConfigure)).toBe(AuthAccessWriteScope);
+    expect(requiredScopeForRpcMethod(WS_METHODS.matrixBridgeDisconnect)).toBe(AuthAccessWriteScope);
+    expect(requiredScopeForRpcMethod(WS_METHODS.matrixBridgeSetOwner)).toBe(
+      AuthOrchestrationOperateScope,
+    );
+    expect(requiredScopeForRpcMethod(WS_METHODS.matrixBridgeSubscribeStatus)).toBe(
+      AuthOrchestrationReadScope,
+    );
+  });
+
   it("allows relay status reads without granting relay installation access", () => {
     expect(requiredScopeForRpcMethod(WS_METHODS.cloudGetRelayClientStatus)).toBe(
       AuthRelayReadScope,
