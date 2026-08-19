@@ -21,6 +21,8 @@ import * as NodePath from "node:path";
 import * as NodeReadline from "node:readline";
 import * as NodeURL from "node:url";
 
+import { SDK_PACKAGES, USER_CACHE, sdkCacheDir } from "./matrix-sdk-pin.mjs";
+
 const REPO_ROOT = NodePath.resolve(NodePath.dirname(NodeURL.fileURLToPath(import.meta.url)), "..");
 const CLI_PATH = NodePath.join(REPO_ROOT, "e2e", "matrix-cli.mjs");
 const FIXTURE_PATH = NodePath.join(REPO_ROOT, "e2e", "fixtures", "conduwuit-matrix-bridge.toml");
@@ -42,10 +44,6 @@ const CONDUWUIT_ASSETS = {
 // girlbossceo/conduwuit. The pin that matters is the checksum below, not the
 // host: an asset that does not match is never executed.
 const CONDUWUIT_RELEASE = "https://github.com/x86pup/conduwuit/releases/download";
-const SDK_PACKAGES = ["matrix-bot-sdk@0.8.0", "@matrix-org/matrix-sdk-crypto-nodejs@0.4.0"];
-// Downloaded fixtures are expensive and immutable, so they are cached for the
-// user rather than re-fetched per run. Everything else lives in the temp root.
-const USER_CACHE = NodePath.join(NodeOS.homedir(), ".cache", "t3-matrix-e2e");
 const T3_PORT_MIN = 13_910;
 const T3_PORT_MAX = 13_940;
 const MATRIX_PORT_MIN = 18_700;
@@ -308,51 +306,61 @@ async function ensureConduwuit() {
  * pin must not drift with the repo lockfile.
  */
 async function ensureSdk() {
-  const cache = NodePath.join(USER_CACHE, "npm");
-  const marker = NodePath.join(cache, ".pinned");
-  const pin = `${SDK_PACKAGES.join("\n")}\n`;
-  NodeFS.mkdirSync(cache, { recursive: true, mode: 0o700 });
-  const installed =
-    NodeFS.existsSync(marker) &&
-    NodeFS.readFileSync(marker, "utf8") === pin &&
-    NodeFS.existsSync(NodePath.join(cache, "node_modules", "matrix-bot-sdk"));
-  if (!installed) {
+  // The install goes to a private staging directory and is published by an
+  // atomic rename into a name that encodes the pin. Two harness runs racing a
+  // cold cache therefore cannot see each other's half-written `node_modules`,
+  // and the published directory is either absent or complete: there is no
+  // window where a marker claims an install that did not finish.
+  const target = sdkCacheDir();
+  NodeFS.mkdirSync(USER_CACHE, { recursive: true, mode: 0o700 });
+  if (!NodeFS.existsSync(NodePath.join(target, "node_modules", "matrix-bot-sdk"))) {
     heartbeat("install-sdk");
-    NodeFS.rmSync(marker, { force: true });
-    NodeFS.writeFileSync(
-      NodePath.join(cache, "package.json"),
-      `${JSON.stringify({ name: "t3-matrix-e2e-sdk", private: true }, null, 2)}\n`,
-    );
-    // --ignore-scripts: nothing in this tree's transitive dependencies gets to
-    // run code at install time. The two pinned packages are exact, but their
-    // dependency graph is resolved fresh, so the install must not be a code
-    // execution path. The one script this harness does need is invoked
-    // explicitly below.
-    await execFile(
-      "npm",
-      ["install", "--omit=dev", "--no-fund", "--no-audit", "--ignore-scripts", ...SDK_PACKAGES],
-      { cwd: cache },
-    );
-    for (const spec of SDK_PACKAGES) {
-      const at = spec.lastIndexOf("@");
-      const [name, wanted] = [spec.slice(0, at), spec.slice(at + 1)];
-      const manifest = NodePath.join(cache, "node_modules", ...name.split("/"), "package.json");
-      const found = JSON.parse(NodeFS.readFileSync(manifest, "utf8")).version;
-      assert(found === wanted, `${name} resolved to ${found}, expected the pinned ${wanted}`);
+    const staging = NodeFS.mkdtempSync(`${target}-staging-`);
+    try {
+      NodeFS.writeFileSync(
+        NodePath.join(staging, "package.json"),
+        `${JSON.stringify({ name: "t3-matrix-e2e-sdk", private: true }, null, 2)}\n`,
+      );
+      // --ignore-scripts: nothing in this tree's transitive dependencies gets
+      // to run code at install time. The two pinned packages are exact, but
+      // their dependency graph is resolved fresh, so the install must not be a
+      // code execution path. The one script this harness does need is invoked
+      // explicitly below.
+      await execFile(
+        "npm",
+        ["install", "--omit=dev", "--no-fund", "--no-audit", "--ignore-scripts", ...SDK_PACKAGES],
+        { cwd: staging },
+      );
+      for (const spec of SDK_PACKAGES) {
+        const at = spec.lastIndexOf("@");
+        const [name, wanted] = [spec.slice(0, at), spec.slice(at + 1)];
+        const manifest = NodePath.join(staging, "node_modules", ...name.split("/"), "package.json");
+        const found = JSON.parse(NodeFS.readFileSync(manifest, "utf8")).version;
+        assert(found === wanted, `${name} resolved to ${found}, expected the pinned ${wanted}`);
+      }
+      const cryptoDir = NodePath.join(
+        staging,
+        "node_modules",
+        "@matrix-org",
+        "matrix-sdk-crypto-nodejs",
+      );
+      if (NodeFS.existsSync(NodePath.join(cryptoDir, "download-lib.js"))) {
+        await execFile(process.execPath, ["download-lib.js"], { cwd: cryptoDir });
+      }
+      try {
+        NodeFS.renameSync(staging, target);
+      } catch (error) {
+        // A concurrent run published first. Its tree is built from the same
+        // pin and was verified the same way, so use it and drop this one.
+        if (!NodeFS.existsSync(NodePath.join(target, "node_modules", "matrix-bot-sdk")))
+          throw error;
+      }
+    } finally {
+      NodeFS.rmSync(staging, { recursive: true, force: true });
     }
-    const cryptoDir = NodePath.join(
-      cache,
-      "node_modules",
-      "@matrix-org",
-      "matrix-sdk-crypto-nodejs",
-    );
-    if (NodeFS.existsSync(NodePath.join(cryptoDir, "download-lib.js"))) {
-      await execFile(process.execPath, ["download-lib.js"], { cwd: cryptoDir });
-    }
-    NodeFS.writeFileSync(marker, pin);
   }
-  process.env.MATRIX_E2E_SDK_DIR = cache;
-  return cache;
+  process.env.MATRIX_E2E_SDK_DIR = target;
+  return target;
 }
 
 function envHas(pid, needle) {
@@ -519,10 +527,14 @@ function spawnCaptured(command, args, options, kind, prove) {
   if (child.pid == null) throw new Error(`failed to spawn ${kind}`);
   const record = trackPid(child.pid, kind, prove, child);
   const stream = NodeFS.createWriteStream(NodePath.join(tempRoot, `${kind}.log`), { flags: "a" });
+  const lines = [];
   const onLine = (line) => {
     const printedToken = line.match(/Token: (\S+)/);
     if (printedToken) rememberSecret(printedToken[1]);
-    stream.write(`${redact(line)}\n`);
+    const redacted = redact(line);
+    lines.push(redacted);
+    if (lines.length > 2_000) lines.shift();
+    stream.write(`${redacted}\n`);
   };
   // One buffer per pipe. Sharing a buffer would splice a partial stdout line
   // onto a stderr line and produce a synthetic line the QR filter cannot
@@ -534,11 +546,17 @@ function spawnCaptured(command, args, options, kind, prove) {
   for (const { source, redactor } of redactors) source.on("data", (chunk) => redactor.push(chunk));
   // `close` fires once both pipes are drained; `exit` can arrive before them,
   // and finalizing there loses trailing output or writes after end().
-  child.on("close", () => {
-    for (const { redactor } of redactors) redactor.flush();
-    stream.end();
+  // Redacted output is also kept in memory: reading the log file back races the
+  // stream finishing, and a caller that has to classify why a child died cannot
+  // wait on the filesystem to catch up.
+  const closed = new Promise((resolve) => {
+    child.on("close", () => {
+      for (const { redactor } of redactors) redactor.flush();
+      stream.end();
+      resolve();
+    });
   });
-  return { child, record };
+  return { child, record, lines, closed };
 }
 
 async function startConduwuit(binary, configPath, port, dataDir) {
@@ -939,15 +957,26 @@ async function startT3(t3HomeDir, workspace, port) {
   env.T3CODE_NO_BROWSER = "1";
   env.T3CODE_LOG_LEVEL = "Info";
   env.MATRIX_E2E_RUN = RUN_ID;
-  const { child } = spawnCaptured(
+  const spawned = spawnCaptured(
     process.execPath,
     [SERVER_ENTRY, "serve", "--port", String(port), "--host", "127.0.0.1", workspace],
     { cwd: REPO_ROOT, env },
     "t3",
     (pid) => envHas(pid, `T3CODE_HOME=${t3HomeDir}`) && envHas(pid, `MATRIX_E2E_RUN=${RUN_ID}`),
   );
+  const { child, lines, closed } = spawned;
   const origin = `http://127.0.0.1:${port}`;
-  const logPath = NodePath.join(tempRoot, "t3.log");
+  // `exit` can fire before the child's pipes drain, so classification waits for
+  // `close` and reads this run's own captured lines. Reading the shared log
+  // file would race the stream and, on a retry, could pick up the previous
+  // attempt's error.
+  const bootFailure = async () => {
+    await Promise.race([closed, sleep(2_000)]);
+    const error = new Error(`ephemeral T3 exited during boot (${JSON.stringify(exited)})`);
+    // Losing a port race is not a broken server: the caller retries elsewhere.
+    error.portInUse = lines.some((line) => line.includes("EADDRINUSE"));
+    return error;
+  };
   let exited = null;
   child.on("exit", (code, signal) => {
     exited = { code, signal };
@@ -955,9 +984,8 @@ async function startT3(t3HomeDir, workspace, port) {
   const deadline = Date.now() + 240_000;
   let listening = false;
   while (!listening && Date.now() < deadline) {
-    if (exited) throw new Error(`ephemeral T3 exited during boot (${JSON.stringify(exited)})`);
-    const logText = NodeFS.existsSync(logPath) ? NodeFS.readFileSync(logPath, "utf8") : "";
-    if (logText.includes("T3 Code server is ready.")) break;
+    if (exited) throw await bootFailure();
+    if (lines.some((line) => line.includes("T3 Code server is ready."))) break;
     try {
       await fetch(origin, { signal: AbortSignal.timeout(400) });
       listening = true;
@@ -975,7 +1003,7 @@ async function startT3(t3HomeDir, workspace, port) {
   rememberSecret(token);
   const t3 = { origin, token, env, child };
   for (let attempt = 0; attempt < 60; attempt += 1) {
-    if (exited) throw new Error(`ephemeral T3 exited during boot (${JSON.stringify(exited)})`);
+    if (exited) throw await bootFailure();
     const response = await fetch(`${origin}/api/orchestration/snapshot`, {
       headers: { authorization: `Bearer ${token}` },
       signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
@@ -1045,13 +1073,23 @@ async function bringUp(mode) {
     NodeFS.mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
   const matrixPort = await randomFreePort(MATRIX_PORT_MIN, MATRIX_PORT_MAX);
-  const t3Port = await firstFreePort(T3_PORT_MIN, T3_PORT_MAX);
 
   // T3 comes up first so the release gate can refuse a server without the
   // capability before paying for a homeserver download and a Matrix bring-up
   // it is about to throw away.
-  heartbeat("1", `ephemeral T3 :${t3Port}`);
-  const t3 = await startT3(t3Home, workspace, t3Port);
+  // Two harness runs can both see the same port free before either binds it,
+  // so losing that race is retried rather than reported as a broken server.
+  heartbeat("1", "ephemeral T3");
+  let t3 = null;
+  for (let attempt = 1; t3 === null; attempt += 1) {
+    const port = await firstFreePort(T3_PORT_MIN, T3_PORT_MAX);
+    try {
+      t3 = await startT3(t3Home, workspace, port);
+    } catch (error) {
+      if (!error.portInUse || attempt >= 5) throw error;
+      log(`port ${port} was taken while starting; retrying on another`);
+    }
+  }
   const rpc = await connectRpc(t3.origin, t3.token);
   const serverConfig = await rpc.call("server.getConfig", {});
   log(`ephemeral T3 ${serverConfig.environment.serverVersion} on ${t3.origin}`);
@@ -1238,6 +1276,8 @@ async function runReleaseGate(ctx) {
    * job queued before it. Both halves of silence get a real witness.
    */
   const bridgeWitness = async (controlThreadId, marker, restoreOwnerThreadId) => {
+    const beforeOwner = (await threadSnapshot(t3, controlThreadId)).thread;
+    const beforeInbound = userMessages(beforeOwner).length;
     await setOwner(controlThreadId, `${marker} witness owner`);
     const before = turnMarker((await threadSnapshot(t3, controlThreadId)).thread);
     const text = `${marker}_WITNESS_${NodeCrypto.randomBytes(4).toString("hex")}`;
@@ -1268,6 +1308,15 @@ async function runReleaseGate(ctx) {
       `${marker} witness turn completed`,
     );
     const final = lastAssistant(settled, witnessTurnId).text.trim();
+    // Only the witness message may have reached the control thread. A bot
+    // consumer lagging until ownership moved here could otherwise have its own
+    // earlier event dispatched onto this thread, where the witness message
+    // would simply steer it: `isNewTurn` would still be satisfied and the
+    // caller's assertions, which look at the silent thread, would see nothing.
+    assert(
+      userMessages(settled).length === beforeInbound + 1,
+      `${marker} witness thread received an inbound message that was not the witness`,
+    );
     await activeCli.request(
       { op: "waitText", roomId, from: botMxid, body: final, timeoutMs: LOCAL_SEND_MS },
       LOCAL_SEND_MS + 1_000,
@@ -1634,6 +1683,9 @@ async function runReleaseGate(ctx) {
     ctx.conduwuitDir,
   );
   const recoveredCli = new MatrixCli("owner-2");
+  // Everything from here, including the witnesses, speaks through the recovered
+  // client; the one that survived the outage was closed above.
+  activeCli = recoveredCli;
   await recoveredCli.request(
     {
       op: "start",
@@ -1647,6 +1699,10 @@ async function runReleaseGate(ctx) {
     { op: "waitText", roomId, from: botMxid, body: queuedFinal, timeoutMs: RECOVERY_MS },
     RECOVERY_MS + 1_000,
   );
+  // Exactly-once needs the retry queue drained, not just the first copy seen.
+  // A later final observed in the room is queued behind any retry of this one,
+  // so once it has arrived a duplicate would already have landed.
+  await bridgeWitness(threadB, "RECOVERY", threadB);
   const recovered = await recoveredCli.request({ op: "messages", roomId, from: botMxid });
   assert(
     recovered.texts.filter((item) => item.body === queuedFinal).length === 1,
@@ -1660,8 +1716,6 @@ async function runReleaseGate(ctx) {
     30_000,
     "status returns to active after recovery",
   );
-
-  activeCli = recoveredCli;
 
   /**
    * Inbound half of silence, run while `silentThreadId` is idle. Idleness is

@@ -7,10 +7,11 @@
 
 import * as NodeFS from "node:fs";
 import * as NodeModule from "node:module";
-import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeReadline from "node:readline";
 import * as NodeURL from "node:url";
+
+import { sdkCacheDir } from "./matrix-sdk-pin.mjs";
 
 // StoreType.Sqlite from @matrix-org/matrix-sdk-crypto-nodejs. That enum is a
 // TypeScript `const enum`, so it is erased at runtime and cannot be imported.
@@ -19,9 +20,11 @@ const MEGOLM = "m.megolm.v1.aes-sha2";
 
 function loadSdk() {
   const here = NodePath.dirname(NodeURL.fileURLToPath(import.meta.url));
+  // Only the tree for the current pin. Earlier pins can still be sitting in the
+  // cache, and silently loading one would defeat the pin.
   const roots = [
     process.env.MATRIX_E2E_SDK_DIR,
-    NodePath.join(NodeOS.homedir(), ".cache", "t3-matrix-e2e", "npm"),
+    sdkCacheDir(),
     NodePath.join(here, "..", "apps", "server"),
   ].filter(Boolean);
   const errors = [];
@@ -35,7 +38,7 @@ function loadSdk() {
     }
   }
   throw new Error(
-    `matrix-bot-sdk is not available. Run e2e/matrix-bridge.mjs, which installs it under ~/.cache/t3-matrix-e2e/npm. ${errors.join("; ")}`,
+    `matrix-bot-sdk is not available. Run e2e/matrix-bridge.mjs, which installs it under ~/.cache/t3-matrix-e2e. ${errors.join("; ")}`,
   );
 }
 
