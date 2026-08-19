@@ -6,7 +6,7 @@ import {
   TerminalIcon,
 } from "lucide-react";
 import { useAtomValue } from "@effect/atom-react";
-import { type ReactNode, memo, useCallback, useId, useMemo, useState } from "react";
+import { type ReactNode, memo, useCallback, useEffect, useId, useMemo, useState } from "react";
 import {
   AuthAccessReadScope,
   AuthAccessWriteScope,
@@ -41,12 +41,21 @@ import { cn } from "../../lib/utils";
 import { formatElapsedDurationLabel, formatExpiresInLabel } from "../../timestampFormat";
 import { resolveDesktopPairingUrl, resolveHostedPairingUrl } from "./pairingUrls";
 import {
+  activeMatrixBridgePairingCode,
   applyWslEnableSelection,
+  EMPTY_MATRIX_BRIDGE_DRAFT,
   isQrShareableEndpoint,
+  matrixBridgeDraftAfterConfigure,
+  matrixBridgeConnectionMode,
+  matrixBridgeSectionAccess,
+  matrixBridgeStatusLabel,
+  parseMatrixBridgeConfigureInput,
+  showMatrixBridgeDisconnect,
   parsePairingUrlFields,
   parseRemotePairingHostChange,
   parseRemotePairingFields,
   selectQrEndpointOption,
+  type MatrixBridgePairingCode,
 } from "./ConnectionsSettings.logic";
 import {
   SettingsPageContainer,
@@ -68,6 +77,7 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "../ui/dialog";
+import { RedactedSensitiveText } from "./RedactedSensitiveText";
 import { ScrollArea } from "../ui/scroll-area";
 import {
   AlertDialog,
@@ -127,6 +137,11 @@ import {
   usePrimaryEnvironment,
 } from "~/state/environments";
 import { useAtomCommand } from "../../state/use-atom-command";
+import {
+  matrixBridgeEnvironment,
+  matrixBridgeFailureMessage,
+  useMatrixBridgeStatusView,
+} from "~/state/matrixBridge";
 import { serverEnvironment } from "~/state/server";
 import { ConnectionStatusDot } from "../ConnectionStatusDot";
 import { ServerUpdateAction, ServerUpdateProgress } from "../ServerUpdateAction";
@@ -1656,6 +1671,325 @@ function EmptyRemoteEnvironments({ cloudEnabled = true }: { readonly cloudEnable
         </EmptyDescription>
       </EmptyHeader>
     </Empty>
+  );
+}
+
+/**
+ * The minted code, for as long as it can still be redeemed. Mounted only while
+ * a code exists, so its one-second tick (the same one the pairing-link rows
+ * use to keep their relative expiry honest) costs nothing the rest of the time.
+ */
+function MatrixBridgePairingCodeRow({
+  code,
+  onExpired,
+  onCopy,
+}: {
+  readonly code: MatrixBridgePairingCode;
+  readonly onExpired: () => void;
+  readonly onCopy: (credential: string, context: undefined) => void;
+}) {
+  const nowMs = useRelativeTimeTick(1_000);
+  const active = activeMatrixBridgePairingCode(code, nowMs);
+
+  useEffect(() => {
+    if (active === null) {
+      // Drop the dead credential from state too, rather than only hiding it.
+      onExpired();
+    }
+  }, [active, onExpired]);
+
+  if (active === null) {
+    return null;
+  }
+
+  return (
+    <div className="flex items-center gap-2 pt-3">
+      <RedactedSensitiveText
+        value={active.credential}
+        ariaLabel="Matrix pairing code"
+        revealTooltip="Reveal pairing code"
+        hideTooltip="Hide pairing code"
+      />
+      <Button size="xs" variant="ghost" onClick={() => onCopy(active.credential, undefined)}>
+        Copy
+      </Button>
+      <span className="text-xs text-muted-foreground">
+        {formatExpiresInLabel(new Date(active.expiresAtMs).toISOString(), nowMs)}
+      </span>
+    </div>
+  );
+}
+
+/**
+ * Matrix bridge subsection.
+ *
+ * Deliberately a subsection of Connections rather than its own Settings page:
+ * it is one more way to reach this environment, and it sits next to the
+ * pairing UI it borrows for its codes. The bot access token is write-only on
+ * the server, so this panel can show what the bridge is doing but can never
+ * read the credential back.
+ */
+function MatrixBridgeSection({
+  environmentId,
+  supported,
+  canManageAccess,
+}: {
+  readonly environmentId: EnvironmentId | null;
+  readonly supported: boolean;
+  readonly canManageAccess: boolean;
+}) {
+  const statusView = useMatrixBridgeStatusView(environmentId);
+  const configureBridge = useAtomCommand(matrixBridgeEnvironment.configure, {
+    reportFailure: false,
+  });
+  const disconnectBridge = useAtomCommand(matrixBridgeEnvironment.disconnect, {
+    reportFailure: false,
+  });
+  const [draft, setDraft] = useState(EMPTY_MATRIX_BRIDGE_DRAFT);
+  const [formError, setFormError] = useState<string | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [pairingCode, setPairingCode] = useState<MatrixBridgePairingCode | null>(null);
+  const [isCreatingPairingCode, setIsCreatingPairingCode] = useState(false);
+  const { copyToClipboard: copyPairingCode } = useCopyToClipboard({
+    target: "pairing code",
+    onCopy: () => {
+      toastManager.add({ type: "success", title: "Pairing code copied" });
+    },
+    onError: (error) => {
+      toastManager.add(
+        stackedThreadToast({
+          type: "error",
+          title: "Could not copy the pairing code",
+          description: error.message,
+        }),
+      );
+    },
+  });
+
+  const handleConnect = useCallback(async () => {
+    if (environmentId === null) return;
+    let input;
+    try {
+      input = parseMatrixBridgeConfigureInput(draft);
+    } catch (error) {
+      setFormError(error instanceof Error ? error.message : "Check the connection details.");
+      return;
+    }
+    setFormError(null);
+    setIsSubmitting(true);
+    try {
+      const result = await configureBridge({ environmentId, input });
+      if (result._tag === "Failure") {
+        if (!isAtomCommandInterrupted(result)) {
+          setFormError(
+            matrixBridgeFailureMessage(
+              squashAtomCommandFailure(result),
+              "Could not connect the Matrix bridge.",
+            ),
+          );
+        }
+        return;
+      }
+      // The token never outlives the request that carried it, and the rest of
+      // the draft becomes what the server normalized and stored.
+      setDraft(matrixBridgeDraftAfterConfigure(result.value));
+      setPairingCode(null);
+    } finally {
+      setIsSubmitting(false);
+    }
+  }, [configureBridge, draft, environmentId]);
+
+  const handleDisconnect = useCallback(async () => {
+    if (environmentId === null) return;
+    setIsSubmitting(true);
+    try {
+      const result = await disconnectBridge({ environmentId, input: {} });
+      if (result._tag === "Failure") {
+        if (!isAtomCommandInterrupted(result)) {
+          setFormError(
+            matrixBridgeFailureMessage(
+              squashAtomCommandFailure(result),
+              "Could not disconnect the Matrix bridge.",
+            ),
+          );
+        }
+        return;
+      }
+      setFormError(null);
+      setPairingCode(null);
+      setDraft(EMPTY_MATRIX_BRIDGE_DRAFT);
+    } finally {
+      setIsSubmitting(false);
+    }
+  }, [disconnectBridge, environmentId]);
+
+  const clearPairingCode = useCallback(() => {
+    setPairingCode(null);
+  }, []);
+
+  const handleCreatePairingCode = useCallback(async () => {
+    setIsCreatingPairingCode(true);
+    try {
+      // The existing one-time pairing endpoint, with the smallest grant that
+      // still proves the sender holds this environment: the bridge consumes
+      // the code as proof and never opens a session with it.
+      const credential = await createServerPairingCredential({
+        label: "Matrix bridge",
+        scopes: [AuthOrchestrationReadScope],
+      });
+      setPairingCode({
+        credential: credential.credential,
+        expiresAtMs: DateTime.toEpochMillis(credential.expiresAt),
+      });
+    } catch (error) {
+      toastManager.add(
+        stackedThreadToast({
+          type: "error",
+          title: "Could not create a Matrix pairing code",
+          description: error instanceof Error ? error.message : "An error occurred.",
+        }),
+      );
+    } finally {
+      setIsCreatingPairingCode(false);
+    }
+  }, []);
+
+  const access = matrixBridgeSectionAccess({ supported, canManageAccess });
+  if (access === "hidden") {
+    return null;
+  }
+
+  const statusLabel = matrixBridgeStatusLabel(statusView);
+  const connectionMode = matrixBridgeConnectionMode(statusView);
+  const ownerThreadId = statusView.kind === "status" ? statusView.status.ownerThreadId : null;
+
+  return (
+    <SettingsSection title="Matrix bridge">
+      <SettingsRow
+        title={statusLabel.title}
+        description={statusLabel.description}
+        status={
+          statusView.kind !== "status"
+            ? null
+            : ownerThreadId
+              ? "One thread is bridged. Right-click another thread to move the bridge."
+              : "No thread is bridged. Right-click a thread in the sidebar to bridge it."
+        }
+        control={
+          access === "manage" && showMatrixBridgeDisconnect(connectionMode) ? (
+            <Button
+              size="xs"
+              variant="destructive-outline"
+              disabled={isSubmitting}
+              onClick={() => void handleDisconnect()}
+            >
+              Disconnect
+            </Button>
+          ) : undefined
+        }
+      />
+      {access === "status-only" ? (
+        <SettingsRow
+          title="Administrative access"
+          description="Configuring the Matrix bridge and creating pairing codes need the access:write scope. Re-pair this T3 client using an administrative link from the machine that runs this backend."
+        />
+      ) : (
+        <>
+          <SettingsRow
+            title={connectionMode === "reconfigure" ? "Reconfigure connection" : "Connection"}
+            description={
+              connectionMode === "connect"
+                ? "T3 signs in as a Matrix bot, creates one private encrypted room, and invites the accounts you list."
+                : "The stored connection is write-only, so saving replaces it outright: enter every field again. A new homeserver, token, or ID list means a new room and a fresh pairing."
+            }
+          >
+            <div className="space-y-3 pt-3">
+              <label className="block">
+                <span className="mb-1.5 block text-xs font-medium text-foreground">
+                  Homeserver URL
+                </span>
+                <Input
+                  value={draft.homeserverUrl}
+                  onChange={(event) =>
+                    setDraft((current) => ({ ...current, homeserverUrl: event.target.value }))
+                  }
+                  placeholder="https://matrix.example.com"
+                  disabled={isSubmitting}
+                  autoComplete="off"
+                />
+              </label>
+              <label className="block">
+                <span className="mb-1.5 block text-xs font-medium text-foreground">
+                  Bot access token
+                </span>
+                <Input
+                  type="password"
+                  value={draft.accessToken}
+                  onChange={(event) =>
+                    setDraft((current) => ({ ...current, accessToken: event.target.value }))
+                  }
+                  placeholder={
+                    connectionMode === "connect" ? "Access token" : "Re-enter to apply changes"
+                  }
+                  disabled={isSubmitting}
+                  autoComplete="off"
+                />
+                <span className="mt-1.5 block text-xs text-muted-foreground">
+                  Kept on this backend and never sent back to a client, so every change needs it
+                  again.
+                </span>
+              </label>
+              <label className="block">
+                <span className="mb-1.5 block text-xs font-medium text-foreground">
+                  Allowed Matrix IDs
+                </span>
+                <Textarea
+                  rows={2}
+                  value={draft.allowedUserIds}
+                  onChange={(event) =>
+                    setDraft((current) => ({ ...current, allowedUserIds: event.target.value }))
+                  }
+                  placeholder="@you:beeper.com"
+                  disabled={isSubmitting}
+                />
+                <span className="mt-1.5 block text-xs text-muted-foreground">
+                  One per line. Only these accounts are invited, and only they can drive the bridged
+                  thread.
+                </span>
+              </label>
+              {formError ? <p className="text-xs text-destructive">{formError}</p> : null}
+              <div className="flex justify-end">
+                <Button size="xs" disabled={isSubmitting} onClick={() => void handleConnect()}>
+                  {isSubmitting ? "Saving…" : connectionMode === "connect" ? "Connect" : "Save"}
+                </Button>
+              </div>
+            </div>
+          </SettingsRow>
+          <SettingsRow
+            title="Matrix pairing code"
+            description="Send a code as a message in the Matrix room to unlock the bridge. It is one-time, carries only the view-environment scope, and is consumed as proof rather than as a sign-in."
+            control={
+              <Button
+                size="xs"
+                variant="outline"
+                disabled={isCreatingPairingCode}
+                onClick={() => void handleCreatePairingCode()}
+              >
+                {isCreatingPairingCode ? "Creating…" : "Create code"}
+              </Button>
+            }
+          >
+            {pairingCode ? (
+              <MatrixBridgePairingCodeRow
+                code={pairingCode}
+                onExpired={clearPairingCode}
+                onCopy={copyPairingCode}
+              />
+            ) : null}
+          </SettingsRow>
+        </>
+      )}
+    </SettingsSection>
   );
 }
 
@@ -3442,6 +3776,15 @@ export function ConnectionsSettings() {
           <CloudLinkRow canManageRelay={canManageRelay} />
         </SettingsSection>
       )}
+
+      {/* Keyed by environment: the draft can hold a bot token, and no part of
+          it may survive a switch to a different backend. */}
+      <MatrixBridgeSection
+        key={primaryEnvironmentId ?? "no-environment"}
+        environmentId={primaryEnvironmentId}
+        supported={primaryServerConfig?.environment.capabilities.matrixBridge === true}
+        canManageAccess={canManageLocalBackend}
+      />
 
       <SettingsSection
         {...searchableSetting("remote-environments")}

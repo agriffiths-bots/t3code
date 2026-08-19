@@ -83,6 +83,13 @@ import {
   useThreadShells,
   useThreadShellsForProjectRefs,
 } from "../state/entities";
+import {
+  matrixBridgeEnvironment,
+  matrixBridgeFailureMessage,
+  selectMatrixBridgeMenuState,
+  useMatrixBridgeStates,
+} from "../state/matrixBridge";
+import { buildMatrixBridgeMenuItems } from "./threadActionMenu.logic";
 import { selectThreadTerminalUiState, useTerminalUiStateStore } from "../terminalUiStateStore";
 import { useThreadRunningTerminalIds } from "../state/terminalSessions";
 import { useThreadDiscoveredPorts } from "../portDiscoveryState";
@@ -1106,6 +1113,10 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
   const updateThreadMetadata = useAtomCommand(threadEnvironment.updateMetadata, {
     reportFailure: false,
   });
+  const setMatrixBridgeOwner = useAtomCommand(matrixBridgeEnvironment.setOwner, {
+    reportFailure: false,
+  });
+  const matrixBridgeStates = useMatrixBridgeStates();
   const updateSettings = useUpdateClientSettings();
   const sidebarThreadPreviewCount = useClientSettings<SidebarThreadPreviewCount>(
     (settings) => settings.sidebarThreadPreviewCount,
@@ -2113,6 +2124,9 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
           ...(thread.branch
             ? [{ id: "new-thread-on-branch", label: `New thread on ${thread.branch}` }]
             : []),
+          // Same builder as the modern sidebar and the chat-header menu, so
+          // this second menu cannot drift from them.
+          ...buildMatrixBridgeMenuItems(selectMatrixBridgeMenuState(matrixBridgeStates, threadRef)),
           { id: "rename", label: "Rename thread" },
           { id: "mark-unread", label: "Mark unread" },
           { id: "copy-path", label: "Copy Path" },
@@ -2143,6 +2157,39 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
             }),
           );
         }
+        return;
+      }
+
+      if (clicked === "bridge-to-matrix" || clicked === "unbridge-matrix") {
+        const stopping = clicked === "unbridge-matrix";
+        const result = await setMatrixBridgeOwner({
+          environmentId: threadRef.environmentId,
+          input: { ownerThreadId: stopping ? null : threadRef.threadId },
+        });
+        if (result._tag === "Failure") {
+          if (!isAtomCommandInterrupted(result)) {
+            toastManager.add(
+              stackedThreadToast({
+                type: "error",
+                title: stopping
+                  ? "Failed to stop the Matrix bridge"
+                  : "Failed to bridge this thread to Matrix",
+                description: matrixBridgeFailureMessage(
+                  squashAtomCommandFailure(result),
+                  "An error occurred.",
+                ),
+              }),
+            );
+          }
+          return;
+        }
+        toastManager.add(
+          stackedThreadToast({
+            type: "success",
+            title: stopping ? "Matrix bridge stopped" : "Matrix bridge moved to this thread",
+            timeout: 5_000,
+          }),
+        );
         return;
       }
 
@@ -2204,8 +2251,10 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       deleteThread,
       handleNewThread,
       markThreadUnread,
+      matrixBridgeStates,
       memberProjectByScopedKey,
       project.workspaceRoot,
+      setMatrixBridgeOwner,
       startThreadRename,
     ],
   );
