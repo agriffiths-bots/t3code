@@ -35,6 +35,7 @@ export class MatrixBridgeClientError extends Schema.TaggedErrorClass<MatrixBridg
   {
     operation: Schema.Literals(["listen", "send"]),
     reason: Schema.String,
+    retryability: Schema.Literals(["transient", "permanent"]),
   },
 ) {}
 
@@ -61,6 +62,7 @@ export const unavailableLayer = Layer.succeed(MatrixBridgeClient, {
       new MatrixBridgeClientError({
         operation: "send",
         reason: "Encrypted Matrix transport is unavailable.",
+        retryability: "permanent",
       }),
     ),
 });
@@ -73,7 +75,10 @@ export interface FakeMatrixBridgeClient {
   ) => Effect.Effect<ReadonlyArray<MatrixBridgeOutboundText>>;
   readonly sent: Effect.Effect<ReadonlyArray<MatrixBridgeOutboundText>>;
   readonly isListening: Effect.Effect<boolean>;
-  readonly failNextSends: (count: number) => Effect.Effect<void>;
+  readonly failNextSends: (
+    count: number,
+    retryability?: MatrixBridgeClientError["retryability"],
+  ) => Effect.Effect<void>;
   readonly emitInbound: (event: MatrixBridgeInboundText) => Effect.Effect<boolean>;
   readonly awaitSentCount: (
     count: number,
@@ -84,7 +89,10 @@ export interface FakeMatrixBridgeClient {
 export const makeFakeMatrixBridgeClient = Effect.gen(function* () {
   const attemptsRef = yield* SubscriptionRef.make<ReadonlyArray<MatrixBridgeOutboundText>>([]);
   const sentRef = yield* SubscriptionRef.make<ReadonlyArray<MatrixBridgeOutboundText>>([]);
-  const failuresRemainingRef = yield* Ref.make(0);
+  const failureRef = yield* Ref.make<{
+    readonly remaining: number;
+    readonly retryability: MatrixBridgeClientError["retryability"];
+  }>({ remaining: 0, retryability: "transient" });
   const inboundHandlerRef = yield* Ref.make<Option.Option<MatrixBridgeInboundHandler>>(
     Option.none(),
   );
@@ -98,14 +106,16 @@ export const makeFakeMatrixBridgeClient = Effect.gen(function* () {
     "FakeMatrixBridgeClient.sendText",
   )(function* (message) {
     yield* SubscriptionRef.update(attemptsRef, (attempts) => [...attempts, message]);
-    const shouldFail = yield* Ref.modify(
-      failuresRemainingRef,
-      (remaining) => [remaining > 0, Math.max(0, remaining - 1)] as const,
+    const retryability = yield* Ref.modify(failureRef, (failure) =>
+      failure.remaining > 0
+        ? [failure.retryability, { ...failure, remaining: Math.max(0, failure.remaining - 1) }]
+        : [null, failure],
     );
-    if (shouldFail) {
+    if (retryability !== null) {
       return yield* new MatrixBridgeClientError({
         operation: "send",
         reason: "Injected fake Matrix send failure.",
+        retryability,
       });
     }
     yield* SubscriptionRef.update(sentRef, (sent) => [...sent, message]);
@@ -133,7 +143,8 @@ export const makeFakeMatrixBridgeClient = Effect.gen(function* () {
     awaitAttemptCount: (count) => awaitCount(attemptsRef, count),
     sent: SubscriptionRef.get(sentRef),
     isListening: Ref.get(inboundHandlerRef).pipe(Effect.map(Option.isSome)),
-    failNextSends: (count) => Ref.set(failuresRemainingRef, Math.max(0, count)),
+    failNextSends: (count, retryability = "transient") =>
+      Ref.set(failureRef, { remaining: Math.max(0, count), retryability }),
     emitInbound: (event) =>
       Ref.get(inboundHandlerRef).pipe(
         Effect.flatMap(

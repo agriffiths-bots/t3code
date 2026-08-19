@@ -77,6 +77,7 @@ function thread(input: {
   readonly turnId: TurnId;
   readonly state: "running" | "completed" | "interrupted" | "error";
   readonly messages: ReadonlyArray<OrchestrationMessage>;
+  readonly requestedAt?: string;
   readonly terminalAt?: string | null;
   readonly archivedAt?: string | null;
   readonly deletedAt?: string | null;
@@ -92,8 +93,8 @@ function thread(input: {
   const latestTurn = {
     turnId: input.turnId,
     state: input.state,
-    requestedAt: baseAt,
-    startedAt: baseAt,
+    requestedAt: input.requestedAt ?? baseAt,
+    startedAt: input.requestedAt ?? baseAt,
     completedAt: terminalAt,
     assistantMessageId: null,
   } as const;
@@ -145,6 +146,10 @@ function eventBase(threadId: ThreadId, eventId: string, occurredAt: string) {
     correlationId: null,
     metadata: {},
   };
+}
+
+function atSequence(event: OrchestrationEvent, sequence: number): OrchestrationEvent {
+  return { ...event, sequence: NonNegativeInt.make(sequence) };
 }
 
 function assistantEvent(input: {
@@ -281,7 +286,9 @@ interface ReactorHarnessOptions {
   readonly initialOwner?: ThreadId | null;
   readonly initialThread?: OrchestrationThread | null;
   readonly lastDeliveredTurnId?: TurnId | null;
+  readonly deliveryBaselineSequence?: number;
   readonly deliveryCheckpointInitialized?: boolean;
+  readonly historicalEvents?: ReadonlyArray<OrchestrationEvent>;
   readonly activation?: Effect.Effect<void>;
 }
 
@@ -294,6 +301,11 @@ function withHarness<A, E>(
       const domainEvents = yield* Queue.unbounded<OrchestrationEvent>();
       const observedEvents = yield* Queue.unbounded<void>();
       const observedInspections = yield* Queue.unbounded<void>();
+      const initialSequence = Math.max(
+        options.deliveryBaselineSequence ?? 0,
+        ...(options.historicalEvents ?? []).map((event) => event.sequence),
+      );
+      const sequenceRef = yield* Ref.make(initialSequence);
       const startupTurnId = TurnId.make("turn-startup-running");
       const initialThread =
         options.initialThread === undefined
@@ -321,6 +333,7 @@ function withHarness<A, E>(
         ownershipEpoch: NonNegativeInt.make(1),
         cryptoStoreGeneration: "test-generation",
         lastDeliveredTurnId: options.lastDeliveredTurnId ?? null,
+        deliveryBaselineSequence: NonNegativeInt.make(options.deliveryBaselineSequence ?? 0),
         deliveryCheckpointInitialized: options.deliveryCheckpointInitialized ?? true,
       };
       const configRef = yield* SubscriptionRef.make<Option.Option<MatrixBridgeConfigV1>>(
@@ -329,24 +342,25 @@ function withHarness<A, E>(
       const fake = yield* makeFakeMatrixBridgeClient;
 
       const setOwner = (ownerThreadId: ThreadId | null) =>
-        SubscriptionRef.modify(configRef, (current) => {
-          if (Option.isNone(current)) {
-            return [status(null), current] as const;
-          }
-          const next: MatrixBridgeConfigV1 = {
-            ...current.value,
-            ownerThreadId,
-            ownershipEpoch: NonNegativeInt.make(current.value.ownershipEpoch + 1),
-            lastDeliveredTurnId:
-              current.value.ownerThreadId === ownerThreadId
-                ? current.value.lastDeliveredTurnId
-                : null,
-            deliveryCheckpointInitialized:
-              current.value.ownerThreadId === ownerThreadId
-                ? current.value.deliveryCheckpointInitialized
-                : true,
-          };
-          return [status(ownerThreadId), Option.some(next)] as const;
+        Effect.gen(function* () {
+          const detail = Option.getOrNull(yield* Ref.get(detailRef));
+          const baselineTurn =
+            ownerThreadId !== null && detail?.id === ownerThreadId ? detail.latestTurn : null;
+          const baselineSequence = NonNegativeInt.make(yield* Ref.get(sequenceRef));
+          return yield* SubscriptionRef.modify(configRef, (current) => {
+            if (Option.isNone(current)) {
+              return [status(null), current] as const;
+            }
+            const next: MatrixBridgeConfigV1 = {
+              ...current.value,
+              ownerThreadId,
+              ownershipEpoch: NonNegativeInt.make(current.value.ownershipEpoch + 1),
+              lastDeliveredTurnId: baselineTurn?.turnId ?? null,
+              deliveryBaselineSequence: baselineSequence,
+              deliveryCheckpointInitialized: true,
+            };
+            return [status(ownerThreadId), Option.some(next)] as const;
+          });
         });
 
       const clearOwnerIfMatches = (expected: {
@@ -366,6 +380,7 @@ function withHarness<A, E>(
             ownerThreadId: null,
             ownershipEpoch: NonNegativeInt.make(current.value.ownershipEpoch + 1),
             lastDeliveredTurnId: null,
+            deliveryBaselineSequence: NonNegativeInt.make(0),
             deliveryCheckpointInitialized: true,
           };
           return [status(null), Option.some(next)] as const;
@@ -392,6 +407,7 @@ function withHarness<A, E>(
               Option.some({
                 ...current.value,
                 lastDeliveredTurnId: expected.baselineTurnId,
+                deliveryBaselineSequence: expected.baselineSequence,
                 deliveryCheckpointInitialized: true,
               }),
             ] as const;
@@ -416,6 +432,7 @@ function withHarness<A, E>(
             Option.some({
               ...current.value,
               lastDeliveredTurnId: expected.turnId,
+              deliveryBaselineSequence: expected.turnSequence,
               deliveryCheckpointInitialized: true,
             }),
           ] as const;
@@ -441,26 +458,39 @@ function withHarness<A, E>(
           clearOwnerIfMatches,
           initializeDeliveryCheckpointIfMissing,
           markDeliveredIfMatches,
+          reportPermanentSendFailureIfMatches: () => Effect.succeed(true),
         }),
       );
       const engineLayer = Layer.succeed(OrchestrationEngineService, {
-        readEvents: () => Stream.empty,
+        readEvents: (fromSequenceExclusive) =>
+          Stream.fromIterable(
+            (options.historicalEvents ?? []).filter(
+              (event) => event.sequence > fromSequenceExclusive,
+            ),
+          ),
         dispatch: () => unsupported(),
         streamDomainEvents: Stream.fromQueue(domainEvents).pipe(
           Stream.tap(() => Queue.offer(observedEvents, undefined)),
         ),
-        latestSequence: Effect.succeed(0),
+        latestSequence: Ref.get(sequenceRef),
       } satisfies OrchestrationEngineShape);
+      const inspectThread = Effect.gen(function* () {
+        yield* Ref.update(inspectionCountRef, (count) => count + 1);
+        yield* Queue.offer(observedInspections, undefined);
+        const detail = yield* Ref.get(detailRef);
+        const snapshotSequence = NonNegativeInt.make(yield* Ref.get(sequenceRef));
+        const gate = yield* Ref.getAndSet(inspectionGateRef, Option.none());
+        if (Option.isSome(gate)) yield* Deferred.await(gate.value);
+        return { detail, snapshotSequence };
+      });
       const projectionLayer = Layer.mock(ProjectionSnapshotQuery)({
-        getThreadDetailById: () =>
-          Effect.gen(function* () {
-            yield* Ref.update(inspectionCountRef, (count) => count + 1);
-            yield* Queue.offer(observedInspections, undefined);
-            const detail = yield* Ref.get(detailRef);
-            const gate = yield* Ref.getAndSet(inspectionGateRef, Option.none());
-            if (Option.isSome(gate)) yield* Deferred.await(gate.value);
-            return detail;
-          }),
+        getThreadDetailById: () => inspectThread.pipe(Effect.map(({ detail }) => detail)),
+        getThreadDetailSnapshot: () =>
+          inspectThread.pipe(
+            Effect.map(({ detail, snapshotSequence }) =>
+              Option.map(detail, (thread) => ({ snapshotSequence, thread })),
+            ),
+          ),
       });
       const environmentLayer = Layer.mock(ServerEnvironment.ServerEnvironment)({
         getEnvironmentId: Effect.succeed(EnvironmentId.make("matrix-env")),
@@ -481,11 +511,15 @@ function withHarness<A, E>(
         yield* Ref.set(inspectionCountRef, 0);
 
         const publishWithoutDrain = (event: OrchestrationEvent) =>
-          Queue.offer(domainEvents, event).pipe(
-            Effect.andThen(Queue.take(observedEvents)),
-            Effect.andThen(Effect.yieldNow),
-            Effect.asVoid,
-          );
+          Effect.gen(function* () {
+            const sequence = yield* Ref.updateAndGet(sequenceRef, (current) => current + 1);
+            yield* Queue.offer(domainEvents, {
+              ...event,
+              sequence: NonNegativeInt.make(sequence),
+            });
+            yield* Queue.take(observedEvents);
+            yield* Effect.yieldNow;
+          });
 
         const publish = (event: OrchestrationEvent) =>
           publishWithoutDrain(event).pipe(Effect.andThen(reactor.drain));
@@ -582,6 +616,17 @@ it.effect("reconciles one undelivered terminal owner turn on startup", () => {
     {
       initialThread: thread({ turnId, state: "completed", messages: [final] }),
       lastDeliveredTurnId: TurnId.make("turn-delivered-before-restart"),
+      deliveryBaselineSequence: 1,
+      historicalEvents: [
+        atSequence(
+          assistantEvent({
+            turnId,
+            messageId: "message-restart-window-final",
+            at: final.updatedAt,
+          }),
+          2,
+        ),
+      ],
     },
   );
 });
@@ -616,9 +661,93 @@ it.effect("retains a projected final across restart until its terminal marker", 
     {
       initialThread: thread({ turnId, state: "running", messages: [final] }),
       lastDeliveredTurnId: TurnId.make("turn-before-restart-window"),
+      deliveryBaselineSequence: 1,
+      historicalEvents: [
+        atSequence(
+          assistantEvent({
+            turnId,
+            messageId: "message-restart-before-terminal-final",
+            at: final.updatedAt,
+          }),
+          2,
+        ),
+      ],
     },
   );
 });
+
+it.effect(
+  "ignores a projected turn older than the persisted delivery baseline after revert",
+  () => {
+    const revertedTurnId = TurnId.make("turn-before-revert");
+    const deliveredTurnId = TurnId.make("turn-delivered-before-revert");
+    const revertedFinal = message({
+      id: "message-before-revert-final",
+      role: "assistant",
+      text: "Historical response after revert",
+      turnId: revertedTurnId,
+      at: "2026-08-19T10:00:05.000Z",
+    });
+    return withHarness(
+      (harness) =>
+        Effect.gen(function* () {
+          expect(yield* harness.fake.sent).toEqual([]);
+          expect(Option.getOrThrow(yield* harness.currentConfig).lastDeliveredTurnId).toBe(
+            deliveredTurnId,
+          );
+
+          const nextTurnId = TurnId.make("turn-after-revert");
+          const nextFinal = message({
+            id: "message-after-revert-final",
+            role: "assistant",
+            text: "Forward-only response",
+            turnId: nextTurnId,
+            at: "2026-08-19T10:00:35.000Z",
+          });
+          yield* harness.setThread(
+            thread({
+              turnId: nextTurnId,
+              state: "completed",
+              requestedAt: "2026-08-19T10:00:30.000Z",
+              messages: [nextFinal],
+              terminalAt: "2026-08-19T10:00:40.000Z",
+            }),
+          );
+          yield* harness.publish(
+            assistantEvent({
+              turnId: nextTurnId,
+              messageId: "message-after-revert-final",
+              at: nextFinal.updatedAt,
+            }),
+          );
+
+          expect((yield* harness.fake.sent).map((entry) => entry.content.body)).toEqual([
+            "Forward-only response",
+          ]);
+        }),
+      {
+        initialThread: thread({
+          turnId: revertedTurnId,
+          state: "completed",
+          requestedAt: "2026-08-19T10:00:00.000Z",
+          messages: [revertedFinal],
+        }),
+        lastDeliveredTurnId: deliveredTurnId,
+        deliveryBaselineSequence: 2,
+        historicalEvents: [
+          atSequence(
+            assistantEvent({
+              turnId: revertedTurnId,
+              messageId: "message-before-revert-final",
+              at: revertedFinal.updatedAt,
+            }),
+            1,
+          ),
+        ],
+      },
+    );
+  },
+);
 
 it.effect("does not redeliver the persisted terminal owner turn on startup", () => {
   const turnId = TurnId.make("turn-already-delivered");
@@ -716,6 +845,39 @@ it.effect("sends only the final text after two mid-turn assistant completions an
       expect(sent.map((entry) => entry.content.body)).toEqual(["The final projected answer."]);
       expect(Option.getOrThrow(yield* harness.currentConfig).lastDeliveredTurnId).toBe(turnId);
     }),
+  ),
+);
+
+it.effect("bridges completed and interrupted turns but never errored partial text", () =>
+  Effect.forEach(
+    [
+      { state: "completed", expected: ["Visible completed response"] },
+      { state: "interrupted", expected: ["Visible interrupted response"] },
+      { state: "error", expected: [] },
+    ] as const,
+    ({ state, expected }) =>
+      withHarness((harness) =>
+        Effect.gen(function* () {
+          const turnId = TurnId.make(`turn-terminal-state-${state}`);
+          const final = message({
+            id: `message-terminal-state-${state}`,
+            role: "assistant",
+            text: `Visible ${state} response`,
+            turnId,
+            at: "2026-08-19T10:00:09.000Z",
+          });
+          yield* harness.setThread(thread({ turnId, state, messages: [final] }));
+          yield* harness.publish(
+            assistantEvent({
+              turnId,
+              messageId: `message-terminal-state-${state}`,
+              at: final.updatedAt,
+            }),
+          );
+
+          expect((yield* harness.fake.sent).map((entry) => entry.content.body)).toEqual(expected);
+        }),
+      ),
   ),
 );
 
@@ -972,7 +1134,7 @@ it.effect("uses projected text and dedupes repeated terminal events after the te
   ),
 );
 
-it.effect("sends one projected completion for each separate turn", () =>
+it.effect("delivers later-sequence turns even when their timestamps regress", () =>
   withHarness((harness) =>
     Effect.gen(function* () {
       const firstTurn = TurnId.make("turn-one");
@@ -1017,6 +1179,7 @@ it.effect("sends one projected completion for each separate turn", () =>
         thread({
           turnId: secondTurn,
           state: "completed",
+          requestedAt: "2026-08-18T10:00:00.000Z",
           messages: [firstFinal, secondUser, secondFinal],
           terminalAt: "2026-08-19T10:00:09.000Z",
         }),
@@ -1140,12 +1303,38 @@ it.effect("drops an old owner mid-turn and clears archived, deleted, and unset o
       );
 
       yield* harness.setOwner(threadB);
+      yield* harness.setThread(
+        thread({
+          threadId: threadB,
+          turnId: silentTurn,
+          state: "completed",
+          messages: [silentFinal],
+          archivedAt: "2026-08-19T10:00:08.000Z",
+        }),
+      );
       yield* harness.publishWithoutDrain(
         lifecycleEvent("thread.archived", threadB, "2026-08-19T10:00:08.000Z"),
       );
       yield* harness.awaitOwner(null);
 
+      yield* harness.setThread(
+        thread({
+          threadId: threadB,
+          turnId: silentTurn,
+          state: "completed",
+          messages: [silentFinal],
+        }),
+      );
       yield* harness.setOwner(threadB);
+      yield* harness.setThread(
+        thread({
+          threadId: threadB,
+          turnId: silentTurn,
+          state: "completed",
+          messages: [silentFinal],
+          deletedAt: "2026-08-19T10:00:09.000Z",
+        }),
+      );
       yield* harness.publishWithoutDrain(
         lifecycleEvent("thread.deleted", threadB, "2026-08-19T10:00:09.000Z"),
       );
@@ -1154,6 +1343,90 @@ it.effect("drops an old owner mid-turn and clears archived, deleted, and unset o
       expect((yield* harness.fake.sent).map((entry) => entry.content.body)).toEqual([
         "B final is delivered",
       ]);
+    }),
+  ),
+);
+
+it.effect("keeps new ownership when a stale archive event finishes after unarchive", () =>
+  Effect.gen(function* () {
+    const turnId = TurnId.make("turn-stale-archive-owner");
+    const final = message({
+      id: "message-stale-archive-owner",
+      role: "assistant",
+      text: "Existing owner response",
+      turnId,
+      at: "2026-08-19T10:00:09.000Z",
+    });
+    const activeThread = thread({
+      threadId: threadB,
+      turnId,
+      state: "completed",
+      messages: [final],
+    });
+    const archivedThread = thread({
+      threadId: threadB,
+      turnId,
+      state: "completed",
+      messages: [final],
+      archivedAt: "2026-08-19T10:00:20.000Z",
+    });
+
+    return yield* withHarness(
+      (harness) =>
+        Effect.gen(function* () {
+          const inspectionGate = yield* Deferred.make<void>();
+          yield* harness.setThread(archivedThread);
+          yield* harness.blockNextInspection(inspectionGate);
+          yield* harness.publishWithoutDrain(
+            lifecycleEvent("thread.archived", threadB, "2026-08-19T10:00:20.000Z"),
+          );
+          yield* harness.awaitInspection;
+
+          yield* harness.setThread(activeThread);
+          yield* harness.setOwner(threadB);
+          yield* Deferred.succeed(inspectionGate, undefined);
+          yield* harness.reactor.drain;
+
+          expect(Option.getOrThrow(yield* harness.currentConfig).ownerThreadId).toBe(threadB);
+        }),
+      {
+        initialOwner: threadB,
+        initialThread: activeThread,
+        lastDeliveredTurnId: turnId,
+        deliveryBaselineSequence: 1,
+      },
+    );
+  }),
+);
+
+it.effect("drops permanent transport failures after one attempt", () =>
+  withHarness((harness) =>
+    Effect.gen(function* () {
+      const turnId = TurnId.make("turn-permanent-send-failure");
+      const final = message({
+        id: "message-permanent-send-failure",
+        role: "assistant",
+        text: "Do not retry permanently",
+        turnId,
+        at: "2026-08-19T10:00:09.000Z",
+      });
+      yield* harness.setThread(thread({ turnId, state: "completed", messages: [final] }));
+      yield* harness.fake.failNextSends(1, "permanent");
+      yield* harness.publishWithoutDrain(
+        assistantEvent({
+          turnId,
+          messageId: "message-permanent-send-failure",
+          at: final.updatedAt,
+        }),
+      );
+      const drainFiber = yield* harness.reactor.drain.pipe(Effect.forkChild);
+      yield* harness.fake.awaitAttemptCount(1);
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust("1 second");
+      yield* Fiber.join(drainFiber);
+
+      expect(yield* harness.fake.attempts).toHaveLength(1);
+      expect(yield* harness.fake.sent).toEqual([]);
     }),
   ),
 );

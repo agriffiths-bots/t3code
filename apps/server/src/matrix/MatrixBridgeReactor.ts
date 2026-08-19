@@ -32,6 +32,7 @@ const MATRIX_BRIDGE_SEEN_TURN_CAPACITY = 1_024;
 interface TerminalCandidate {
   readonly threadId: ThreadId;
   readonly turnId: TurnId;
+  readonly sequence: number;
   readonly ownershipEpoch: number;
   readonly cryptoStoreGeneration: string;
 }
@@ -153,13 +154,18 @@ function projectedTerminalAt(
   const latestTurn = thread.latestTurn;
   if (
     latestTurn?.turnId === turnId &&
-    (latestTurn.state === "completed" ||
-      latestTurn.state === "interrupted" ||
-      latestTurn.state === "error")
+    (latestTurn.state === "completed" || latestTurn.state === "interrupted")
   ) {
     return latestTurn.completedAt ?? latestTurn.startedAt ?? latestTurn.requestedAt;
   }
   return awarenessCompleted(thread) ? fallbackAt : null;
+}
+
+function isAfterDeliveryBaseline(
+  config: MatrixBridgeConfigV1,
+  candidate: TerminalCandidate,
+): boolean {
+  return candidate.sequence > config.deliveryBaselineSequence;
 }
 
 function rememberBounded(
@@ -265,7 +271,8 @@ export const make = Effect.gen(function* () {
     return (
       candidateMatchesConfig(current, job) &&
       current.roomId === job.roomId &&
-      current.lastDeliveredTurnId !== job.turnId
+      current.lastDeliveredTurnId !== job.turnId &&
+      isAfterDeliveryBaseline(current, job)
     );
   });
 
@@ -289,6 +296,7 @@ export const make = Effect.gen(function* () {
               cryptoStoreGeneration: job.cryptoStoreGeneration,
               roomId: job.roomId,
               turnId: job.turnId,
+              turnSequence: job.sequence,
             }),
           )
         : yield* Effect.result(
@@ -302,6 +310,25 @@ export const make = Effect.gen(function* () {
         if (sent) return;
         sent = true;
         continue;
+      }
+
+      if (
+        !sent &&
+        result.failure._tag === "MatrixBridgeClientError" &&
+        result.failure.retryability === "permanent"
+      ) {
+        yield* Effect.logWarning("Matrix bridge dropped a permanent outbound failure", {
+          threadId: job.threadId,
+          turnId: job.turnId,
+          attempts: attempt + 1,
+        });
+        yield* configService.reportPermanentSendFailureIfMatches({
+          ownerThreadId: job.threadId,
+          ownershipEpoch: job.ownershipEpoch,
+          cryptoStoreGeneration: job.cryptoStoreGeneration,
+          roomId: job.roomId,
+        });
+        return;
       }
 
       const now = yield* Clock.currentTimeMillis;
@@ -336,7 +363,8 @@ export const make = Effect.gen(function* () {
       const current = currentOwner(yield* configService.currentConfig, candidate.threadId);
       if (
         !candidateMatchesConfig(current, candidate) ||
-        current.lastDeliveredTurnId === candidate.turnId
+        current.lastDeliveredTurnId === candidate.turnId ||
+        !isAfterDeliveryBaseline(current, candidate)
       ) {
         forgetPendingCandidate(candidate);
         return;
@@ -386,7 +414,8 @@ export const make = Effect.gen(function* () {
       const afterRead = currentOwner(yield* configService.currentConfig, candidate.threadId);
       if (
         !candidateMatchesConfig(afterRead, candidate) ||
-        afterRead.lastDeliveredTurnId === candidate.turnId
+        afterRead.lastDeliveredTurnId === candidate.turnId ||
+        !isAfterDeliveryBaseline(afterRead, candidate)
       ) {
         forgetPendingCandidate(candidate);
         return;
@@ -492,26 +521,51 @@ export const make = Effect.gen(function* () {
       yield* scheduleTerminalCandidate(candidate, true);
     });
 
-  const clearInactiveOwner = (threadId: ThreadId) =>
-    Effect.gen(function* () {
-      pendingCandidates.delete(threadId);
-      scheduledCandidates.delete(threadId);
-      trailingCandidates.delete(threadId);
-      const current = currentOwner(yield* configService.currentConfig, threadId);
-      if (current === null) return;
-      yield* configService
-        .clearOwnerIfMatches({
-          ownerThreadId: threadId,
-          ownershipEpoch: current.ownershipEpoch,
-        })
-        .pipe(
-          Effect.catchCause(() =>
-            Effect.logWarning("Matrix bridge failed to clear archived or deleted owner", {
-              threadId,
-            }),
-          ),
-        );
-    });
+  const clearInactiveOwner = Effect.fn("MatrixBridgeReactor.clearInactiveOwner")(
+    function* (threadId: ThreadId) {
+      const beforeRead = currentOwner(yield* configService.currentConfig, threadId);
+      if (beforeRead === null) return;
+
+      const detail = yield* projection.getThreadDetailById(threadId);
+      if (
+        Option.isSome(detail) &&
+        detail.value.archivedAt === null &&
+        detail.value.deletedAt === null
+      ) {
+        return;
+      }
+
+      const afterRead = currentOwner(yield* configService.currentConfig, threadId);
+      if (
+        afterRead === null ||
+        afterRead.ownershipEpoch !== beforeRead.ownershipEpoch ||
+        afterRead.cryptoStoreGeneration !== beforeRead.cryptoStoreGeneration
+      ) {
+        return;
+      }
+
+      for (const candidates of [pendingCandidates, scheduledCandidates, trailingCandidates]) {
+        const candidate = candidates.get(threadId);
+        if (
+          candidate !== undefined &&
+          candidate.ownershipEpoch === beforeRead.ownershipEpoch &&
+          candidate.cryptoStoreGeneration === beforeRead.cryptoStoreGeneration
+        ) {
+          candidates.delete(threadId);
+        }
+      }
+
+      yield* configService.clearOwnerIfMatches({
+        ownerThreadId: threadId,
+        ownershipEpoch: beforeRead.ownershipEpoch,
+      });
+    },
+    Effect.catchCause((cause) =>
+      Cause.hasInterruptsOnly(cause)
+        ? Effect.interrupt
+        : Effect.logWarning("Matrix bridge failed to clear archived or deleted owner"),
+    ),
+  );
 
   const reconcileOwnerAtStartup = Effect.fn("MatrixBridgeReactor.reconcileOwnerAtStartup")(
     function* () {
@@ -526,29 +580,27 @@ export const make = Effect.gen(function* () {
       }
 
       const ownerThreadId = config.ownerThreadId;
-      const detail = yield* projection.getThreadDetailById(ownerThreadId);
+      const detailSnapshot = yield* projection.getThreadDetailSnapshot(ownerThreadId);
       if (
-        Option.isNone(detail) ||
-        detail.value.archivedAt !== null ||
-        detail.value.deletedAt !== null
+        Option.isNone(detailSnapshot) ||
+        detailSnapshot.value.thread.archivedAt !== null ||
+        detailSnapshot.value.thread.deletedAt !== null
       ) {
         yield* clearInactiveOwner(ownerThreadId);
         return;
       }
 
-      const latestTurn = detail.value.latestTurn;
+      const detail = detailSnapshot.value.thread;
+      const latestTurn = detail.latestTurn;
       if (!config.deliveryCheckpointInitialized) {
-        const baselineTurnId =
-          latestTurn !== null &&
-          projectedTerminalAt(detail.value, latestTurn.turnId, detail.value.updatedAt) !== null
-            ? latestTurn.turnId
-            : null;
+        const baselineTurnId = latestTurn?.turnId ?? null;
         const initialized = yield* configService.initializeDeliveryCheckpointIfMissing({
           ownerThreadId,
           ownershipEpoch: config.ownershipEpoch,
           cryptoStoreGeneration: config.cryptoStoreGeneration,
           roomId: config.roomId,
           baselineTurnId,
+          baselineSequence: detailSnapshot.value.snapshotSequence,
         });
         if (!initialized) return;
         if (baselineTurnId !== null) {
@@ -560,19 +612,36 @@ export const make = Effect.gen(function* () {
         config = {
           ...config,
           lastDeliveredTurnId: null,
+          deliveryBaselineSequence: detailSnapshot.value.snapshotSequence,
           deliveryCheckpointInitialized: true,
         };
       }
 
       if (latestTurn === null || config.lastDeliveredTurnId === latestTurn.turnId) return;
+      const recoveryEvent = yield* orchestrationEngine
+        .readEvents(config.deliveryBaselineSequence, Number.MAX_SAFE_INTEGER)
+        .pipe(
+          Stream.filter(
+            (event) =>
+              event.type === "thread.message-sent" &&
+              event.payload.threadId === ownerThreadId &&
+              event.payload.role === "assistant" &&
+              event.payload.streaming === false &&
+              event.payload.turnId === latestTurn.turnId,
+          ),
+          Stream.runHead,
+        );
+      if (Option.isNone(recoveryEvent)) return;
+
       const candidate = {
         threadId: ownerThreadId,
         turnId: latestTurn.turnId,
+        sequence: recoveryEvent.value.sequence,
         ownershipEpoch: config.ownershipEpoch,
         cryptoStoreGeneration: config.cryptoStoreGeneration,
       };
       retainPendingCandidate(candidate);
-      yield* inspectProjectedCandidate(candidate, detail);
+      yield* inspectProjectedCandidate(candidate, Option.some(detail));
     },
     Effect.catchCause((cause) =>
       Cause.hasInterruptsOnly(cause)
@@ -604,6 +673,7 @@ export const make = Effect.gen(function* () {
       const candidate = {
         threadId: event.payload.threadId,
         turnId: event.payload.turnId as TurnId,
+        sequence: event.sequence,
         ownershipEpoch: current.ownershipEpoch,
         cryptoStoreGeneration: current.cryptoStoreGeneration,
       };

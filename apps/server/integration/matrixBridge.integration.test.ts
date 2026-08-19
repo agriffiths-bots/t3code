@@ -86,6 +86,7 @@ it.live("observes a real projected final through the fake Matrix client", () =>
           ownershipEpoch: NonNegativeInt.make(1),
           cryptoStoreGeneration: "integration-generation",
           lastDeliveredTurnId: null,
+          deliveryBaselineSequence: NonNegativeInt.make(0),
           deliveryCheckpointInitialized: true,
         };
         const configLayer = Layer.succeed(
@@ -101,6 +102,7 @@ it.live("observes a real projected final through the fake Matrix client", () =>
               Effect.die("clearOwnerIfMatches is not used by this integration test"),
             initializeDeliveryCheckpointIfMissing: () => Effect.succeed(true),
             markDeliveredIfMatches: () => Effect.succeed(true),
+            reportPermanentSendFailureIfMatches: () => Effect.succeed(true),
           }),
         );
         const dependencies = Layer.mergeAll(
