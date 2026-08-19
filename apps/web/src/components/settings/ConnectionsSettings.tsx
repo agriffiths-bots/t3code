@@ -6,7 +6,7 @@ import {
   TerminalIcon,
 } from "lucide-react";
 import { useAtomValue } from "@effect/atom-react";
-import { type ReactNode, memo, useCallback, useId, useMemo, useState } from "react";
+import { type ReactNode, memo, useCallback, useEffect, useId, useMemo, useState } from "react";
 import {
   AuthAccessReadScope,
   AuthAccessWriteScope,
@@ -41,6 +41,7 @@ import { cn } from "../../lib/utils";
 import { formatElapsedDurationLabel, formatExpiresInLabel } from "../../timestampFormat";
 import { resolveDesktopPairingUrl, resolveHostedPairingUrl } from "./pairingUrls";
 import {
+  activeMatrixBridgePairingCode,
   applyWslEnableSelection,
   EMPTY_MATRIX_BRIDGE_DRAFT,
   isQrShareableEndpoint,
@@ -54,6 +55,7 @@ import {
   parseRemotePairingHostChange,
   parseRemotePairingFields,
   selectQrEndpointOption,
+  type MatrixBridgePairingCode,
 } from "./ConnectionsSettings.logic";
 import {
   SettingsPageContainer,
@@ -1673,6 +1675,52 @@ function EmptyRemoteEnvironments({ cloudEnabled = true }: { readonly cloudEnable
 }
 
 /**
+ * The minted code, for as long as it can still be redeemed. Mounted only while
+ * a code exists, so its one-second tick (the same one the pairing-link rows
+ * use to keep their relative expiry honest) costs nothing the rest of the time.
+ */
+function MatrixBridgePairingCodeRow({
+  code,
+  onExpired,
+  onCopy,
+}: {
+  readonly code: MatrixBridgePairingCode;
+  readonly onExpired: () => void;
+  readonly onCopy: (credential: string, context: undefined) => void;
+}) {
+  const nowMs = useRelativeTimeTick(1_000);
+  const active = activeMatrixBridgePairingCode(code, nowMs);
+
+  useEffect(() => {
+    if (active === null) {
+      // Drop the dead credential from state too, rather than only hiding it.
+      onExpired();
+    }
+  }, [active, onExpired]);
+
+  if (active === null) {
+    return null;
+  }
+
+  return (
+    <div className="flex items-center gap-2 pt-3">
+      <RedactedSensitiveText
+        value={active.credential}
+        ariaLabel="Matrix pairing code"
+        revealTooltip="Reveal pairing code"
+        hideTooltip="Hide pairing code"
+      />
+      <Button size="xs" variant="ghost" onClick={() => onCopy(active.credential, undefined)}>
+        Copy
+      </Button>
+      <span className="text-xs text-muted-foreground">
+        {formatExpiresInLabel(new Date(active.expiresAtMs).toISOString(), nowMs)}
+      </span>
+    </div>
+  );
+}
+
+/**
  * Matrix bridge subsection.
  *
  * Deliberately a subsection of Connections rather than its own Settings page:
@@ -1700,7 +1748,7 @@ function MatrixBridgeSection({
   const [draft, setDraft] = useState(EMPTY_MATRIX_BRIDGE_DRAFT);
   const [formError, setFormError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [pairingCode, setPairingCode] = useState<string | null>(null);
+  const [pairingCode, setPairingCode] = useState<MatrixBridgePairingCode | null>(null);
   const [isCreatingPairingCode, setIsCreatingPairingCode] = useState(false);
   const { copyToClipboard: copyPairingCode } = useCopyToClipboard({
     target: "pairing code",
@@ -1775,6 +1823,10 @@ function MatrixBridgeSection({
     }
   }, [disconnectBridge, environmentId]);
 
+  const clearPairingCode = useCallback(() => {
+    setPairingCode(null);
+  }, []);
+
   const handleCreatePairingCode = useCallback(async () => {
     setIsCreatingPairingCode(true);
     try {
@@ -1785,7 +1837,10 @@ function MatrixBridgeSection({
         label: "Matrix bridge",
         scopes: [AuthOrchestrationReadScope],
       });
-      setPairingCode(credential.credential);
+      setPairingCode({
+        credential: credential.credential,
+        expiresAtMs: DateTime.toEpochMillis(credential.expiresAt),
+      });
     } catch (error) {
       toastManager.add(
         stackedThreadToast({
@@ -1925,21 +1980,11 @@ function MatrixBridgeSection({
             }
           >
             {pairingCode ? (
-              <div className="flex items-center gap-2 pt-3">
-                <RedactedSensitiveText
-                  value={pairingCode}
-                  ariaLabel="Matrix pairing code"
-                  revealTooltip="Reveal pairing code"
-                  hideTooltip="Hide pairing code"
-                />
-                <Button
-                  size="xs"
-                  variant="ghost"
-                  onClick={() => copyPairingCode(pairingCode, undefined)}
-                >
-                  Copy
-                </Button>
-              </div>
+              <MatrixBridgePairingCodeRow
+                code={pairingCode}
+                onExpired={clearPairingCode}
+                onCopy={copyPairingCode}
+              />
             ) : null}
           </SettingsRow>
         </>

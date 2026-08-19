@@ -296,6 +296,28 @@ export function showMatrixBridgeDisconnect(mode: MatrixBridgeConnectionMode): bo
   return mode !== "connect";
 }
 
+/**
+ * A minted pairing credential and the moment it stops being redeemable. The
+ * server's one-time credentials expire in minutes, so the panel keeps the
+ * expiry rather than the bare string.
+ */
+export interface MatrixBridgePairingCode {
+  readonly credential: string;
+  readonly expiresAtMs: number;
+}
+
+/**
+ * The code only while it can still be consumed. An expired credential is worth
+ * less than nothing on screen: sending it fails the pairing attempt and reads
+ * as a broken bridge rather than a stale code.
+ */
+export function activeMatrixBridgePairingCode(
+  code: MatrixBridgePairingCode | null,
+  nowMs: number,
+): MatrixBridgePairingCode | null {
+  return code !== null && code.expiresAtMs > nowMs ? code : null;
+}
+
 export function parseMatrixBridgeAllowedUserIds(raw: string): ReadonlyArray<string> {
   const userIds = [...new Set(raw.split(/[\s,]+/u).filter((value) => value.length > 0))];
   if (userIds.length === 0) {

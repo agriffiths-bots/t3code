@@ -24,7 +24,7 @@ const baseState: ThreadActionMenuState = {
   matrixBridge: {
     supported: false,
     canOperate: true,
-    ownerThreadId: null,
+    ownership: { kind: "owner", ownerThreadId: null },
     threadId: thisThread,
   },
 };
@@ -86,7 +86,7 @@ describe("buildThreadActionMenuItems", () => {
         matrixBridge: {
           supported: true,
           canOperate: true,
-          ownerThreadId: null,
+          ownership: { kind: "owner", ownerThreadId: null },
           threadId: thisThread,
         },
       }),
@@ -95,12 +95,14 @@ describe("buildThreadActionMenuItems", () => {
 });
 
 describe("buildMatrixBridgeMenuItems", () => {
+  const owner = (ownerThreadId: ThreadId | null) => ({ kind: "owner", ownerThreadId }) as const;
+
   it("offers nothing when the server does not support the bridge", () => {
     expect(
       buildMatrixBridgeMenuItems({
         supported: false,
         canOperate: true,
-        ownerThreadId: otherThread,
+        ownership: owner(otherThread),
         threadId: thisThread,
       }),
     ).toEqual([]);
@@ -111,10 +113,36 @@ describe("buildMatrixBridgeMenuItems", () => {
       buildMatrixBridgeMenuItems({
         supported: true,
         canOperate: false,
-        ownerThreadId: thisThread,
+        ownership: owner(thisThread),
         threadId: thisThread,
       }),
     ).toEqual([]);
+  });
+
+  it("offers nothing while the server holds no bridge configuration", () => {
+    // setOwner would reject this with notConfigured, and a standard client
+    // without access:write could not resolve that failure itself.
+    expect(
+      buildMatrixBridgeMenuItems({
+        supported: true,
+        canOperate: true,
+        ownership: { kind: "unconfigured" },
+        threadId: thisThread,
+      }),
+    ).toEqual([]);
+  });
+
+  it("shows an unreadable status as disabled rather than guessing there is no owner", () => {
+    expect(
+      buildMatrixBridgeMenuItems({
+        supported: true,
+        canOperate: true,
+        ownership: { kind: "unknown" },
+        threadId: thisThread,
+      }),
+    ).toEqual([
+      { id: "bridge-to-matrix", label: "Matrix bridge status unavailable", disabled: true },
+    ]);
   });
 
   it("offers to bridge when no thread owns the bridge", () => {
@@ -122,7 +150,7 @@ describe("buildMatrixBridgeMenuItems", () => {
       buildMatrixBridgeMenuItems({
         supported: true,
         canOperate: true,
-        ownerThreadId: null,
+        ownership: owner(null),
         threadId: thisThread,
       }),
     ).toEqual([{ id: "bridge-to-matrix", label: "Bridge to Matrix" }]);
@@ -133,7 +161,7 @@ describe("buildMatrixBridgeMenuItems", () => {
       buildMatrixBridgeMenuItems({
         supported: true,
         canOperate: true,
-        ownerThreadId: otherThread,
+        ownership: owner(otherThread),
         threadId: thisThread,
       }),
     ).toEqual([{ id: "bridge-to-matrix", label: "Move Matrix bridge here" }]);
@@ -144,7 +172,7 @@ describe("buildMatrixBridgeMenuItems", () => {
       buildMatrixBridgeMenuItems({
         supported: true,
         canOperate: true,
-        ownerThreadId: thisThread,
+        ownership: owner(thisThread),
         threadId: thisThread,
       }),
     ).toEqual([{ id: "unbridge-matrix", label: "Stop Matrix bridge" }]);

@@ -14,6 +14,7 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   canOperateMatrixBridge,
   matrixBridgeFailureMessage,
+  matrixBridgeOwnership,
   matrixBridgeStatusView,
   selectMatrixBridgeMenuState,
   selectMatrixBridgeStatusView,
@@ -76,12 +77,35 @@ describe("canOperateMatrixBridge", () => {
   });
 });
 
+describe("matrixBridgeOwnership", () => {
+  it("reports no configuration rather than an empty owner when the bridge is off", () => {
+    expect(
+      matrixBridgeOwnership({
+        kind: "status",
+        status: { ...activeStatus, state: "disabled", ownerThreadId: null },
+      }),
+    ).toEqual({ kind: "unconfigured" });
+  });
+
+  it("keeps an unreadable status unknown, so an operate-only session is not told there is no owner", () => {
+    expect(matrixBridgeOwnership({ kind: "unavailable" })).toEqual({ kind: "unknown" });
+    expect(matrixBridgeOwnership({ kind: "pending" })).toEqual({ kind: "unknown" });
+  });
+
+  it("reports the owner pointer once the status is readable", () => {
+    expect(matrixBridgeOwnership({ kind: "status", status: activeStatus })).toEqual({
+      kind: "owner",
+      ownerThreadId: ownerThread,
+    });
+  });
+});
+
 describe("selectMatrixBridgeMenuState", () => {
   it("routes each thread to its own environment's bridge", () => {
     expect(selectMatrixBridgeMenuState(states, scopeThreadRef(environmentA, otherThread))).toEqual({
       supported: true,
       canOperate: true,
-      ownerThreadId: ownerThread,
+      ownership: { kind: "owner", ownerThreadId: ownerThread },
       threadId: otherThread,
     });
   });
@@ -90,18 +114,18 @@ describe("selectMatrixBridgeMenuState", () => {
     expect(selectMatrixBridgeMenuState(states, scopeThreadRef(environmentB, otherThread))).toEqual({
       supported: false,
       canOperate: false,
-      ownerThreadId: null,
+      ownership: { kind: "unknown" },
       threadId: otherThread,
     });
   });
 
-  it("has no owner before the status subscription delivers one", () => {
+  it("has unknown ownership before the status subscription delivers one", () => {
     const pending = new Map([
       [environmentA, { statusView: { kind: "pending" } as const, canOperate: true }],
     ]);
     expect(
       selectMatrixBridgeMenuState(pending, scopeThreadRef(environmentA, otherThread)),
-    ).toMatchObject({ supported: true, ownerThreadId: null });
+    ).toMatchObject({ supported: true, ownership: { kind: "unknown" } });
   });
 });
 

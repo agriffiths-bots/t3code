@@ -16,7 +16,10 @@ import { AsyncResult, Atom } from "effect/unstable/reactivity";
 
 import { environmentCatalog } from "../connection/catalog";
 import { connectionAtomRuntime } from "../connection/runtime";
-import type { MatrixBridgeMenuState } from "../components/threadActionMenu.logic";
+import type {
+  MatrixBridgeMenuState,
+  MatrixBridgeOwnership,
+} from "../components/threadActionMenu.logic";
 import { environmentServerConfigsAtom } from "./server";
 import { environmentSession } from "./session";
 
@@ -131,16 +134,30 @@ export const matrixBridgeStatesAtom = Atom.make((get) => {
  * server that owns it, never another connected backend's. A missing entry is
  * an environment without the capability, which renders no bridge controls.
  */
+/**
+ * `disabled` is the one lifecycle state that means the server holds no bridge
+ * configuration at all, so `setOwner` would reject it with `notConfigured`.
+ * Every other state has a stored configuration and a meaningful owner pointer.
+ */
+export function matrixBridgeOwnership(view: MatrixBridgeStatusView): MatrixBridgeOwnership {
+  if (view.kind !== "status") {
+    return { kind: "unknown" };
+  }
+  if (view.status.state === "disabled") {
+    return { kind: "unconfigured" };
+  }
+  return { kind: "owner", ownerThreadId: view.status.ownerThreadId };
+}
+
 export function selectMatrixBridgeMenuState(
   states: ReadonlyMap<EnvironmentId, MatrixBridgeEnvironmentState>,
   threadRef: ScopedThreadRef,
 ): MatrixBridgeMenuState {
   const state = states.get(threadRef.environmentId);
-  const statusView = state?.statusView;
   return {
     supported: state !== undefined,
     canOperate: state?.canOperate ?? false,
-    ownerThreadId: statusView?.kind === "status" ? statusView.status.ownerThreadId : null,
+    ownership: matrixBridgeOwnership(state?.statusView ?? PENDING_STATUS_VIEW),
     threadId: threadRef.threadId,
   };
 }

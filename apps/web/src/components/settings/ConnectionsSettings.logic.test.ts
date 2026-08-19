@@ -2,6 +2,7 @@ import type { DesktopWslState, MatrixBridgeStatus } from "@t3tools/contracts";
 import { ThreadId } from "@t3tools/contracts";
 import { describe, expect, it, vi } from "vite-plus/test";
 import {
+  activeMatrixBridgePairingCode,
   applyWslEnableSelection,
   matrixBridgeConnectionMode,
   matrixBridgeDraftAfterConfigure,
@@ -313,5 +314,24 @@ describe("Matrix bridge connection form", () => {
       accessToken: "",
       allowedUserIds: "@you:beeper.com\n@phone:beeper.com",
     });
+  });
+});
+
+describe("activeMatrixBridgePairingCode", () => {
+  const code = { credential: "pair_abc", expiresAtMs: 1_000 };
+
+  it("shows a code that can still be redeemed", () => {
+    expect(activeMatrixBridgePairingCode(code, 999)).toEqual(code);
+  });
+
+  it("stops presenting a code the server would no longer consume", () => {
+    // One-time credentials expire in minutes; a panel left open must not keep
+    // offering a code whose only outcome is a failed pairing attempt.
+    expect(activeMatrixBridgePairingCode(code, 1_000)).toBeNull();
+    expect(activeMatrixBridgePairingCode(code, 60_000)).toBeNull();
+  });
+
+  it("has nothing to show before a code is minted", () => {
+    expect(activeMatrixBridgePairingCode(null, 0)).toBeNull();
   });
 });
