@@ -157,9 +157,31 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
+/**
+ * Follow symlinks on both sides: a lexical compare is trivial to walk around.
+ * A path that does not exist yet still has to be resolved, so this walks up to
+ * the deepest ancestor that does exist, resolves that, and re-appends the rest.
+ */
+function realPathOrSelf(target) {
+  const absolute = NodePath.resolve(target);
+  const trailing = [];
+  let cursor = absolute;
+  for (;;) {
+    try {
+      return NodePath.join(NodeFS.realpathSync(cursor), ...trailing);
+    } catch {
+      const parent = NodePath.dirname(cursor);
+      if (parent === cursor) return absolute;
+      trailing.unshift(NodePath.basename(cursor));
+      cursor = parent;
+    }
+  }
+}
+
 function assertSafePath(target) {
-  const resolved = NodePath.resolve(target);
-  for (const forbidden of FORBIDDEN_PATHS) {
+  const resolved = realPathOrSelf(target);
+  for (const entry of FORBIDDEN_PATHS) {
+    const forbidden = realPathOrSelf(entry);
     if (resolved === forbidden || resolved.startsWith(`${forbidden}${NodePath.sep}`)) {
       throw new Error(`refusing to touch ${forbidden}`);
     }
@@ -212,17 +234,31 @@ async function waitHttpOk(url, timeoutMs = 20_000) {
   throw new Error(`timed out waiting for ${url}: ${lastError}`);
 }
 
+/**
+ * Short-lived helpers (`npm install`, the native downloader, the token CLI) get
+ * the same treatment as the long-lived servers: their own process group, a
+ * tracked record, and the shared terminate-then-kill sweep. A signal arriving
+ * mid-install would otherwise leave npm and its downloader descendants
+ * rewriting the shared SDK cache, or the token CLI reading a T3 home that
+ * teardown is deleting.
+ */
 function execFile(file, args, options = {}) {
   return new Promise((resolve, reject) => {
-    NodeChildProcess.execFile(file, args, { timeout: 180_000, ...options }, (error, out, err) => {
-      if (error) {
-        error.stdout = out;
-        error.stderr = err;
-        reject(error);
-        return;
-      }
-      resolve({ stdout: out, stderr: err });
-    });
+    const child = NodeChildProcess.execFile(
+      file,
+      args,
+      { timeout: 180_000, detached: true, ...options },
+      (error, out, err) => {
+        if (error) {
+          error.stdout = out;
+          error.stderr = err;
+          reject(error);
+          return;
+        }
+        resolve({ stdout: out, stderr: err });
+      },
+    );
+    if (child.pid != null) trackPid(child.pid, `helper ${NodePath.basename(file)}`, null, child);
   });
 }
 
@@ -994,7 +1030,11 @@ function startTurn(t3, threadId, text, modelSelection) {
  * differs between the two modes.
  */
 async function bringUp(mode) {
-  tempRoot = assertSafePath(NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-matrix-e2e-")));
+  // Check the real temp parent before writing into it: a TMPDIR under, or
+  // symlinked into, a live T3 home would otherwise be created first and only
+  // rejected afterwards, leaving a directory behind at best.
+  const tmpParent = assertSafePath(NodeOS.tmpdir());
+  tempRoot = assertSafePath(NodeFS.mkdtempSync(NodePath.join(tmpParent, "t3-matrix-e2e-")));
   NodeFS.chmodSync(tempRoot, 0o700);
   const t3Home = NodePath.join(tempRoot, "t3-home");
   const workspace = NodePath.join(tempRoot, "workspace");
