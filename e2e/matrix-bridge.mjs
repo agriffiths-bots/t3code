@@ -1967,6 +1967,14 @@ async function runReleaseGate(ctx) {
         assert(final.length > 0, `the ${label} probe turn produced no assistant final to suppress`);
       }
     }
+    // Bridging a control thread to get a drain witness does move the ownership
+    // epoch, so an implementation that wrongly queued the silent thread's final
+    // and then correctly discarded it on the epoch recheck is indistinguishable
+    // here from one that never queued it. That residual is deliberate: the
+    // product invariant is silence in the room, the count below already fails
+    // any implementation that actually sends while unowned, and a job that is
+    // queued but never sent has no observable consequence. Closing it properly
+    // needs an outbound-worker drain receipt, which the server does not expose.
     const witness = await bridgeWitness(threadA, `${marker}_OUT`, null);
     const texts = (await activeCli.request({ op: "messages", roomId, from: botMxid })).texts;
     assert(
