@@ -151,14 +151,17 @@ function projectedTerminalAt(
   turnId: TurnId,
   fallbackAt: string,
 ): string | null {
-  const latestTurn = thread.latestTurn;
+  const latestTurn =
+    thread.latestTurn?.turnId === turnId
+      ? thread.latestTurn
+      : (thread.turns.find((turn) => turn.turnId === turnId) ?? null);
   if (
-    latestTurn?.turnId === turnId &&
+    latestTurn !== null &&
     (latestTurn.state === "completed" || latestTurn.state === "interrupted")
   ) {
     return latestTurn.completedAt ?? latestTurn.startedAt ?? latestTurn.requestedAt;
   }
-  return awarenessCompleted(thread) ? fallbackAt : null;
+  return thread.latestTurn?.turnId === turnId && awarenessCompleted(thread) ? fallbackAt : null;
 }
 
 function isAfterDeliveryBaseline(
@@ -216,6 +219,15 @@ export const make = Effect.gen(function* () {
     left.cryptoStoreGeneration === right.cryptoStoreGeneration;
 
   const retainPendingCandidate = (candidate: TerminalCandidate) => {
+    const retained = pendingCandidates.get(candidate.threadId);
+    if (
+      retained !== undefined &&
+      retained.ownershipEpoch === candidate.ownershipEpoch &&
+      retained.cryptoStoreGeneration === candidate.cryptoStoreGeneration &&
+      retained.sequence > candidate.sequence
+    ) {
+      return false;
+    }
     for (const [threadId, pending] of pendingCandidates) {
       if (
         threadId !== candidate.threadId ||
@@ -226,6 +238,7 @@ export const make = Effect.gen(function* () {
       }
     }
     pendingCandidates.set(candidate.threadId, candidate);
+    return true;
   };
 
   const forgetPendingCandidate = (candidate: TerminalCandidate) => {
@@ -263,6 +276,14 @@ export const make = Effect.gen(function* () {
     config.deliveryCheckpointInitialized &&
     config.pairing.state === "paired" &&
     config.roomId !== null;
+
+  const candidateMatchesOwnerVersion = (
+    config: MatrixBridgeConfigV1 | null,
+    candidate: TerminalCandidate,
+  ) =>
+    config !== null &&
+    config.ownershipEpoch === candidate.ownershipEpoch &&
+    config.cryptoStoreGeneration === candidate.cryptoStoreGeneration;
 
   const ownerStillMatches = Effect.fn("MatrixBridgeReactor.ownerStillMatches")(function* (
     job: OutboundJob,
@@ -391,6 +412,19 @@ export const make = Effect.gen(function* () {
         return;
       }
 
+      const projectedTurn =
+        detail.value.latestTurn?.turnId === candidate.turnId
+          ? detail.value.latestTurn
+          : detail.value.turns.find((turn) => turn.turnId === candidate.turnId);
+      if (
+        projectedTurn?.state === "error" ||
+        (detail.value.latestTurn?.turnId === candidate.turnId &&
+          detail.value.session?.status === "error")
+      ) {
+        forgetPendingCandidate(candidate);
+        return;
+      }
+
       const finalMessage = detail.value.messages.findLast(
         (message) =>
           message.role === "assistant" &&
@@ -514,10 +548,11 @@ export const make = Effect.gen(function* () {
       const candidate = pendingCandidates.get(threadId);
       if (candidate === undefined || (turnId !== undefined && candidate.turnId !== turnId)) return;
       const current = currentOwner(yield* configService.currentConfig, threadId);
-      if (!candidateMatchesConfig(current, candidate)) {
+      if (!candidateMatchesOwnerVersion(current, candidate)) {
         forgetPendingCandidate(candidate);
         return;
       }
+      if (!candidateMatchesConfig(current, candidate)) return;
       yield* scheduleTerminalCandidate(candidate, true);
     });
 
@@ -593,28 +628,45 @@ export const make = Effect.gen(function* () {
       const detail = detailSnapshot.value.thread;
       const latestTurn = detail.latestTurn;
       if (!config.deliveryCheckpointInitialized) {
-        const baselineTurnId = latestTurn?.turnId ?? null;
+        const hasInFlightTurn = latestTurn?.state === "running";
+        const baselineTurnId = hasInFlightTurn ? null : (latestTurn?.turnId ?? null);
+        const baselineSequence = hasInFlightTurn
+          ? config.deliveryBaselineSequence
+          : detailSnapshot.value.snapshotSequence;
         const initialized = yield* configService.initializeDeliveryCheckpointIfMissing({
           ownerThreadId,
           ownershipEpoch: config.ownershipEpoch,
           cryptoStoreGeneration: config.cryptoStoreGeneration,
           roomId: config.roomId,
           baselineTurnId,
-          baselineSequence: detailSnapshot.value.snapshotSequence,
+          baselineSequence,
         });
         if (!initialized) return;
-        if (baselineTurnId !== null) {
-          pendingCandidates.delete(ownerThreadId);
-          scheduledCandidates.delete(ownerThreadId);
-          trailingCandidates.delete(ownerThreadId);
+
+        const initializedConfig = currentOwner(yield* configService.currentConfig, ownerThreadId);
+        if (
+          initializedConfig === null ||
+          initializedConfig.ownershipEpoch !== config.ownershipEpoch ||
+          initializedConfig.cryptoStoreGeneration !== config.cryptoStoreGeneration ||
+          !initializedConfig.deliveryCheckpointInitialized ||
+          initializedConfig.pairing.state !== "paired" ||
+          initializedConfig.roomId === null
+        ) {
           return;
         }
-        config = {
-          ...config,
-          lastDeliveredTurnId: null,
-          deliveryBaselineSequence: detailSnapshot.value.snapshotSequence,
-          deliveryCheckpointInitialized: true,
-        };
+        config = initializedConfig;
+        for (const candidates of [pendingCandidates, scheduledCandidates, trailingCandidates]) {
+          const candidate = candidates.get(ownerThreadId);
+          if (
+            candidate !== undefined &&
+            candidate.ownershipEpoch === config.ownershipEpoch &&
+            candidate.cryptoStoreGeneration === config.cryptoStoreGeneration &&
+            candidate.sequence <= config.deliveryBaselineSequence
+          ) {
+            candidates.delete(ownerThreadId);
+          }
+        }
+        yield* recheckPendingCandidate(ownerThreadId);
       }
 
       if (latestTurn === null || config.lastDeliveredTurnId === latestTurn.turnId) return;
@@ -640,8 +692,9 @@ export const make = Effect.gen(function* () {
         ownershipEpoch: config.ownershipEpoch,
         cryptoStoreGeneration: config.cryptoStoreGeneration,
       };
-      retainPendingCandidate(candidate);
-      yield* inspectProjectedCandidate(candidate, Option.some(detail));
+      if (retainPendingCandidate(candidate)) {
+        yield* inspectProjectedCandidate(candidate, Option.some(detail));
+      }
     },
     Effect.catchCause((cause) =>
       Cause.hasInterruptsOnly(cause)
@@ -677,8 +730,13 @@ export const make = Effect.gen(function* () {
         ownershipEpoch: current.ownershipEpoch,
         cryptoStoreGeneration: current.cryptoStoreGeneration,
       };
-      retainPendingCandidate(candidate);
-      if (current.deliveryCheckpointInitialized) {
+      if (!retainPendingCandidate(candidate)) return;
+      const refreshed = currentOwner(yield* configService.currentConfig, candidate.threadId);
+      if (!candidateMatchesOwnerVersion(refreshed, candidate)) {
+        forgetPendingCandidate(candidate);
+        return;
+      }
+      if (candidateMatchesConfig(refreshed, candidate)) {
         yield* scheduleTerminalCandidate(candidate);
       }
     });

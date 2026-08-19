@@ -77,6 +77,7 @@ function thread(input: {
   readonly turnId: TurnId;
   readonly state: "running" | "completed" | "interrupted" | "error";
   readonly messages: ReadonlyArray<OrchestrationMessage>;
+  readonly turns?: OrchestrationThread["turns"];
   readonly requestedAt?: string;
   readonly terminalAt?: string | null;
   readonly archivedAt?: string | null;
@@ -111,7 +112,7 @@ function thread(input: {
     branch: null,
     worktreePath: null,
     latestTurn,
-    turns: [latestTurn],
+    turns: input.turns ?? [latestTurn],
     createdAt: baseAt,
     updatedAt: terminalAt ?? baseAt,
     archivedAt: input.archivedAt ?? null,
@@ -279,6 +280,7 @@ interface ReactorHarness {
   readonly inspectionCount: Effect.Effect<number>;
   readonly blockNextInspection: (gate: Deferred.Deferred<void>) => Effect.Effect<void>;
   readonly awaitInspection: Effect.Effect<void>;
+  readonly awaitCheckpointInitialized: Effect.Effect<void>;
   readonly awaitOwner: (ownerThreadId: ThreadId | null) => Effect.Effect<void>;
 }
 
@@ -476,10 +478,10 @@ function withHarness<A, E>(
       } satisfies OrchestrationEngineShape);
       const inspectThread = Effect.gen(function* () {
         yield* Ref.update(inspectionCountRef, (count) => count + 1);
-        yield* Queue.offer(observedInspections, undefined);
         const detail = yield* Ref.get(detailRef);
         const snapshotSequence = NonNegativeInt.make(yield* Ref.get(sequenceRef));
         const gate = yield* Ref.getAndSet(inspectionGateRef, Option.none());
+        yield* Queue.offer(observedInspections, undefined);
         if (Option.isSome(gate)) yield* Deferred.await(gate.value);
         return { detail, snapshotSequence };
       });
@@ -545,6 +547,13 @@ function withHarness<A, E>(
           inspectionCount: Ref.get(inspectionCountRef),
           blockNextInspection: (gate) => Ref.set(inspectionGateRef, Option.some(gate)),
           awaitInspection: Queue.take(observedInspections),
+          awaitCheckpointInitialized: SubscriptionRef.changes(configRef).pipe(
+            Stream.filter(
+              (current) => Option.isSome(current) && current.value.deliveryCheckpointInitialized,
+            ),
+            Stream.runHead,
+            Effect.asVoid,
+          ),
           awaitOwner,
         });
       }).pipe(
@@ -595,6 +604,129 @@ it.effect("baselines a legacy terminal turn without replaying it on upgrade", ()
     },
   );
 });
+
+it.effect("delivers a legacy running turn after it becomes terminal", () => {
+  const turnId = TurnId.make("turn-legacy-running");
+  return withHarness(
+    (harness) =>
+      Effect.gen(function* () {
+        const migrated = Option.getOrThrow(yield* harness.currentConfig);
+        expect(migrated.lastDeliveredTurnId).toBe(null);
+        expect(migrated.deliveryCheckpointInitialized).toBe(true);
+
+        const final = message({
+          id: "message-legacy-running-final",
+          role: "assistant",
+          text: "Completed after migration",
+          turnId,
+          at: "2026-08-19T10:00:09.000Z",
+        });
+        yield* harness.setThread(thread({ turnId, state: "completed", messages: [final] }));
+        yield* harness.publish(
+          assistantEvent({
+            turnId,
+            messageId: "message-legacy-running-final",
+            at: final.updatedAt,
+          }),
+        );
+
+        expect((yield* harness.fake.sent).map((entry) => entry.content.body)).toEqual([
+          "Completed after migration",
+        ]);
+      }),
+    {
+      initialThread: thread({ turnId, state: "running", messages: [] }),
+      deliveryCheckpointInitialized: false,
+    },
+  );
+});
+
+it.effect("preserves a post-snapshot final during legacy checkpoint initialization", () =>
+  Effect.gen(function* () {
+    const activation = yield* Deferred.make<void>();
+    const snapshotGate = yield* Deferred.make<void>();
+    const snapshotTurnId = TurnId.make("turn-legacy-snapshot-running");
+    const snapshotSegment = message({
+      id: "message-legacy-snapshot-running",
+      role: "assistant",
+      text: "Historical in-flight response",
+      turnId: snapshotTurnId,
+      at: "2026-08-19T10:00:09.000Z",
+    });
+    const nextTurnId = TurnId.make("turn-during-legacy-initialization");
+    return yield* withHarness(
+      (harness) =>
+        Effect.gen(function* () {
+          yield* harness.blockNextInspection(snapshotGate);
+          yield* Deferred.succeed(activation, undefined);
+          yield* harness.awaitInspection;
+
+          const nextFinal = message({
+            id: "message-during-legacy-initialization",
+            role: "assistant",
+            text: "Captured after the migration snapshot",
+            turnId: nextTurnId,
+            at: "2026-08-19T10:00:20.000Z",
+          });
+          yield* harness.setThread(
+            thread({ turnId: nextTurnId, state: "running", messages: [nextFinal] }),
+          );
+          yield* harness.publishWithoutDrain(
+            assistantEvent({
+              turnId: nextTurnId,
+              messageId: "message-during-legacy-initialization",
+              at: nextFinal.updatedAt,
+            }),
+          );
+
+          const checkpointInitialized = yield* harness.awaitCheckpointInitialized.pipe(
+            Effect.forkChild,
+          );
+          yield* Deferred.succeed(snapshotGate, undefined);
+          yield* Fiber.join(checkpointInitialized);
+          yield* harness.reactor.drain;
+
+          expect(yield* harness.fake.sent).toEqual([]);
+          yield* harness.setThread(
+            thread({ turnId: nextTurnId, state: "completed", messages: [nextFinal] }),
+          );
+          yield* harness.publish(
+            terminalMarkerEvent({
+              kind: "turn-diff",
+              turnId: nextTurnId,
+              at: "2026-08-19T10:00:30.000Z",
+            }),
+          );
+
+          expect((yield* harness.fake.sent).map((entry) => entry.content.body)).toEqual([
+            "Captured after the migration snapshot",
+          ]);
+          expect(Option.getOrThrow(yield* harness.currentConfig).lastDeliveredTurnId).toBe(
+            nextTurnId,
+          );
+        }),
+      {
+        activation: Deferred.await(activation),
+        initialThread: thread({
+          turnId: snapshotTurnId,
+          state: "running",
+          messages: [snapshotSegment],
+        }),
+        deliveryCheckpointInitialized: false,
+        historicalEvents: [
+          atSequence(
+            assistantEvent({
+              turnId: snapshotTurnId,
+              messageId: "message-legacy-snapshot-running",
+              at: snapshotSegment.updatedAt,
+            }),
+            1,
+          ),
+        ],
+      },
+    );
+  }),
+);
 
 it.effect("reconciles one undelivered terminal owner turn on startup", () => {
   const turnId = TurnId.make("turn-restart-window");
@@ -878,6 +1010,68 @@ it.effect("bridges completed and interrupted turns but never errored partial tex
           expect((yield* harness.fake.sent).map((entry) => entry.content.body)).toEqual(expected);
         }),
       ),
+  ),
+);
+
+it.effect("clears an errored candidate before a newer system-started turn settles", () =>
+  withHarness((harness) =>
+    Effect.gen(function* () {
+      const erroredTurnId = TurnId.make("turn-errored-pending");
+      const erroredPartial = message({
+        id: "message-errored-pending",
+        role: "assistant",
+        text: "Partial text must stay hidden",
+        turnId: erroredTurnId,
+        at: "2026-08-19T10:00:09.000Z",
+      });
+      yield* harness.setThread(
+        thread({ turnId: erroredTurnId, state: "running", messages: [erroredPartial] }),
+      );
+      yield* harness.publish(
+        assistantEvent({
+          turnId: erroredTurnId,
+          messageId: "message-errored-pending",
+          at: erroredPartial.updatedAt,
+        }),
+      );
+
+      const erroredThread = thread({
+        turnId: erroredTurnId,
+        state: "error",
+        messages: [erroredPartial],
+      });
+      yield* harness.setThread(erroredThread);
+      yield* harness.publish(
+        terminalMarkerEvent({
+          kind: "session",
+          turnId: erroredTurnId,
+          sessionStatus: "error",
+          at: "2026-08-19T10:00:10.000Z",
+        }),
+      );
+
+      const newerTurnId = TurnId.make("turn-system-started-after-error");
+      const newerThread = thread({
+        turnId: newerTurnId,
+        state: "completed",
+        messages: [erroredPartial],
+        requestedAt: "2026-08-19T10:00:20.000Z",
+        terminalAt: "2026-08-19T10:00:30.000Z",
+      });
+      yield* harness.setThread({
+        ...newerThread,
+        turns: [erroredThread.latestTurn!, newerThread.latestTurn!],
+      });
+      yield* harness.publish(
+        terminalMarkerEvent({
+          kind: "session",
+          turnId: newerTurnId,
+          at: "2026-08-19T10:00:30.000Z",
+        }),
+      );
+
+      expect(yield* harness.fake.sent).toEqual([]);
+    }),
   ),
 );
 
