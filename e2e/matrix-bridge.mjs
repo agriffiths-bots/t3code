@@ -73,6 +73,7 @@ const RUN_ID = NodeCrypto.randomUUID();
 
 const secrets = new Set();
 const pids = [];
+const logFlushes = [];
 let tempRoot = null;
 let failed = false;
 let stopping = false;
@@ -297,7 +298,18 @@ async function ensureConduwuit() {
   const cached = NodePath.join(cacheDir, asset.name);
   if (!NodeFS.existsSync(cached) || sha256File(cached) !== asset.sha256) {
     heartbeat("download-conduwuit", asset.name);
-    await download(`${CONDUWUIT_RELEASE}/${CONDUWUIT_VERSION}/${asset.name}`, cached);
+    // Download to a private file, verify it there, and publish by rename. Two
+    // runs writing the shared path directly would let one checksum or copy a
+    // binary the other was still truncating.
+    const staging = `${cached}.${NodeCrypto.randomBytes(6).toString("hex")}.part`;
+    try {
+      await download(`${CONDUWUIT_RELEASE}/${CONDUWUIT_VERSION}/${asset.name}`, staging);
+      const staged = sha256File(staging);
+      assert(staged === asset.sha256, `conduwuit checksum mismatch: ${staged}`);
+      NodeFS.renameSync(staging, cached);
+    } finally {
+      NodeFS.rmSync(staging, { force: true });
+    }
   }
   const digest = sha256File(cached);
   assert(digest === asset.sha256, `conduwuit checksum mismatch: ${digest}`);
@@ -561,6 +573,15 @@ function spawnCaptured(command, args, options, kind, prove) {
   // Redacted output is also kept in memory: reading the log file back races the
   // stream finishing, and a caller that has to classify why a child died cannot
   // wait on the filesystem to catch up.
+  // `closed` means the child's pipes drained, which is what callers classifying
+  // a failure need. Flushing the destination file takes longer, and teardown
+  // has to wait for that separately or it reads a report truncated exactly
+  // where the useful error was about to appear.
+  const flushed = new Promise((resolve) => {
+    stream.on("finish", resolve);
+    stream.on("error", resolve);
+  });
+  logFlushes.push(flushed);
   const closed = new Promise((resolve) => {
     child.on("close", () => {
       for (const { redactor } of redactors) redactor.flush();
@@ -568,7 +589,7 @@ function spawnCaptured(command, args, options, kind, prove) {
       resolve();
     });
   });
-  return { child, record, lines, closed };
+  return { child, record, lines, closed, flushed };
 }
 
 /** Socket inodes listening on a loopback port, read straight from /proc. */
@@ -693,6 +714,15 @@ class MatrixCli {
     const errLog = NodeFS.createWriteStream(NodePath.join(tempRoot, `${kind}.stderr.log`), {
       flags: "a",
     });
+    // The same flush barrier the captured servers use: this stream holds the
+    // trailing diagnostic that explains why a client died, and teardown must
+    // not read and delete the temp tree before it lands.
+    logFlushes.push(
+      new Promise((resolve) => {
+        errLog.on("finish", resolve);
+        errLog.on("error", resolve);
+      }),
+    );
     const redactor = lineRedactor((line) => errLog.write(`${redact(line)}\n`));
     this.child.stderr.on("data", (chunk) => redactor.push(chunk));
     this.child.on("exit", () => {
@@ -1636,7 +1666,6 @@ async function runReleaseGate(ctx) {
     assistantSegments(terminalA, terminalA.latestTurn.turnId).length >= 2,
     "the turn produced no assistant message before its final, so final-only suppression was never exercised",
   );
-  assert((await botCount()) === botBefore + 1, "expected exactly one bot message for the turn");
 
   heartbeat("9", "the bot's own event starts no turn");
   // The bot's final is a room event it must ignore, and the witness for that
@@ -1652,6 +1681,15 @@ async function runReleaseGate(ctx) {
     afterEcho.turns.length === echoMarker.turns &&
       afterEcho.latestTurn?.turnId === echoMarker.turnId,
     "the bot's own Matrix event created a turn on the owner thread",
+  );
+  // The streaming turn's message count is only counted here, behind the
+  // witness. Counting it the moment its final arrived would miss an erroneous
+  // extra send still queued at that point; the witness final is queued behind
+  // any such send, so by now it would have landed. Two messages are expected:
+  // that turn's one final, and the witness's.
+  assert(
+    (await botCount()) === botBefore + 2,
+    "expected exactly one bot message for the streaming turn",
   );
 
   heartbeat("10", "inbound message on an idle thread");
@@ -2033,6 +2071,7 @@ async function runTeardown() {
   if (!tempRoot) return;
   if (failed) {
     try {
+      await Promise.race([Promise.allSettled(logFlushes), sleep(5_000)]);
       const collected = [];
       for (const name of NodeFS.readdirSync(tempRoot)) {
         if (!name.endsWith(".log")) continue;

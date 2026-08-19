@@ -8,7 +8,7 @@ The bridge is one room and at most one owner thread per T3 environment. Mid-turn
 
 ## What You Need
 
-- A Matrix bot account on any homeserver that can invite you. You do not log T3 into Beeper; the bot creates the room and invites your Matrix user ID.
+- A Matrix bot account on a homeserver that can invite you, reachable over HTTPS. Plain HTTP is accepted only for a homeserver on this machine (`localhost` or `127.0.0.1`). You do not log T3 into Beeper; the bot creates the room and invites your Matrix user ID.
 - A T3 client with permission to manage access (`access:write`). If Connections will not let you configure the bridge or mint a pairing code, re-pair this T3 client from an administrative link, then try again.
 - End-to-end encryption on the bot. If the encrypted Matrix library cannot load, the bridge stays unavailable and T3 otherwise keeps running.
 
