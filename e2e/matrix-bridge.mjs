@@ -287,9 +287,23 @@ async function ensureSdk() {
       NodePath.join(cache, "package.json"),
       `${JSON.stringify({ name: "t3-matrix-e2e-sdk", private: true }, null, 2)}\n`,
     );
-    await execFile("npm", ["install", "--omit=dev", "--no-fund", "--no-audit", ...SDK_PACKAGES], {
-      cwd: cache,
-    });
+    // --ignore-scripts: nothing in this tree's transitive dependencies gets to
+    // run code at install time. The two pinned packages are exact, but their
+    // dependency graph is resolved fresh, so the install must not be a code
+    // execution path. The one script this harness does need is invoked
+    // explicitly below.
+    await execFile(
+      "npm",
+      ["install", "--omit=dev", "--no-fund", "--no-audit", "--ignore-scripts", ...SDK_PACKAGES],
+      { cwd: cache },
+    );
+    for (const spec of SDK_PACKAGES) {
+      const at = spec.lastIndexOf("@");
+      const [name, wanted] = [spec.slice(0, at), spec.slice(at + 1)];
+      const manifest = NodePath.join(cache, "node_modules", ...name.split("/"), "package.json");
+      const found = JSON.parse(NodeFS.readFileSync(manifest, "utf8")).version;
+      assert(found === wanted, `${name} resolved to ${found}, expected the pinned ${wanted}`);
+    }
     const cryptoDir = NodePath.join(
       cache,
       "node_modules",
@@ -330,12 +344,37 @@ function isAlive(pid) {
   }
 }
 
+function retire(record) {
+  const index = pids.indexOf(record);
+  if (index >= 0) pids.splice(index, 1);
+}
+
+/**
+ * A record outlives its leader only for as long as the leader's process group
+ * still has members. That is the exact window worth covering: a detached
+ * leader that dies early can orphan its group (a T3 server's provider
+ * subprocesses, say), and while the group is populated its id cannot be
+ * recycled onto anything else. Once it drains, the record is retired, because
+ * signalling that id later would be signalling a stranger.
+ */
+function retireWhenGroupDrains(record) {
+  const timer = setInterval(() => {
+    if (groupIsPopulated(record.pid)) return;
+    clearInterval(timer);
+    retire(record);
+  }, 100);
+  timer.unref();
+}
+
 function trackPid(pid, kind, prove, child) {
   const record = { pid, kind, prove };
   pids.push(record);
   child.on("exit", () => {
-    const index = pids.indexOf(record);
-    if (index >= 0) pids.splice(index, 1);
+    if (!groupIsPopulated(pid)) {
+      retire(record);
+      return;
+    }
+    retireWhenGroupDrains(record);
   });
   return record;
 }
@@ -357,29 +396,57 @@ function signalTree(pid, signal) {
   }
 }
 
-async function waitForExit(pid, timeoutMs) {
-  const started = Date.now();
-  while (Date.now() - started < timeoutMs) {
-    if (!isAlive(pid)) return true;
-    await sleep(50);
+/** Is any process still in this group? */
+function groupIsPopulated(pid) {
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch {
+    return false;
   }
-  return !isAlive(pid);
 }
 
 /**
- * Stop one captured process tree. Identity is re-proved from /proc before any
- * signal: this harness must never kill a process it did not start.
+ * Stop one captured process tree. While the leader is alive its identity is
+ * re-proved from /proc first, because this harness must never kill a process
+ * it did not start. Once the leader has exited there is nothing left to prove
+ * identity against, so the group is swept only if it is still populated: the
+ * leader's own exit is what created the orphans worth sweeping.
  */
 async function stopPid(record) {
-  if (!record?.pid || !isAlive(record.pid)) return;
-  if (record.prove && !record.prove(record.pid)) {
+  if (!record?.pid) return;
+  const leaderAlive = isAlive(record.pid);
+  if (leaderAlive && record.prove && !record.prove(record.pid)) {
     throw new Error(`refusing to kill ${record.kind} pid ${record.pid}: identity check failed`);
   }
+  if (!leaderAlive && !groupIsPopulated(record.pid)) {
+    retire(record);
+    return;
+  }
   signalTree(record.pid, "SIGTERM");
-  if (await waitForExit(record.pid, 5_000)) return;
+  if (await waitForTree(record, 5_000)) {
+    retire(record);
+    return;
+  }
   signalTree(record.pid, "SIGKILL");
-  if (await waitForExit(record.pid, 2_000)) return;
+  if (await waitForTree(record, 2_000)) {
+    retire(record);
+    return;
+  }
   throw new Error(`${record.kind} pid ${record.pid} survived SIGKILL`);
+}
+
+function treeIsGone(record) {
+  return !isAlive(record.pid) && !groupIsPopulated(record.pid);
+}
+
+async function waitForTree(record, timeoutMs) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (treeIsGone(record)) return true;
+    await sleep(50);
+  }
+  return treeIsGone(record);
 }
 
 /**
@@ -844,28 +911,6 @@ async function startT3(t3HomeDir, workspace, port) {
   throw new Error("ephemeral T3 never became command-ready");
 }
 
-/**
- * The inbound half of silence. Clearing ownership has to stop Matrix messages
- * from reaching T3, not only stop T3 replies from reaching Matrix: a reactor
- * that drops outbound but keeps a stale inbound owner would otherwise still
- * start and steer turns on a thread nobody bridged.
- */
-async function assertInboundIgnored(t3, cli, roomId, threadId, marker, label) {
-  const probe = `${marker}_INBOUND_${NodeCrypto.randomBytes(4).toString("hex")}`;
-  const before = (await threadSnapshot(t3, threadId)).thread;
-  await cli.request({ op: "send", roomId, body: probe });
-  await cli.request({ op: "waitSyncCycles", count: 2, timeoutMs: 20_000 }, 21_000);
-  const after = (await threadSnapshot(t3, threadId)).thread;
-  assert(
-    after.turns.length === before.turns.length,
-    `a Matrix message started a T3 turn on the ${label} thread`,
-  );
-  assert(
-    !userMessages(after).some((message) => message.text === probe),
-    `a Matrix message reached the ${label} thread`,
-  );
-}
-
 function requireMatrixBridgeCapability(serverConfig) {
   if (serverConfig.environment?.capabilities?.matrixBridge !== true) {
     throw new Error(CAPABILITY_MISSING);
@@ -909,7 +954,7 @@ function startTurn(t3, threadId, text, modelSelection) {
  * Neither Matrix client is started here, because who owns the bot device
  * differs between the two modes.
  */
-async function bringUp() {
+async function bringUp(mode) {
   tempRoot = assertSafePath(NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-matrix-e2e-")));
   NodeFS.chmodSync(tempRoot, 0o700);
   const t3Home = NodePath.join(tempRoot, "t3-home");
@@ -920,11 +965,21 @@ async function bringUp() {
   for (const dir of [t3Home, workspace, dbPath]) {
     NodeFS.mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
+  const matrixPort = await randomFreePort(MATRIX_PORT_MIN, MATRIX_PORT_MAX);
+  const t3Port = await firstFreePort(T3_PORT_MIN, T3_PORT_MAX);
+
+  // T3 comes up first so the release gate can refuse a server without the
+  // capability before paying for a homeserver download and a Matrix bring-up
+  // it is about to throw away.
+  heartbeat("1", `ephemeral T3 :${t3Port}`);
+  const t3 = await startT3(t3Home, workspace, t3Port);
+  const rpc = await connectRpc(t3.origin, t3.token);
+  const serverConfig = await rpc.call("server.getConfig", {});
+  log(`ephemeral T3 ${serverConfig.environment.serverVersion} on ${t3.origin}`);
+  if (mode === "release-gate") requireMatrixBridgeCapability(serverConfig);
 
   await ensureSdk();
   const conduwuitBin = await ensureConduwuit();
-  const matrixPort = await randomFreePort(MATRIX_PORT_MIN, MATRIX_PORT_MAX);
-  const t3Port = await firstFreePort(T3_PORT_MIN, T3_PORT_MAX);
 
   const registrationToken = NodeCrypto.randomBytes(18).toString("base64url");
   const botPassword = NodeCrypto.randomBytes(18).toString("base64url");
@@ -943,10 +998,10 @@ async function bringUp() {
   );
   const homeserver = `http://127.0.0.1:${matrixPort}`;
 
-  heartbeat("1", `conduwuit :${matrixPort}`);
+  heartbeat("2", `conduwuit :${matrixPort}`);
   const conduwuit = await startConduwuit(conduwuitBin, configPath, matrixPort, conduwuitDir);
 
-  heartbeat("2", "register bot and owner accounts");
+  heartbeat("3", "register bot and owner accounts");
   const botCli = new MatrixCli("bot");
   await botCli.request({
     op: "configure",
@@ -968,12 +1023,6 @@ async function bringUp() {
     password: ownerPassword,
     registrationToken,
   });
-
-  heartbeat("3", `ephemeral T3 :${t3Port}`);
-  const t3 = await startT3(t3Home, workspace, t3Port);
-  const rpc = await connectRpc(t3.origin, t3.token);
-  const serverConfig = await rpc.call("server.getConfig", {});
-  log(`ephemeral T3 ${serverConfig.environment.serverVersion} on ${t3.origin}`);
 
   return {
     conduwuit,
@@ -1082,6 +1131,60 @@ async function runReleaseGate(ctx) {
   const statusSub = rpc.subscribe("matrixBridge.subscribeStatus", {}, (value) => {
     status = value;
   });
+  // The Matrix client the harness talks through swaps when the homeserver is
+  // restarted mid-run, so the witness below reads it indirectly.
+  let activeCli = ownerCli;
+  const setOwner = async (ownerThreadId, label) => {
+    await rpc.call("matrixBridge.setOwner", { ownerThreadId });
+    await waitStatus(
+      () => status,
+      (v) => v.ownerThreadId === ownerThreadId,
+      10_000,
+      label,
+    );
+  };
+
+  /**
+   * Force the bot inside T3 to observably catch up, and return the room events
+   * that prove it. This exists because every negative assertion here needs a
+   * clock, and the harness client's own /sync counter is the wrong one: it
+   * says the harness polled, which is silent about where the independent bot
+   * has reached, so a slow or reconnecting bot could act after the assertion
+   * and turn the gate false-green.
+   *
+   * Matrix totally orders a room's timeline. Bridging a control thread and
+   * getting a later message to land in T3 therefore proves the bot's inbound
+   * consumer already passed everything sent before it, and getting that turn's
+   * final back into the room proves its outbound worker drained past every
+   * job queued before it. Both halves of silence get a real witness.
+   */
+  const bridgeWitness = async (controlThreadId, marker, restoreOwnerThreadId) => {
+    await setOwner(controlThreadId, `${marker} witness owner`);
+    const text = `${marker}_WITNESS_${NodeCrypto.randomBytes(4).toString("hex")}`;
+    await activeCli.request({ op: "send", roomId, body: text });
+    await waitThread(
+      t3,
+      controlThreadId,
+      (thread) => userMessages(thread).some((message) => message.text === text),
+      INBOUND_MS,
+      `${marker} witness message reached T3`,
+    );
+    const settled = await waitThread(
+      t3,
+      controlThreadId,
+      (thread) =>
+        thread.latestTurn?.state === "completed" && lastAssistant(thread, thread.latestTurn.turnId),
+      TURN_MS,
+      `${marker} witness turn`,
+    );
+    const final = lastAssistant(settled, settled.latestTurn.turnId).text.trim();
+    await activeCli.request(
+      { op: "waitText", roomId, from: botMxid, body: final, timeoutMs: LOCAL_SEND_MS },
+      LOCAL_SEND_MS + 1_000,
+    );
+    await setOwner(restoreOwnerThreadId, `${marker} owner restored`);
+    return { text, final };
+  };
   const configView = await rpc.call("matrixBridge.configure", {
     homeserverUrl: ctx.homeserver,
     accessToken: ctx.bot.accessToken,
@@ -1244,25 +1347,25 @@ async function runReleaseGate(ctx) {
   );
   assert(outboundA.event.encrypted === true, "the assistant final was not encrypted on the wire");
   assert((await botCount()) === botBefore + 1, "expected exactly one bot message for the turn");
-  await ownerCli.request({ op: "waitSyncCycles", count: 2, timeoutMs: 20_000 }, 21_000);
-  const afterEcho = await threadSnapshot(t3, threadA);
-  assert(
-    afterEcho.thread.turns.length === terminalA.turns.length,
-    "the bot's own Matrix event created another T3 turn",
-  );
 
-  heartbeat("9", "inbound message on an idle thread");
+  heartbeat("9", "inbound message on an idle thread, and no self-echo turn");
+  // The bot's own final is a room event it must ignore. The inbound message
+  // below is the witness for that: Matrix orders the room, so once this later
+  // message has observably become a turn, the bot has already consumed its own
+  // event, and the turn count proves it created nothing. Counting the harness
+  // client's /sync cycles instead would prove only that the harness polled.
   const inboundIdle = `INBOUND_IDLE_${NodeCrypto.randomBytes(4).toString("hex")}`;
-  const idleTurns = afterEcho.thread.turns.length;
+  const idleTurns = terminalA.turns.length;
   await ownerCli.request({ op: "send", roomId, body: inboundIdle });
   await waitThread(
     t3,
     threadA,
     (thread) =>
+      userMessages(thread).some((m) => m.text === inboundIdle) &&
       thread.turns.length === idleTurns + 1 &&
       userMessages(thread, thread.latestTurn?.turnId).some((m) => m.text === inboundIdle),
     INBOUND_MS,
-    "inbound idle dispatch",
+    "inbound idle dispatch, and the bot's own event created no turn",
   );
   const idleTerminal = await waitThread(
     t3,
@@ -1342,12 +1445,10 @@ async function runReleaseGate(ctx) {
     "owner-move thread A finished",
   );
   const droppedText = lastAssistant(finishedA, finishedA.latestTurn.turnId)?.text.trim() ?? "";
-  await sleep(LOCAL_SEND_MS);
-  const afterDrop = await ownerCli.request({ op: "messages", roomId, from: botMxid });
-  assert(
-    droppedText.length === 0 || !afterDrop.texts.some((item) => item.body === droppedText),
-    "the old owner's final was posted after the move",
-  );
+  // The new owner's turn is the witness for the dropped one. Its final is
+  // queued after thread A's, so once it has arrived the outbound worker has
+  // drained past the abandoned job; a fixed sleep would instead declare the
+  // drop while a delayed or retrying send was still in flight.
   await startTurn(
     t3,
     threadB,
@@ -1366,6 +1467,11 @@ async function runReleaseGate(ctx) {
   await ownerCli.request(
     { op: "waitText", roomId, from: botMxid, body: finalB, timeoutMs: LOCAL_SEND_MS },
     LOCAL_SEND_MS + 1_000,
+  );
+  const afterDrop = await ownerCli.request({ op: "messages", roomId, from: botMxid });
+  assert(
+    droppedText.length === 0 || !afterDrop.texts.some((item) => item.body === droppedText),
+    "the old owner's final was posted after the move",
   );
 
   heartbeat("12", "homeserver outage and recovery");
@@ -1428,38 +1534,107 @@ async function runReleaseGate(ctx) {
     "status returns to active after recovery",
   );
 
-  heartbeat("13", "unbridge is silent in both directions");
-  const beforeUnbridge = (await recoveredCli.request({ op: "messages", roomId, from: botMxid }))
-    .texts.length;
-  await rpc.call("matrixBridge.setOwner", { ownerThreadId: null });
-  await assertInboundIgnored(t3, recoveredCli, roomId, threadB, "UNBRIDGED", "unbridged");
-  await startTurn(
-    t3,
-    threadB,
-    "Reply with the exact word SILENCE_SHOULD_NOT_ARRIVE and nothing else.",
-    modelSelection,
-  );
-  await waitThread(
-    t3,
-    threadB,
-    (thread) => thread.latestTurn?.state === "completed",
-    TURN_MS,
-    "unbridged turn",
-  );
-  await recoveredCli.request({ op: "waitSyncCycles", count: 2, timeoutMs: 20_000 }, 21_000);
-  const afterSilence = await recoveredCli.request({ op: "messages", roomId, from: botMxid });
-  assert(afterSilence.texts.length === beforeUnbridge, "unbridging still posted a Matrix message");
+  activeCli = recoveredCli;
 
-  await rpc.call("matrixBridge.setOwner", { ownerThreadId: threadB });
+  /**
+   * Inbound half of silence, run while `silentThreadId` is idle. Idleness is
+   * load-bearing: starting work on the thread first would let a wrongly-live
+   * inbound path have its dispatch rejected as busy, which leaves exactly the
+   * same evidence as the intended drop.
+   */
+  const assertInboundSilent = async (silentThreadId, marker, label) => {
+    const probe = `${marker}_INBOUND_${NodeCrypto.randomBytes(4).toString("hex")}`;
+    const before = (await threadSnapshot(t3, silentThreadId)).thread;
+    await activeCli.request({ op: "send", roomId, body: probe });
+    await bridgeWitness(threadA, `${marker}_IN`, null);
+    const after = (await threadSnapshot(t3, silentThreadId)).thread;
+    assert(
+      !userMessages(after).some((message) => message.text === probe),
+      `a Matrix message reached the ${label} thread`,
+    );
+    assert(
+      after.turns.length === before.turns.length,
+      `a Matrix message started a T3 turn on the ${label} thread`,
+    );
+    // The probe preceded the witness bridging, so a bot that deferred it
+    // across the ownership change would land it on the control thread instead
+    // of dropping it. That is a failure here rather than an invisible pass.
+    const control = (await threadSnapshot(t3, threadA)).thread;
+    assert(
+      !userMessages(control).some((message) => message.text === probe),
+      `a ${label} Matrix message was dispatched once ownership was restored`,
+    );
+  };
+
+  /**
+   * Outbound half of silence. A live thread has to produce a real final for
+   * the suppression to mean anything, so a rejected dispatch there is a gate
+   * failure; only an archived thread may refuse the turn outright.
+   */
+  const assertOutboundSilent = async (silentThreadId, marker, label, prompt, { requireFinal }) => {
+    const before = (await threadSnapshot(t3, silentThreadId)).thread;
+    const beforeTurnId = before.latestTurn?.turnId ?? null;
+    const botBefore = (await activeCli.request({ op: "messages", roomId, from: botMxid })).texts
+      .length;
+    const dispatched = await startTurn(t3, silentThreadId, prompt, modelSelection).then(
+      () => true,
+      (error) => {
+        if (requireFinal) throw error;
+        return false;
+      },
+    );
+    let final = "";
+    if (dispatched) {
+      // The predicate must name a *new* turn: the thread's previous turn is
+      // already terminal, so a state-only check matches instantly and would
+      // hand the witness a stale reply while the real probe still runs.
+      const settled = await waitThread(
+        t3,
+        silentThreadId,
+        (thread) =>
+          thread.turns.length === before.turns.length + 1 &&
+          thread.latestTurn?.turnId !== beforeTurnId &&
+          ["completed", "error", "interrupted"].includes(thread.latestTurn?.state),
+        TURN_MS,
+        `${label} probe turn terminal`,
+      );
+      final = lastAssistant(settled, settled.latestTurn.turnId)?.text.trim() ?? "";
+      if (requireFinal) {
+        assert(
+          settled.latestTurn.state === "completed",
+          `the ${label} probe turn ended as ${settled.latestTurn.state}, so outbound suppression was never exercised`,
+        );
+        assert(final.length > 0, `the ${label} probe turn produced no assistant final to suppress`);
+      }
+    }
+    const witness = await bridgeWitness(threadA, `${marker}_OUT`, null);
+    const texts = (await activeCli.request({ op: "messages", roomId, from: botMxid })).texts;
+    assert(
+      final.length === 0 || !texts.some((item) => item.body === final),
+      `the ${label} thread still posted a Matrix message`,
+    );
+    // Exactly one new bot message since the probe: the witness final.
+    assert(
+      texts.length === botBefore + 1 && texts.at(-1).body === witness.final,
+      `the bot posted something other than the witness while ${label}`,
+    );
+  };
+
+  heartbeat("13", "unbridge is silent in both directions");
+  await setOwner(null, "owner cleared");
+  await assertInboundSilent(threadB, "UNBRIDGED", "unbridged");
+  await assertOutboundSilent(
+    threadB,
+    "UNBRIDGED",
+    "unbridged",
+    "Reply with the exact word SILENCE_SHOULD_NOT_ARRIVE and nothing else.",
+    { requireFinal: true },
+  );
+
   // Ownership has to be observed as thread B before the archive, or the null
   // below is satisfied by the stale null the unbridge above already published
   // and the archive proves nothing.
-  await waitStatus(
-    () => status,
-    (v) => v.ownerThreadId === threadB,
-    10_000,
-    "owner is thread B again",
-  );
+  await setOwner(threadB, "owner is thread B again");
   await dispatch(t3, {
     type: "thread.archive",
     commandId: NodeCrypto.randomUUID(),
@@ -1471,30 +1646,15 @@ async function runReleaseGate(ctx) {
     10_000,
     "archive unset the owner",
   );
-  const beforeArchive = (await recoveredCli.request({ op: "messages", roomId, from: botMxid }))
-    .texts.length;
-  await assertInboundIgnored(t3, recoveredCli, roomId, threadB, "ARCHIVED", "archived");
-  const archivedDispatched = await startTurn(
-    t3,
+  await assertInboundSilent(threadB, "ARCHIVED", "archived");
+  await assertOutboundSilent(
     threadB,
+    "ARCHIVED",
+    "archived",
     "Reply with the exact word ARCHIVED_SHOULD_NOT_BRIDGE and nothing else.",
-    modelSelection,
-  ).then(
-    () => true,
-    () => false,
+    // An archived thread is allowed to refuse the turn outright.
+    { requireFinal: false },
   );
-  if (archivedDispatched) {
-    await waitThread(
-      t3,
-      threadB,
-      (thread) => ["completed", "error", "interrupted"].includes(thread.latestTurn?.state),
-      TURN_MS,
-      "archived turn terminal",
-    );
-    await recoveredCli.request({ op: "waitSyncCycles", count: 2, timeoutMs: 20_000 }, 21_000);
-  }
-  const afterArchive = await recoveredCli.request({ op: "messages", roomId, from: botMxid });
-  assert(afterArchive.texts.length === beforeArchive, "an archived owner thread still bridged");
 
   heartbeat("14", "close clients");
   statusSub.interrupt();
@@ -1517,7 +1677,7 @@ async function main() {
   heartbeat("start", mode);
   assertSafePath(REPO_ROOT);
   assertSafePath(USER_CACHE);
-  const ctx = await bringUp();
+  const ctx = await bringUp(mode);
   if (mode === "smoke") await runSmoke(ctx);
   else await runReleaseGate(ctx);
 }
@@ -1531,7 +1691,7 @@ async function runTeardown() {
       console.error(redact(error instanceof Error ? error.message : String(error)));
     }
   }
-  const survivors = pids.filter((record) => isAlive(record.pid));
+  const survivors = pids.filter((record) => !treeIsGone(record));
   if (survivors.length > 0) {
     // A run that leaks a homeserver, a T3 server, or a Matrix client is not a
     // pass whatever the assertions said: the next run inherits its ports, and

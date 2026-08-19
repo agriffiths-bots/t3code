@@ -1,10 +1,10 @@
 # Matrix Bridge
 
+> The bridge is still rolling out. **Matrix bridge** appears in Settings → Connections only on a server that has it; if you do not see the section, that server does not support the bridge yet and nothing on this page applies to it.
+
 Use this when you want one T3 Code thread to appear as a private encrypted chat on Matrix, including Beeper.
 
 The bridge is one room and at most one owner thread per T3 environment. Mid-turn tool output, streaming fragments, and activity notices stay in T3. Matrix receives each completed assistant reply as a single plain-text message.
-
-**Matrix bridge** appears in Settings → Connections only on a server that supports it. If you do not see it, the server you are connected to is older than the feature; update that server rather than the client.
 
 ## What You Need
 
