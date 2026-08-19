@@ -1,3 +1,4 @@
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
@@ -12,6 +13,7 @@ import { ProviderRuntimeIngestionService } from "../Services/ProviderRuntimeInge
 import { ScheduledTasksReactor } from "../Services/ScheduledTasksReactor.ts";
 import { ThreadDeletionReactor } from "../Services/ThreadDeletionReactor.ts";
 import * as AgentAwarenessRelay from "../../relay/AgentAwarenessRelay.ts";
+import { forkParked, ServerActivation } from "../../serverActivation.ts";
 import * as VcsMaintenanceReactor from "../../vcs/VcsMaintenanceReactor.ts";
 
 export const makeOrchestrationReactor = Effect.gen(function* () {
@@ -23,6 +25,12 @@ export const makeOrchestrationReactor = Effect.gen(function* () {
   const vcsMaintenanceReactor = yield* VcsMaintenanceReactor.VcsMaintenanceReactor;
   const childThreadCoordinator = yield* ChildThreadCoordinator;
   const scheduledTasksReactor = yield* ScheduledTasksReactor;
+  const activationReady = yield* Deferred.make<void>();
+
+  const startActivationSensitiveReactors = Effect.gen(function* () {
+    yield* childThreadCoordinator.start();
+    yield* scheduledTasksReactor.start();
+  }).pipe(Effect.onExit((exit) => Deferred.done(activationReady, exit).pipe(Effect.asVoid)));
 
   const start: OrchestrationReactorShape["start"] = Effect.fn("start")(function* () {
     yield* providerRuntimeIngestion.start();
@@ -31,12 +39,15 @@ export const makeOrchestrationReactor = Effect.gen(function* () {
     yield* threadDeletionReactor.start();
     yield* agentAwarenessRelay.start();
     yield* vcsMaintenanceReactor.start();
-    yield* childThreadCoordinator.start();
-    yield* scheduledTasksReactor.start();
+    const activation = yield* ServerActivation;
+    yield* activation === undefined
+      ? startActivationSensitiveReactors
+      : forkParked(startActivationSensitiveReactors);
   });
 
   return {
     start,
+    activationReady: Deferred.await(activationReady),
   } satisfies OrchestrationReactorShape;
 });
 
