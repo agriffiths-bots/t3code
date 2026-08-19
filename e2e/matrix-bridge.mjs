@@ -1422,7 +1422,16 @@ async function runReleaseGate(ctx) {
   const bridgeWitness = async (controlThreadId, marker, restoreOwnerThreadId) => {
     const beforeOwner = (await threadSnapshot(t3, controlThreadId)).thread;
     const beforeInbound = userMessages(beforeOwner).length;
-    await setOwner(controlThreadId, `${marker} witness owner`);
+    // Selecting an owner bumps the ownership epoch even when the thread is
+    // unchanged, and the reactor drops queued outbound jobs carrying a stale
+    // epoch. A witness that reselected would therefore discard the delayed
+    // duplicates it exists to detect and certify its own caller. Ownership is
+    // touched only when the control thread is not already the owner; otherwise
+    // this is an ordinary turn on the current owner, whose final queues behind
+    // any pending job in the same worker.
+    if (status.ownerThreadId !== controlThreadId) {
+      await setOwner(controlThreadId, `${marker} witness owner`);
+    }
     const before = turnMarker((await threadSnapshot(t3, controlThreadId)).thread);
     const text = `${marker}_WITNESS_${NodeCrypto.randomBytes(4).toString("hex")}`;
     // The room position before the send. `waitText` scans events already
@@ -1483,7 +1492,9 @@ async function runReleaseGate(ctx) {
       },
       LOCAL_SEND_MS + 1_000,
     );
-    await setOwner(restoreOwnerThreadId, `${marker} owner restored`);
+    if (status.ownerThreadId !== restoreOwnerThreadId) {
+      await setOwner(restoreOwnerThreadId, `${marker} owner restored`);
+    }
     return { text, final };
   };
   const configView = await rpc.call("matrixBridge.configure", {
@@ -1667,34 +1678,18 @@ async function runReleaseGate(ctx) {
     "the turn produced no assistant message before its final, so final-only suppression was never exercised",
   );
 
-  heartbeat("9", "the bot's own event starts no turn");
-  // The bot's final is a room event it must ignore, and the witness for that
-  // must not touch thread A. Sending the next owner message here would let a
-  // wrongly created echo turn absorb it as a steer, leaving exactly the turn
-  // count a correct bridge produces. Bridging thread B instead makes the bot
-  // dispatch somewhere else, which by room ordering proves it already consumed
-  // its own event, and thread A has to be untouched at that point.
-  const echoMarker = turnMarker(terminalA);
-  await bridgeWitness(threadB, "ECHO", threadA);
-  const afterEcho = (await threadSnapshot(t3, threadA)).thread;
-  assert(
-    afterEcho.turns.length === echoMarker.turns &&
-      afterEcho.latestTurn?.turnId === echoMarker.turnId,
-    "the bot's own Matrix event created a turn on the owner thread",
-  );
-  // The streaming turn's message count is only counted here, behind the
-  // witness. Counting it the moment its final arrived would miss an erroneous
-  // extra send still queued at that point; the witness final is queued behind
-  // any such send, so by now it would have landed. Two messages are expected:
-  // that turn's one final, and the witness's.
-  assert(
-    (await botCount()) === botBefore + 2,
-    "expected exactly one bot message for the streaming turn",
-  );
-
-  heartbeat("10", "inbound message on an idle thread");
+  heartbeat("9", "inbound message on an idle thread, and no self-echo turn");
+  // This message is the witness for two things at once, and it moves no
+  // ownership: reselecting an owner bumps the epoch, which would drop the very
+  // outbound jobs these assertions are looking for.
+  //
+  // The bot's own final precedes this message in the room, so by the time this
+  // one has landed in T3 the bridge has consumed that event. Had it dispatched
+  // it, the final's text would be sitting on the thread as a user message,
+  // whether it opened a turn of its own or was absorbed as a steer into this
+  // one, so the check is on content rather than on turn accounting.
   const inboundIdle = `INBOUND_IDLE_${NodeCrypto.randomBytes(4).toString("hex")}`;
-  const idleMarker = turnMarker(afterEcho);
+  const idleMarker = turnMarker(terminalA);
   await ownerCli.request({ op: "send", roomId, body: inboundIdle });
   const idleDispatched = await waitThread(
     t3,
@@ -1702,7 +1697,11 @@ async function runReleaseGate(ctx) {
     (thread) =>
       isNewTurn(thread, idleMarker) && userMessages(thread).some((m) => m.text === inboundIdle),
     INBOUND_MS,
-    "inbound idle dispatch",
+    "inbound idle dispatch, and the bot's own event created no turn",
+  );
+  assert(
+    !userMessages(idleDispatched).some((message) => message.text === finalA),
+    "the bot's own Matrix event was dispatched into T3 as a user message",
   );
   const idleTurnId = idleDispatched.latestTurn.turnId;
   const idleTerminal = await waitThread(
@@ -1720,8 +1719,16 @@ async function runReleaseGate(ctx) {
     { op: "waitText", roomId, from: botMxid, body: idleFinal, timeoutMs: LOCAL_SEND_MS },
     LOCAL_SEND_MS + 1_000,
   );
+  // Both turns' messages are counted here rather than as each final arrived.
+  // This final is queued behind any erroneous extra send from the streaming
+  // turn in the same worker, so by now such a send would have landed, and no
+  // ownership was touched to arrange that. Two messages, one final each.
+  assert(
+    (await botCount()) === botBefore + 2,
+    "expected exactly one bot message for each of the streaming and idle turns",
+  );
 
-  heartbeat("11", "inbound message steers a running turn");
+  heartbeat("10", "inbound message steers a running turn");
   const steerMarker = turnMarker(idleTerminal);
   await ownerCli.request({
     op: "send",
@@ -1766,7 +1773,7 @@ async function runReleaseGate(ctx) {
     LOCAL_SEND_MS + 1_000,
   );
 
-  heartbeat("12", "owner move drops the old final");
+  heartbeat("11", "owner move drops the old final");
   const moveMarker = turnMarker(steered);
   await startTurn(
     t3,
@@ -1833,7 +1840,7 @@ async function runReleaseGate(ctx) {
     "the old owner's final was posted after the move",
   );
 
-  heartbeat("13", "homeserver outage and recovery");
+  heartbeat("12", "homeserver outage and recovery");
   await stopPid(ctx.conduwuit.record);
   const queuedMarker = turnMarker(doneB);
   await startTurn(
@@ -1885,22 +1892,26 @@ async function runReleaseGate(ctx) {
     { op: "waitText", roomId, from: botMxid, body: queuedFinal, timeoutMs: RECOVERY_MS },
     RECOVERY_MS + 1_000,
   );
-  // Exactly-once needs the retry queue drained, not just the first copy seen.
-  // A later final observed in the room is queued behind any retry of this one,
-  // so once it has arrived a duplicate would already have landed.
-  await bridgeWitness(threadB, "RECOVERY", threadB);
-  const recovered = await recoveredCli.request({ op: "messages", roomId, from: botMxid });
-  assert(
-    recovered.texts.filter((item) => item.body === queuedFinal).length === 1,
-    "the queued final was not delivered exactly once",
-  );
   // Delivering the backlog is not enough: a client reading the status stream
-  // must see the bridge come back, not sit on a stale outage lifecycle.
+  // must see the bridge come back, not sit on a stale outage lifecycle. This
+  // also establishes, rather than assumes, that thread B is still the observed
+  // owner, so the witness below provably takes its no-reselect path.
   await waitStatus(
     () => status,
     (v) => v.state === "active" && v.ownerThreadId === threadB,
     30_000,
     "status returns to active after recovery",
+  );
+  // Exactly-once needs the retry queue drained, not just the first copy seen.
+  // A later final on this same thread is queued behind any retry of this one,
+  // so once it has arrived a duplicate would already have landed. Ownership is
+  // deliberately untouched: reselecting would bump the epoch and drop exactly
+  // the retries this count is looking for.
+  await bridgeWitness(threadB, "RECOVERY", threadB);
+  const recovered = await recoveredCli.request({ op: "messages", roomId, from: botMxid });
+  assert(
+    recovered.texts.filter((item) => item.body === queuedFinal).length === 1,
+    "the queued final was not delivered exactly once",
   );
 
   /**
@@ -1988,7 +1999,7 @@ async function runReleaseGate(ctx) {
     );
   };
 
-  heartbeat("14", "unbridge is silent in both directions");
+  heartbeat("13", "unbridge is silent in both directions");
   await setOwner(null, "owner cleared");
   await assertInboundSilent(threadB, "UNBRIDGED", "unbridged");
   await assertOutboundSilent(
@@ -2024,7 +2035,7 @@ async function runReleaseGate(ctx) {
     { requireFinal: false },
   );
 
-  heartbeat("15", "close clients");
+  heartbeat("14", "close clients");
   statusSub.interrupt();
   // A subscription that never acknowledges the interrupt must not hold the run
   // open; the socket close below ends it either way.
