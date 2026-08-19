@@ -57,8 +57,10 @@ import { RuntimeReceiptBusTest } from "../src/orchestration/Layers/RuntimeReceip
 import { OrchestrationReactorLive } from "../src/orchestration/Layers/OrchestrationReactor.ts";
 import { ProviderCommandReactorLive } from "../src/orchestration/Layers/ProviderCommandReactor.ts";
 import { ProviderRuntimeIngestionLive } from "../src/orchestration/Layers/ProviderRuntimeIngestion.ts";
+import { ChildThreadCoordinator } from "../src/orchestration/Services/ChildThreadCoordinator.ts";
 import { CheckpointReactor } from "../src/orchestration/Services/CheckpointReactor.ts";
 import { ProviderRuntimeIngestionService } from "../src/orchestration/Services/ProviderRuntimeIngestion.ts";
+import { ScheduledTasksReactor } from "../src/orchestration/Services/ScheduledTasksReactor.ts";
 import {
   OrchestrationEngineService,
   type OrchestrationEngineShape,
@@ -389,6 +391,12 @@ export const makeOrchestrationIntegrationHarness = (
           sweep: () => Effect.void,
         }),
       ),
+      Layer.provideMerge(
+        Layer.mock(ChildThreadCoordinator)({
+          start: () => Effect.void,
+        }),
+      ),
+      Layer.provideMerge(Layer.succeed(ScheduledTasksReactor, { start: () => Effect.void })),
     );
     const layer = Layer.empty.pipe(
       Layer.provideMerge(runtimeServicesLayer),

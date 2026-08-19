@@ -449,6 +449,7 @@ export const make = (options?: StartupOptions) =>
         }),
       );
       yield* options?.activate ?? Effect.void;
+      yield* runStartupPhase("reactors.activation-ready", orchestrationReactor.activationReady);
 
       yield* Effect.logDebug("Accepting commands");
       yield* commandGate.signalCommandReady;

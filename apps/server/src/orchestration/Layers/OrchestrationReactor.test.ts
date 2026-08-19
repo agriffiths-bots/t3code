@@ -5,11 +5,13 @@ import * as ManagedRuntime from "effect/ManagedRuntime";
 import * as Scope from "effect/Scope";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 
+import { ChildThreadCoordinator } from "../Services/ChildThreadCoordinator.ts";
 import { CheckpointReactor } from "../Services/CheckpointReactor.ts";
+import { OrchestrationReactor } from "../Services/OrchestrationReactor.ts";
 import { ProviderCommandReactor } from "../Services/ProviderCommandReactor.ts";
 import { ProviderRuntimeIngestionService } from "../Services/ProviderRuntimeIngestion.ts";
+import { ScheduledTasksReactor } from "../Services/ScheduledTasksReactor.ts";
 import { ThreadDeletionReactor } from "../Services/ThreadDeletionReactor.ts";
-import { OrchestrationReactor } from "../Services/OrchestrationReactor.ts";
 import { makeOrchestrationReactor } from "./OrchestrationReactor.ts";
 import * as AgentAwarenessRelay from "../../relay/AgentAwarenessRelay.ts";
 import * as VcsMaintenanceReactor from "../../vcs/VcsMaintenanceReactor.ts";
@@ -24,7 +26,7 @@ describe("OrchestrationReactor", () => {
     runtime = null;
   });
 
-  it("starts provider ingestion, provider command, checkpoint, thread deletion, and maintenance reactors", async () => {
+  it("starts all orchestration reactors", async () => {
     const started: string[] = [];
 
     runtime = ManagedRuntime.make(
@@ -83,6 +85,22 @@ describe("OrchestrationReactor", () => {
             sweep: () => Effect.void,
           }),
         ),
+        Layer.provideMerge(
+          Layer.mock(ChildThreadCoordinator)({
+            start: () => {
+              started.push("child-thread-coordinator");
+              return Effect.void;
+            },
+          }),
+        ),
+        Layer.provideMerge(
+          Layer.succeed(ScheduledTasksReactor, {
+            start: () => {
+              started.push("scheduled-tasks-reactor");
+              return Effect.void;
+            },
+          }),
+        ),
       ),
     );
 
@@ -97,6 +115,8 @@ describe("OrchestrationReactor", () => {
       "thread-deletion-reactor",
       "agent-awareness-relay",
       "vcs-maintenance-reactor",
+      "child-thread-coordinator",
+      "scheduled-tasks-reactor",
     ]);
 
     await Effect.runPromise(Scope.close(scope, Exit.void));
