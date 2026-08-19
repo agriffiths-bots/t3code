@@ -24,4 +24,9 @@ describe("server Vite packaging", () => {
     expect(shouldBundleCliDependency("node-pty")).toBe(false);
     expect(shouldBundleCliDependency("node:fs")).toBe(false);
   });
+
+  it("leaves the optional Matrix bridge packages external", () => {
+    expect(shouldBundleCliDependency("matrix-bot-sdk")).toBe(false);
+    expect(shouldBundleCliDependency("@matrix-org/matrix-sdk-crypto-nodejs")).toBe(false);
+  });
 });

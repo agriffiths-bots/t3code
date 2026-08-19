@@ -40,6 +40,7 @@ import {
   resolveMacPasskeySigningConfiguration,
   resolveDesktopRuntimeDependencies,
   resolveStagedRuntimeDependencies,
+  resolveStagedOptionalRuntimeDependencies,
   resolveFfiRsNativeDependencies,
   resolveFffNativeDependencies,
   resolveClaudeAgentNativeDependencies,
@@ -278,6 +279,45 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
         "node-pty": "^1.1.0",
         "playwright-core": "1.60.0",
       },
+    );
+  });
+
+  it("stages the optional Matrix bridge packages as optional dependencies", () => {
+    assert.deepStrictEqual(
+      resolveStagedOptionalRuntimeDependencies({
+        serverOptionalDependencies: {
+          "@matrix-org/matrix-sdk-crypto-nodejs": "0.4.0",
+          "matrix-bot-sdk": "0.8.0",
+        },
+        catalog: {},
+      }),
+      {
+        "@matrix-org/matrix-sdk-crypto-nodejs": "0.4.0",
+        "matrix-bot-sdk": "0.8.0",
+      },
+    );
+    assert.deepStrictEqual(
+      resolveStagedOptionalRuntimeDependencies({
+        serverOptionalDependencies: undefined,
+        catalog: {},
+      }),
+      {},
+    );
+  });
+
+  it("unpacks the Matrix crypto binding while the JavaScript SDK stays packed", () => {
+    assert.include(
+      [...DESKTOP_NATIVE_ASAR_UNPACK_PACKAGE_PATTERNS],
+      "@matrix-org/matrix-sdk-crypto-nodejs",
+    );
+    assert.notInclude([...DESKTOP_NATIVE_ASAR_UNPACK_PACKAGE_PATTERNS], "matrix-bot-sdk");
+    assert.include(
+      [...DESKTOP_ASAR_UNPACK],
+      "node_modules/@matrix-org/matrix-sdk-crypto-nodejs/**",
+    );
+    assert.include(
+      [...DESKTOP_ASAR_UNPACK],
+      "node_modules/.pnpm/**/node_modules/@matrix-org/matrix-sdk-crypto-nodejs/**",
     );
   });
 

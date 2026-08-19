@@ -12,6 +12,15 @@ const NODE_PTY_KEEP_PREBUILD_FILE_NAMES = new Set([
   "spawn-helper",
   "t3code-wsl-node-pty.json",
 ]);
+const MATRIX_CRYPTO_PACKAGE_PATH = NodePath.join("@matrix-org", "matrix-sdk-crypto-nodejs");
+const MATRIX_CRYPTO_REMOVED_ENTRY_NAMES = [
+  "CHANGELOG.md",
+  "README.md",
+  "RELEASING.md",
+  "download-lib.js",
+  "index.d.ts",
+  "node_modules",
+];
 const ELECTRON_BUILDER_ARCH_NAMES = new Map([
   [0, "ia32"],
   [1, "x64"],
@@ -276,6 +285,40 @@ async function pruneScopedNativePackages(unpackedRoot, scopeDir, platform, archN
   await removeEmptyDirectories(scopeDir);
 }
 
+export function matrixCryptoBindingPrefix(platform, archName) {
+  if (platform === "darwin") return `matrix-sdk-crypto.darwin-${archName}`;
+  if (platform === "win32") return `matrix-sdk-crypto.win32-${archName}`;
+  const linuxArch = linuxArchFor(archName);
+  return linuxArch === null ? null : `matrix-sdk-crypto.linux-${linuxArch}`;
+}
+
+// The Matrix crypto package ships one ~22 MB binding per platform plus an
+// install-time downloader. Only the target binding can be loaded, and the
+// downloader never runs again inside a packaged app.
+async function pruneMatrixCryptoBinding(packageDir, platform, arch) {
+  if (!(await pathExists(packageDir))) {
+    return;
+  }
+  const archName = resolveArchName(arch);
+  if (archName === null || archName === "universal") {
+    return;
+  }
+
+  await Promise.all(
+    MATRIX_CRYPTO_REMOVED_ENTRY_NAMES.map((name) => removePath(NodePath.join(packageDir, name))),
+  );
+
+  const keepPrefix = matrixCryptoBindingPrefix(platform, archName);
+  for (const entry of await listEntries(packageDir)) {
+    if (!entry.name.endsWith(".node")) {
+      continue;
+    }
+    if (keepPrefix === null || !entry.name.startsWith(keepPrefix)) {
+      await removePath(NodePath.join(packageDir, entry.name));
+    }
+  }
+}
+
 async function pruneNativeSidecars(root, platform, arch) {
   const archName = resolveArchName(arch);
   if (archName === null || archName === "universal") {
@@ -392,6 +435,11 @@ export default async function afterPack(context) {
     await pruneNativeSidecars(root, context.electronPlatformName, context.arch);
     await pruneNodePty(
       NodePath.join(root, "node_modules", "node-pty"),
+      context.electronPlatformName,
+      context.arch,
+    );
+    await pruneMatrixCryptoBinding(
+      NodePath.join(root, "node_modules", MATRIX_CRYPTO_PACKAGE_PATH),
       context.electronPlatformName,
       context.arch,
     );

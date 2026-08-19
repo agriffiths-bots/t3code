@@ -671,6 +671,7 @@ interface StagePackageJson {
   readonly main: string;
   readonly build: Record<string, unknown>;
   readonly dependencies: Record<string, unknown>;
+  readonly optionalDependencies: Record<string, unknown>;
   readonly devDependencies: {
     readonly electron: string;
   };
@@ -692,6 +693,9 @@ export const DESKTOP_NATIVE_ASAR_UNPACK_PACKAGE_PATTERNS = [
   "@clerk/electron-passkeys-*",
   "@ff-labs/fff-bin-*",
   "@ff-labs/fff-node",
+  // The Matrix crypto binding is dlopen'd, so its .node must sit outside the
+  // archive. The pure-JS SDK that loads it stays packed.
+  "@matrix-org/matrix-sdk-crypto-nodejs",
   "@msgpackr-extract/*",
   "@yuuang/ffi-rs-*",
   "ffi-rs",
@@ -714,6 +718,14 @@ export const DESKTOP_STAGED_RUNTIME_DEPENDENCY_NAMES = [
   "@ff-labs/fff-node",
   "node-pty",
   "playwright-core",
+] as const;
+/**
+ * Staged as optional so a Matrix crypto download failure degrades the bridge to
+ * unavailable instead of failing the desktop build.
+ */
+export const DESKTOP_STAGED_OPTIONAL_RUNTIME_DEPENDENCY_NAMES = [
+  "@matrix-org/matrix-sdk-crypto-nodejs",
+  "matrix-bot-sdk",
 ] as const;
 
 function toAsarUnpackPackagePatterns(packagePattern: string): readonly string[] {
@@ -1747,6 +1759,26 @@ export function resolveStagedRuntimeDependencies(input: {
   return resolveCatalogDependencies(dependencySpecs, input.catalog, "desktop staged runtime");
 }
 
+/** Mirrors the server's optional dependencies into the staged app manifest. */
+export function resolveStagedOptionalRuntimeDependencies(input: {
+  readonly serverOptionalDependencies: Record<string, string> | undefined;
+  readonly catalog: Record<string, string>;
+}): Record<string, string> {
+  const dependencySpecs: Record<string, string> = {};
+  const manifest = input.serverOptionalDependencies ?? {};
+
+  for (const packageName of DESKTOP_STAGED_OPTIONAL_RUNTIME_DEPENDENCY_NAMES) {
+    const dependencySpec = manifest[packageName];
+    if (dependencySpec !== undefined) dependencySpecs[packageName] = dependencySpec;
+  }
+
+  return resolveCatalogDependencies(
+    dependencySpecs,
+    input.catalog,
+    "desktop staged optional runtime",
+  );
+}
+
 export const resolveGitHubPublishConfig = Effect.fn("resolveGitHubPublishConfig")(function* (
   updateChannel: "latest" | "nightly",
 ) {
@@ -2071,6 +2103,20 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
       }),
   });
 
+  const resolvedStagedOptionalRuntimeDependencies = yield* Effect.try({
+    try: () =>
+      resolveStagedOptionalRuntimeDependencies({
+        serverOptionalDependencies: serverPackageJson.optionalDependencies,
+        catalog: workspaceCatalog,
+      }),
+    catch: (cause) =>
+      new DesktopBuildDependencyResolutionError({
+        kind: "desktop-runtime",
+        manifestPath: "apps/server/package.json",
+        cause,
+      }),
+  });
+
   const appVersion = options.version ?? serverPackageJson.version;
   const iconAssets = resolveDesktopBuildIconAssets(appVersion);
   const commitHash = yield* resolveGitCommitHash(repoRoot);
@@ -2243,10 +2289,10 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
         }
       : {}),
   };
-  const stagePatchedDependencies = createStagePatchedDependencies(
-    workspacePatchedDependencies,
-    stageDependencies,
-  );
+  const stagePatchedDependencies = createStagePatchedDependencies(workspacePatchedDependencies, {
+    ...stageDependencies,
+    ...resolvedStagedOptionalRuntimeDependencies,
+  });
   const stagePackageJson: StagePackageJson = {
     name: "t3code",
     version: appVersion,
@@ -2273,6 +2319,7 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
       path.join(stageAppDir, DESKTOP_AFTER_PACK_HOOK_STAGE_PATH),
     ),
     dependencies: stageDependencies,
+    optionalDependencies: resolvedStagedOptionalRuntimeDependencies,
     devDependencies: {
       electron: electronVersion,
     },

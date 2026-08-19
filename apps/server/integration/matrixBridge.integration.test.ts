@@ -100,6 +100,10 @@ it.live("observes a real projected final through the fake Matrix client", () =>
             setOwner: () => Effect.die("setOwner is not used by this integration test"),
             clearOwnerIfMatches: () =>
               Effect.die("clearOwnerIfMatches is not used by this integration test"),
+            recordRoomIfMatches: () =>
+              Effect.die("recordRoomIfMatches is not used by this integration test"),
+            reportTransportStateIfMatches: () =>
+              Effect.die("reportTransportStateIfMatches is not used by this integration test"),
             initializeDeliveryCheckpointIfMissing: () => Effect.succeed(true),
             markDeliveredIfMatches: () => Effect.succeed(true),
             reportPermanentSendFailureIfMatches: () => Effect.succeed(true),

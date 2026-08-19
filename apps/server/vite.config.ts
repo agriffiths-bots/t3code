@@ -14,6 +14,11 @@ const externalRuntimePackageNames = new Set([
   "@effect/platform-bun",
   "@effect/sql-sqlite-bun",
   "@ff-labs/fff-node",
+  // Optional Matrix bridge dependencies: the crypto package is a native
+  // binding, and the SDK is only resolved when a bridge is configured. Keeping
+  // both external means an install without them still produces a working CLI.
+  "@matrix-org/matrix-sdk-crypto-nodejs",
+  "matrix-bot-sdk",
   "ffi-rs",
   "node-pty",
 ]);

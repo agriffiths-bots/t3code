@@ -573,6 +573,96 @@ it.layer(NodeServices.layer)("MatrixBridgeConfig", (it) => {
     }),
   );
 
+  it.effect("binds a created room to the connection that created it", () =>
+    Effect.gen(function* () {
+      const memory = makeMemorySecretStore(
+        new TextEncoder().encode(yield* encodeMatrixBridgeConfigJson(persistedConfig())),
+      );
+      const bridge = yield* makeService(memory.service);
+
+      assert.isTrue(
+        yield* bridge.recordRoomIfMatches({
+          cryptoStoreGeneration: "generation-one",
+          roomId: "!room:matrix.example.test",
+        }),
+      );
+      assert.equal(
+        Option.getOrThrow(decodeMatrixBridgeConfigJson(new TextDecoder().decode(memory.read())))
+          .roomId,
+        "!room:matrix.example.test",
+      );
+
+      // Re-verifying the same room is idempotent; a different room or a
+      // replaced connection is refused rather than silently adopted.
+      assert.isTrue(
+        yield* bridge.recordRoomIfMatches({
+          cryptoStoreGeneration: "generation-one",
+          roomId: "!room:matrix.example.test",
+        }),
+      );
+      assert.isFalse(
+        yield* bridge.recordRoomIfMatches({
+          cryptoStoreGeneration: "generation-one",
+          roomId: "!other:matrix.example.test",
+        }),
+      );
+      assert.isFalse(
+        yield* bridge.recordRoomIfMatches({
+          cryptoStoreGeneration: "generation-two",
+          roomId: "!room:matrix.example.test",
+        }),
+      );
+      assert.equal(
+        Option.getOrThrow(yield* bridge.currentConfig).roomId,
+        "!room:matrix.example.test",
+      );
+    }),
+  );
+
+  it.effect("publishes transport readiness and sanitized unavailability", () =>
+    Effect.gen(function* () {
+      const memory = makeMemorySecretStore(
+        new TextEncoder().encode(
+          yield* encodeMatrixBridgeConfigJson(
+            persistedConfig({ roomId: "!room:matrix.example.test" }),
+          ),
+        ),
+      );
+      const bridge = yield* makeService(memory.service);
+
+      assert.isTrue(
+        yield* bridge.reportTransportStateIfMatches({
+          cryptoStoreGeneration: "generation-one",
+          transport: { state: "ready" },
+        }),
+      );
+      const ready = yield* bridge.status;
+      assert.equal(ready.state, "waiting-for-member");
+      assert.isTrue(ready.encryptionReady);
+      assert.equal(ready.reason, null);
+
+      assert.isTrue(
+        yield* bridge.reportTransportStateIfMatches({
+          cryptoStoreGeneration: "generation-one",
+          transport: { state: "unavailable", reason: "Matrix encryption is unavailable." },
+        }),
+      );
+      const unavailable = yield* bridge.status;
+      assert.equal(unavailable.state, "unavailable");
+      assert.isFalse(unavailable.encryptionReady);
+      assert.equal(unavailable.reason, "Matrix encryption is unavailable.");
+
+      // A report from a replaced connection cannot move the live status.
+      assert.isFalse(
+        yield* bridge.reportTransportStateIfMatches({
+          cryptoStoreGeneration: "generation-two",
+          transport: { state: "ready" },
+        }),
+      );
+      assert.equal((yield* bridge.status).state, "unavailable");
+    }),
+  );
+
   it.effect("accepts HTTP only for literal loopback homeservers", () =>
     Effect.gen(function* () {
       const memory = makeMemorySecretStore();

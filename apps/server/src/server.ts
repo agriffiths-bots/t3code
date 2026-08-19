@@ -98,8 +98,8 @@ import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import { authHttpApiLayer, environmentAuthenticatedAuthLayer } from "./auth/http.ts";
 import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
+import * as MatrixBotSdkClient from "./matrix/MatrixBotSdkClient.ts";
 import * as MatrixBridgeConfig from "./matrix/MatrixBridgeConfig.ts";
-import * as MatrixBridgeClient from "./matrix/MatrixBridgeClient.ts";
 import * as MatrixBridgeReactor from "./matrix/MatrixBridgeReactor.ts";
 import {
   connectHttpApiLayer,
@@ -271,9 +271,7 @@ const ReactorLayerLive = Layer.empty.pipe(
   Layer.provideMerge(ChildThreadCoordinatorLive.pipe(Layer.provide(PendingDispatchRepositoryLive))),
   Layer.provideMerge(AgentAwarenessRelay.layer.pipe(Layer.provide(ServerSecretStore.layer))),
   Layer.provideMerge(RuntimeReceiptBusLive),
-  Layer.provideMerge(
-    MatrixBridgeReactor.layer.pipe(Layer.provide(MatrixBridgeClient.unavailableLayer)),
-  ),
+  Layer.provideMerge(MatrixBridgeReactor.layer.pipe(Layer.provide(MatrixBotSdkClient.layer))),
 );
 
 const ProviderSessionDirectoryLayerLive = ProviderSessionDirectoryLive.pipe(
