@@ -279,7 +279,9 @@ interface ReactorHarness {
   readonly currentConfig: Effect.Effect<Option.Option<MatrixBridgeConfigV1>>;
   readonly inspectionCount: Effect.Effect<number>;
   readonly blockNextInspection: (gate: Deferred.Deferred<void>) => Effect.Effect<void>;
+  readonly blockNextInspectionBeforeRead: (gate: Deferred.Deferred<void>) => Effect.Effect<void>;
   readonly awaitInspection: Effect.Effect<void>;
+  readonly awaitInspectionBeforeRead: Effect.Effect<void>;
   readonly awaitCheckpointInitialized: Effect.Effect<void>;
   readonly awaitOwner: (ownerThreadId: ThreadId | null) => Effect.Effect<void>;
 }
@@ -303,6 +305,7 @@ function withHarness<A, E>(
       const domainEvents = yield* Queue.unbounded<OrchestrationEvent>();
       const observedEvents = yield* Queue.unbounded<void>();
       const observedInspections = yield* Queue.unbounded<void>();
+      const observedInspectionsBeforeRead = yield* Queue.unbounded<void>();
       const initialSequence = Math.max(
         options.deliveryBaselineSequence ?? 0,
         ...(options.historicalEvents ?? []).map((event) => event.sequence),
@@ -318,6 +321,9 @@ function withHarness<A, E>(
       );
       const inspectionCountRef = yield* Ref.make(0);
       const inspectionGateRef = yield* Ref.make<Option.Option<Deferred.Deferred<void>>>(
+        Option.none(),
+      );
+      const inspectionBeforeReadGateRef = yield* Ref.make<Option.Option<Deferred.Deferred<void>>>(
         Option.none(),
       );
       const initialConfig: MatrixBridgeConfigV1 = {
@@ -478,6 +484,11 @@ function withHarness<A, E>(
       } satisfies OrchestrationEngineShape);
       const inspectThread = Effect.gen(function* () {
         yield* Ref.update(inspectionCountRef, (count) => count + 1);
+        const beforeReadGate = yield* Ref.getAndSet(inspectionBeforeReadGateRef, Option.none());
+        if (Option.isSome(beforeReadGate)) {
+          yield* Queue.offer(observedInspectionsBeforeRead, undefined);
+          yield* Deferred.await(beforeReadGate.value);
+        }
         const detail = yield* Ref.get(detailRef);
         const snapshotSequence = NonNegativeInt.make(yield* Ref.get(sequenceRef));
         const gate = yield* Ref.getAndSet(inspectionGateRef, Option.none());
@@ -546,7 +557,10 @@ function withHarness<A, E>(
           currentConfig: SubscriptionRef.get(configRef),
           inspectionCount: Ref.get(inspectionCountRef),
           blockNextInspection: (gate) => Ref.set(inspectionGateRef, Option.some(gate)),
+          blockNextInspectionBeforeRead: (gate) =>
+            Ref.set(inspectionBeforeReadGateRef, Option.some(gate)),
           awaitInspection: Queue.take(observedInspections),
+          awaitInspectionBeforeRead: Queue.take(observedInspectionsBeforeRead),
           awaitCheckpointInitialized: SubscriptionRef.changes(configRef).pipe(
             Stream.filter(
               (current) => Option.isSome(current) && current.value.deliveryCheckpointInitialized,
@@ -980,6 +994,110 @@ it.effect("sends only the final text after two mid-turn assistant completions an
   ),
 );
 
+it.effect("delivers a live final once when a newer turn starts before inspection", () =>
+  withHarness((harness) =>
+    Effect.gen(function* () {
+      const turnA = TurnId.make("turn-fast-follow-a");
+      const finalA = message({
+        id: "message-fast-follow-a-final",
+        role: "assistant",
+        text: "First final survives the fast follow-up",
+        turnId: turnA,
+        at: "2026-08-19T10:00:09.000Z",
+      });
+      const completedA = thread({
+        turnId: turnA,
+        state: "completed",
+        messages: [finalA],
+        terminalAt: "2026-08-19T10:00:10.000Z",
+      });
+      yield* harness.setThread(completedA);
+
+      const inspectionGate = yield* Deferred.make<void>();
+      yield* harness.blockNextInspectionBeforeRead(inspectionGate);
+      yield* harness.publishWithoutDrain(
+        assistantEvent({
+          turnId: turnA,
+          messageId: "message-fast-follow-a-final",
+          at: finalA.updatedAt,
+        }),
+      );
+      yield* harness.awaitInspectionBeforeRead;
+
+      const turnB = TurnId.make("turn-fast-follow-b");
+      const userB = message({
+        id: "message-fast-follow-b-user",
+        role: "user",
+        text: "One more thing",
+        turnId: turnB,
+        at: "2026-08-19T10:00:20.000Z",
+      });
+      const runningB = thread({
+        turnId: turnB,
+        state: "running",
+        requestedAt: "2026-08-19T10:00:20.000Z",
+        messages: [finalA, userB],
+      });
+      yield* harness.setThread({
+        ...runningB,
+        turns: [completedA.latestTurn!, runningB.latestTurn!],
+      });
+      yield* harness.publishWithoutDrain(
+        assistantEvent({
+          turnId: turnB,
+          messageId: "message-fast-follow-b-user",
+          role: "user",
+          at: userB.updatedAt,
+        }),
+      );
+
+      yield* Deferred.succeed(inspectionGate, undefined);
+      yield* harness.reactor.drain;
+      expect((yield* harness.fake.sent).map((entry) => entry.content.body)).toEqual([
+        "First final survives the fast follow-up",
+      ]);
+
+      const finalB = message({
+        id: "message-fast-follow-b-final",
+        role: "assistant",
+        text: "Second final arrives later",
+        turnId: turnB,
+        at: "2026-08-19T10:00:29.000Z",
+      });
+      const completedB = thread({
+        turnId: turnB,
+        state: "completed",
+        requestedAt: "2026-08-19T10:00:20.000Z",
+        messages: [finalA, userB, finalB],
+        terminalAt: "2026-08-19T10:00:30.000Z",
+      });
+      yield* harness.setThread({
+        ...completedB,
+        turns: [completedA.latestTurn!, completedB.latestTurn!],
+      });
+      yield* harness.publish(
+        assistantEvent({
+          turnId: turnB,
+          messageId: "message-fast-follow-b-final",
+          at: finalB.updatedAt,
+        }),
+      );
+      yield* harness.publish(
+        assistantEvent({
+          turnId: turnA,
+          messageId: "message-fast-follow-a-final-repeated",
+          at: finalA.updatedAt,
+        }),
+      );
+
+      expect((yield* harness.fake.sent).map((entry) => entry.content.body)).toEqual([
+        "First final survives the fast follow-up",
+        "Second final arrives later",
+      ]);
+    }),
+  ),
+);
+
 it.effect("bridges completed and interrupted turns but never errored partial text", () =>
   Effect.forEach(
     [
@@ -1219,76 +1337,90 @@ it.effect("re-evaluates a pending final once when each terminal marker arrives",
   ),
 );
 
-it.effect("ignores approval-opening, stale-terminal, chunk, user, and tool events", () =>
-  withHarness((harness) =>
-    Effect.gen(function* () {
-      const turnId = TurnId.make("turn-negative");
-      const segment = message({
-        id: "message-approval-opening",
-        role: "assistant",
-        text: "Please approve this command.",
-        turnId,
-        at: "2026-08-19T10:00:01.000Z",
-      });
-      yield* harness.setThread(
-        thread({
-          turnId,
-          state: "running",
-          messages: [segment],
-          sessionStatus: "waiting",
-        }),
-      );
-      yield* harness.publish(
-        assistantEvent({
-          turnId,
-          messageId: "message-approval-opening",
-          at: segment.updatedAt,
-        }),
-      );
-      yield* harness.publish(
-        assistantEvent({
-          turnId,
-          messageId: "message-streaming",
-          streaming: true,
-          at: "2026-08-19T10:00:02.000Z",
-        }),
-      );
-      yield* harness.publish(
-        assistantEvent({
-          turnId: null,
-          messageId: "message-user",
-          role: "user",
-          at: "2026-08-19T10:00:03.000Z",
-        }),
-      );
-      yield* harness.publish(toolEvent(threadA, turnId, "2026-08-19T10:00:04.000Z"));
+it.effect("ignores stale startup history plus non-final live events", () => {
+  const staleTurnId = TurnId.make("turn-stale-startup-history");
+  const staleFinal = message({
+    id: "message-stale-startup-final",
+    role: "assistant",
+    text: "Superseded startup response",
+    turnId: staleTurnId,
+    at: "2026-08-19T10:00:09.000Z",
+  });
+  const newerUser = message({
+    id: "message-newer-user",
+    role: "user",
+    text: "Start the next turn",
+    at: "2026-08-19T10:00:20.000Z",
+  });
+  return withHarness(
+    (harness) =>
+      Effect.gen(function* () {
+        expect(yield* harness.fake.sent).toEqual([]);
 
-      const staleUser = message({
-        id: "message-newer-user",
-        role: "user",
-        text: "Start the next turn",
-        at: "2026-08-19T10:00:20.000Z",
-      });
-      yield* harness.setThread(
-        thread({
-          turnId,
-          state: "completed",
-          messages: [segment, staleUser],
-          terminalAt: "2026-08-19T10:00:10.000Z",
-        }),
-      );
-      yield* harness.publish(
-        assistantEvent({
-          turnId,
-          messageId: "message-approval-opening",
-          at: segment.updatedAt,
-        }),
-      );
+        const liveTurnId = TurnId.make("turn-negative-live-events");
+        const segment = message({
+          id: "message-approval-opening",
+          role: "assistant",
+          text: "Please approve this command.",
+          turnId: liveTurnId,
+          at: "2026-08-19T10:00:21.000Z",
+        });
+        yield* harness.setThread(
+          thread({
+            turnId: liveTurnId,
+            state: "running",
+            requestedAt: "2026-08-19T10:00:20.000Z",
+            messages: [staleFinal, newerUser, segment],
+            sessionStatus: "waiting",
+          }),
+        );
+        yield* harness.publish(
+          assistantEvent({
+            turnId: liveTurnId,
+            messageId: "message-approval-opening",
+            at: segment.updatedAt,
+          }),
+        );
+        yield* harness.publish(
+          assistantEvent({
+            turnId: liveTurnId,
+            messageId: "message-streaming",
+            streaming: true,
+            at: "2026-08-19T10:00:22.000Z",
+          }),
+        );
+        yield* harness.publish(
+          assistantEvent({
+            turnId: null,
+            messageId: "message-user",
+            role: "user",
+            at: "2026-08-19T10:00:23.000Z",
+          }),
+        );
+        yield* harness.publish(toolEvent(threadA, liveTurnId, "2026-08-19T10:00:24.000Z"));
 
-      expect(yield* harness.fake.sent).toEqual([]);
-    }),
-  ),
-);
+        expect(yield* harness.fake.sent).toEqual([]);
+      }),
+    {
+      initialThread: thread({
+        turnId: staleTurnId,
+        state: "completed",
+        messages: [staleFinal, newerUser],
+        terminalAt: "2026-08-19T10:00:10.000Z",
+      }),
+      historicalEvents: [
+        atSequence(
+          assistantEvent({
+            turnId: staleTurnId,
+            messageId: "message-stale-startup-final",
+            at: staleFinal.updatedAt,
+          }),
+          1,
+        ),
+      ],
+    },
+  );
+});
 
 it.effect("uses projected text and dedupes repeated terminal events after the terminal check", () =>
   withHarness((harness) =>

@@ -35,6 +35,7 @@ interface TerminalCandidate {
   readonly sequence: number;
   readonly ownershipEpoch: number;
   readonly cryptoStoreGeneration: string;
+  readonly origin: "live-event" | "startup-recovery";
 }
 
 interface OutboundJob extends TerminalCandidate {
@@ -216,7 +217,8 @@ export const make = Effect.gen(function* () {
     left.threadId === right.threadId &&
     left.turnId === right.turnId &&
     left.ownershipEpoch === right.ownershipEpoch &&
-    left.cryptoStoreGeneration === right.cryptoStoreGeneration;
+    left.cryptoStoreGeneration === right.cryptoStoreGeneration &&
+    left.origin === right.origin;
 
   const retainPendingCandidate = (candidate: TerminalCandidate) => {
     const retained = pendingCandidates.get(candidate.threadId);
@@ -439,10 +441,14 @@ export const make = Effect.gen(function* () {
         finalMessage.updatedAt,
       );
       if (terminalAt === null) return;
-      const latestUserAt = latestUserMessageAt(detail.value);
-      if (latestUserAt !== null && latestUserAt > terminalAt) {
-        forgetPendingCandidate(candidate);
-        return;
+      if (candidate.origin === "startup-recovery") {
+        // Startup recovery can rediscover superseded history. A live event is
+        // already a delivery obligation and must survive later user activity.
+        const latestUserAt = latestUserMessageAt(detail.value);
+        if (latestUserAt !== null && latestUserAt > terminalAt) {
+          forgetPendingCandidate(candidate);
+          return;
+        }
       }
 
       const afterRead = currentOwner(yield* configService.currentConfig, candidate.threadId);
@@ -691,6 +697,7 @@ export const make = Effect.gen(function* () {
         sequence: recoveryEvent.value.sequence,
         ownershipEpoch: config.ownershipEpoch,
         cryptoStoreGeneration: config.cryptoStoreGeneration,
+        origin: "startup-recovery" as const,
       };
       if (retainPendingCandidate(candidate)) {
         yield* inspectProjectedCandidate(candidate, Option.some(detail));
@@ -729,6 +736,7 @@ export const make = Effect.gen(function* () {
         sequence: event.sequence,
         ownershipEpoch: current.ownershipEpoch,
         cryptoStoreGeneration: current.cryptoStoreGeneration,
+        origin: "live-event" as const,
       };
       if (!retainPendingCandidate(candidate)) return;
       const refreshed = currentOwner(yield* configService.currentConfig, candidate.threadId);
