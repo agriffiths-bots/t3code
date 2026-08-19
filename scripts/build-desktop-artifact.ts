@@ -37,6 +37,7 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { Command, Flag } from "effect/unstable/cli";
+import { FetchHttpClient, HttpClient, HttpClientResponse } from "effect/unstable/http";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
 const LINUX_ICON_SIZES = [16, 22, 24, 32, 48, 64, 128, 256, 512] as const;
@@ -479,6 +480,30 @@ export class WslNodePtyPrebuildMissingError extends Schema.TaggedErrorClass<WslN
 ) {
   override get message(): string {
     return `WSL node-pty prebuild not found at ${this.prebuildPath}.`;
+  }
+}
+
+export class MatrixCryptoBindingDownloadError extends Schema.TaggedErrorClass<MatrixCryptoBindingDownloadError>()(
+  "MatrixCryptoBindingDownloadError",
+  {
+    url: Schema.String,
+    cause: Schema.String,
+  },
+) {
+  override get message(): string {
+    return `Could not download the Matrix crypto binding from ${this.url}.`;
+  }
+}
+
+export class MatrixCryptoManifestReadError extends Schema.TaggedErrorClass<MatrixCryptoManifestReadError>()(
+  "MatrixCryptoManifestReadError",
+  {
+    manifestPath: Schema.String,
+    cause: Schema.Defect(),
+  },
+) {
+  override get message(): string {
+    return `Could not read the Matrix crypto package version from ${this.manifestPath}.`;
   }
 }
 
@@ -1987,6 +2012,105 @@ const assertPlatformBuildResources = Effect.fn("assertPlatformBuildResources")(f
 // checks (arch + node-pty version; the binary is N-API, hence ABI-stable across
 // Node versions). A missing prebuild is a warning, not an error, so local and
 // non-Windows builds still succeed — they just won't ship a working WSL backend.
+export interface MatrixCryptoBindingTarget {
+  readonly platform: "darwin" | "linux" | "win32";
+  readonly arch: "arm64" | "x64";
+  readonly fileName: string;
+}
+
+const MATRIX_CRYPTO_PACKAGE_NAME = "@matrix-org/matrix-sdk-crypto-nodejs";
+const decodeMatrixCryptoManifest = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(Schema.Struct({ version: Schema.String })),
+);
+
+function matrixCryptoBindingFileName(
+  platform: MatrixCryptoBindingTarget["platform"],
+  arch: MatrixCryptoBindingTarget["arch"],
+): string {
+  if (platform === "win32") return `matrix-sdk-crypto.win32-${arch}-msvc.node`;
+  if (platform === "darwin") return `matrix-sdk-crypto.darwin-${arch}.node`;
+  return `matrix-sdk-crypto.linux-${arch}-gnu.node`;
+}
+
+/**
+ * The Matrix crypto package's postinstall downloads the *host* binding, so a
+ * cross-architecture build would ship one the packaged server cannot load.
+ * These are the bindings the artifact must hold instead: the build target, plus
+ * the matching Linux one for Windows, whose WSL backend runs Linux Node.
+ */
+export function resolveMatrixCryptoBindingTargets(
+  platform: typeof BuildPlatform.Type,
+  arch: typeof BuildArch.Type,
+): ReadonlyArray<MatrixCryptoBindingTarget> {
+  const architectures = arch === "universal" ? (["arm64", "x64"] as const) : ([arch] as const);
+  const platforms: ReadonlyArray<MatrixCryptoBindingTarget["platform"]> =
+    platform === "mac" ? ["darwin"] : platform === "win" ? ["win32", "linux"] : ["linux"];
+
+  return platforms.flatMap((targetPlatform) =>
+    architectures.map((targetArch) => ({
+      platform: targetPlatform,
+      arch: targetArch,
+      fileName: matrixCryptoBindingFileName(targetPlatform, targetArch),
+    })),
+  );
+}
+
+export const MATRIX_CRYPTO_RELEASE_BASE_URL =
+  "https://github.com/matrix-org/matrix-rust-sdk-crypto-nodejs/releases/download";
+
+export function matrixCryptoBindingUrl(version: string, fileName: string): string {
+  return `${MATRIX_CRYPTO_RELEASE_BASE_URL}/v${version}/${fileName}`;
+}
+
+/**
+ * Fetches each target's binding from the pinned release.
+ *
+ * The package's own postinstall downloader is not reused for this: it picks the
+ * Linux flavour by inspecting the *running* process, so a Windows host staging
+ * the WSL binding would ask for musl and, on arm64, refuse outright.
+ */
+const stageMatrixCryptoBindings = Effect.fn("stageMatrixCryptoBindings")(function* (input: {
+  readonly stageAppDir: string;
+  readonly platform: typeof BuildPlatform.Type;
+  readonly arch: typeof BuildArch.Type;
+}) {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const httpClient = yield* HttpClient.HttpClient;
+
+  const packageLink = path.join(input.stageAppDir, "node_modules", MATRIX_CRYPTO_PACKAGE_NAME);
+  const packageDir = yield* fs.realPath(packageLink).pipe(Effect.orElseSucceed(() => packageLink));
+  const manifestPath = path.join(packageDir, "package.json");
+  if (!(yield* fs.exists(manifestPath).pipe(Effect.orElseSucceed(() => false)))) {
+    // The package is optional: without it the packaged bridge reports Matrix
+    // encryption unavailable, which is the intended fail-closed behaviour.
+    yield* Effect.logWarning(
+      "[desktop-artifact] Matrix crypto package is not staged; the packaged bridge will report encryption unavailable.",
+    );
+    return;
+  }
+  const manifest = yield* decodeMatrixCryptoManifest(yield* fs.readFileString(manifestPath)).pipe(
+    Effect.mapError((cause) => new MatrixCryptoManifestReadError({ manifestPath, cause })),
+  );
+
+  for (const target of resolveMatrixCryptoBindingTargets(input.platform, input.arch)) {
+    const targetPath = path.join(packageDir, target.fileName);
+    const url = matrixCryptoBindingUrl(manifest.version, target.fileName);
+    const bytes = yield* httpClient.get(url).pipe(
+      Effect.flatMap(HttpClientResponse.filterStatusOk),
+      Effect.flatMap((response) => response.arrayBuffer),
+      Effect.map((buffer) => new Uint8Array(buffer)),
+      Effect.mapError(
+        (cause) => new MatrixCryptoBindingDownloadError({ url, cause: `${cause._tag}` }),
+      ),
+    );
+    yield* fs.writeFile(targetPath, bytes);
+    yield* Effect.log(
+      `[desktop-artifact] Staged Matrix crypto binding ${target.fileName} (${bytes.byteLength} bytes).`,
+    );
+  }
+});
+
 const stageWslNodePtyPrebuild = Effect.fn("stageWslNodePtyPrebuild")(function* (input: {
   readonly stageAppDir: string;
   readonly arch: typeof BuildArch.Type;
@@ -2354,6 +2478,11 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
     { label: "vp install --prod", verbose: options.verbose },
   );
   yield* stageClerkPasskeyNativeBinaries(stageAppDir, options.platform, options.arch);
+  yield* stageMatrixCryptoBindings({
+    stageAppDir,
+    platform: options.platform,
+    arch: options.arch,
+  });
 
   // WSL is Windows-only, so only the Windows artifact carries the Linux backend
   // binary; other platforms ignore the prebuild input.
@@ -2527,7 +2656,11 @@ const buildDesktopArtifactCli = Command.make("build-desktop-artifact", {
   Command.withHandler((input) => Effect.flatMap(resolveBuildOptions(input), buildDesktopArtifact)),
 );
 
-const cliRuntimeLayer = Layer.mergeAll(Logger.layer([Logger.consolePretty()]), NodeServices.layer);
+const cliRuntimeLayer = Layer.mergeAll(
+  Logger.layer([Logger.consolePretty()]),
+  NodeServices.layer,
+  FetchHttpClient.layer,
+);
 
 if (import.meta.main) {
   Command.run(buildDesktopArtifactCli, { version: "0.0.0" }).pipe(

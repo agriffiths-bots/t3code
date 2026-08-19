@@ -1,14 +1,16 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import { MatrixBridgeOperationError } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
-import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import { TestClock } from "effect/testing";
 
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as ServerConfig from "../config.ts";
@@ -49,6 +51,15 @@ interface FakeSdkOptions {
   readonly joinedRooms?: ReadonlyArray<string>;
   readonly syncToken?: string | null;
   readonly storedFilter?: MatrixSdkFilterInfo | null;
+  /** Content of the catch-up batch each `start()` delivers, as a server would. */
+  readonly catchUp?: {
+    readonly roomKeys?: ReadonlyArray<string>;
+    readonly timeline?: ReadonlyArray<{
+      readonly roomId?: string;
+      readonly sessionKey?: string;
+      readonly event: unknown;
+    }>;
+  };
   readonly cryptoReady?: boolean;
   readonly failSendsWith?: ReadonlyArray<unknown>;
 }
@@ -85,7 +96,16 @@ interface FakeSdk {
   }>;
   readonly syncStorePaths: Array<string>;
   readonly cryptoStores: Array<{ readonly storagePath: string; readonly storeType: number }>;
-  readonly emit: (roomId: string, event: unknown) => void;
+  /** Mirrors one processed sync batch: cursor first, then crypto, then events. */
+  readonly deliverSyncBatch: (batch: {
+    readonly cursor: string;
+    readonly roomKeys?: ReadonlyArray<string>;
+    readonly timeline?: ReadonlyArray<{
+      readonly roomId?: string;
+      readonly sessionKey?: string;
+      readonly event: unknown;
+    }>;
+  }) => void;
   readonly started: Deferred.Deferred<void>;
 }
 
@@ -100,12 +120,34 @@ const makeFakeSdk = (options: FakeSdkOptions = {}): FakeSdk => {
   const syncStorePaths: Array<string> = [];
   const cryptoStores: Array<{ readonly storagePath: string; readonly storeType: number }> = [];
   const handlers = new Map<string, Set<MatrixSdkEventHandler>>();
+  const knownRoomKeys = new Set<string>();
   const started = Deferred.makeUnsafe<void>();
+  let liveClient: { readonly storage: MatrixSdkStorageProvider } | null = null;
   const failSends = [...(options.failSendsWith ?? [])];
   const roomState = options.roomState ?? encryptedRoomState();
   let syncToken: string | null = options.syncToken ?? null;
   let storedFilter: MatrixSdkFilterInfo | null = options.storedFilter ?? null;
   let encryptionCounter = 0;
+  let batchCounter = 0;
+
+  const deliverSyncBatch: FakeSdk["deliverSyncBatch"] = ({
+    cursor,
+    roomKeys = [],
+    timeline = [],
+  }) => {
+    // matrix-bot-sdk persists the cursor before it processes the batch.
+    liveClient?.storage.setSyncToken(cursor);
+    // To-device room keys reach the crypto store even for a fenced batch.
+    for (const key of roomKeys) knownRoomKeys.add(key);
+    for (const entry of timeline) {
+      // An event whose Megolm session never arrived cannot be decrypted, so
+      // the SDK would emit a failed decryption instead of this event.
+      if (entry.sessionKey !== undefined && !knownRoomKeys.has(entry.sessionKey)) continue;
+      for (const handler of handlers.get("room.decrypted_event") ?? []) {
+        handler(entry.roomId ?? ROOM_ID, entry.event);
+      }
+    }
+  };
 
   class FakeStorageProvider implements MatrixSdkStorageProvider {
     constructor(filename: string) {
@@ -164,6 +206,7 @@ const makeFakeSdk = (options: FakeSdkOptions = {}): FakeSdk => {
     ) {
       this.storage = storage;
       this.cryptoStore = cryptoStore;
+      liveClient = { storage };
       clientOptions.push({ homeserverUrl, accessToken });
     }
 
@@ -213,6 +256,11 @@ const makeFakeSdk = (options: FakeSdkOptions = {}): FakeSdk => {
       startedFilters.push(filter);
       startedAfterStoredToken.push(syncToken);
       Deferred.doneUnsafe(started, Effect.void);
+      // The sync loop runs in the background; its first response arrives just
+      // after `start` resolves.
+      batchCounter += 1;
+      const cursor = `catch-up-${batchCounter}`;
+      queueMicrotask(() => deliverSyncBatch({ cursor, ...options.catchUp }));
       return Promise.resolve(undefined);
     }
 
@@ -249,24 +297,10 @@ const makeFakeSdk = (options: FakeSdkOptions = {}): FakeSdk => {
     clientOptions,
     syncStorePaths,
     cryptoStores,
-    emit: (roomId, event) => {
-      for (const handler of handlers.get("room.decrypted_event") ?? []) handler(roomId, event);
-    },
+    deliverSyncBatch,
     started,
   };
 };
-
-/** Decodes the filter exactly as it travels on the wire. */
-const decodeFenceFilter = Schema.decodeSync(
-  Schema.fromJsonString(
-    Schema.Struct({
-      room: Schema.Struct({
-        rooms: Schema.Array(Schema.String),
-        timeline: Schema.Struct({ limit: Schema.Number }),
-      }),
-    }),
-  ),
-);
 
 const decryptedTextEvent = (input: {
   readonly eventId: string;
@@ -497,52 +531,185 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
     }).pipe(Effect.provide(testLayer)),
   );
 
-  it.effect("fences the initial sync cursor before the sync loop starts", () =>
+  it.effect("adopts the created room when persisting it fails", () =>
+    Effect.gen(function* () {
+      const sdk = makeFakeSdk();
+      const configService = yield* configureBridge();
+      let persistFailures = 1;
+      const flakyPersistence = MatrixBridgeConfig.of({
+        ...configService,
+        recordRoomIfMatches: (expected) => {
+          if (persistFailures > 0) {
+            persistFailures -= 1;
+            return Effect.fail(
+              new MatrixBridgeOperationError({
+                reason: "persistenceFailed",
+                message: "Matrix bridge configuration could not be persisted.",
+              }),
+            );
+          }
+          return configService.recordRoomIfMatches(expected);
+        },
+      });
+
+      const client = yield* make(sdk.load).pipe(
+        Effect.provideService(MatrixBridgeConfig, flakyPersistence),
+      );
+      yield* Effect.forkScoped(client.listen(() => Effect.void));
+      yield* awaitStatusState(configService, "unavailable");
+
+      // Drive the reconnect backoff; the retry must reuse the created room
+      // instead of creating a second one and re-inviting everybody.
+      const ticker = yield* Effect.forkScoped(
+        TestClock.adjust("1 second").pipe(Effect.andThen(Effect.yieldNow), Effect.forever),
+      );
+      yield* awaitStatusState(configService, "waiting-for-member");
+      yield* Fiber.interrupt(ticker);
+
+      assert.lengthOf(sdk.createdRooms, 1);
+      assert.equal(Option.getOrThrow(yield* configService.currentConfig).roomId, ROOM_ID);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("registers the sync filter before the sync loop can clear the cursor", () =>
     Effect.gen(function* () {
       const sdk = makeFakeSdk();
       yield* configureBridge();
       yield* startAdapter(sdk);
       yield* Deferred.await(sdk.started);
 
-      const fence = sdk.requests.find((request) => request.endpoint === "/_matrix/client/v3/sync");
-      assert.isDefined(fence);
-      assert.equal(fence?.method, "GET");
-      const query = fence?.qs as { readonly filter: string; readonly timeout: number };
-      assert.equal(query.timeout, 0);
-      const filter = decodeFenceFilter(query.filter);
-      assert.deepEqual([...filter.room.rooms], [ROOM_ID]);
-      assert.equal(filter.room.timeline.limit, 0);
-
-      // The filter is registered first, because registering it is what clears
-      // a stored cursor; the fence is then the last write before syncing.
-      const filterRequestIndex = sdk.requests.findIndex((request) =>
-        request.endpoint.endsWith("/filter"),
-      );
-      const fenceRequestIndex = sdk.requests.findIndex(
-        (request) => request.endpoint === "/_matrix/client/v3/sync",
-      );
-      assert.isAbove(fenceRequestIndex, filterRequestIndex);
-      assert.deepEqual([...sdk.storageWrites], [null, "fence-cursor"]);
-      // The cursor survives the sync start, so history cannot replay.
-      assert.deepEqual([...sdk.startedAfterStoredToken], ["fence-cursor"]);
+      const filterRequest = sdk.requests.find((request) => request.endpoint.endsWith("/filter"));
+      assert.isDefined(filterRequest);
+      assert.equal(filterRequest?.method, "POST");
+      assert.deepEqual(filterRequest?.body, buildSyncFilter(ROOM_ID));
+      // A filter the SDK would have to create is what wipes a stored cursor;
+      // creating the identical filter first makes that branch a no-op.
+      assert.deepEqual([...sdk.startedFilters], [buildSyncFilter(ROOM_ID)]);
+      assert.deepEqual([...sdk.storageWrites], [null]);
     }).pipe(Effect.provide(testLayer)),
   );
 
-  it.effect("keeps an existing sync cursor instead of refencing", () =>
+  it.effect("fences catch-up history while its room keys still reach encryption", () =>
+    Effect.gen(function* () {
+      // The catch-up batch carries a room key and old history at once.
+      const sdk = makeFakeSdk({
+        catchUp: {
+          roomKeys: ["megolm-session-1"],
+          timeline: [
+            {
+              sessionKey: "megolm-session-1",
+              event: decryptedTextEvent({
+                eventId: "$history",
+                sender: ALLOWED_USER_ID,
+                body: "sent before the bridge existed",
+              }),
+            },
+          ],
+        },
+      });
+      const received = yield* Queue.unbounded<MatrixBridgeInboundText>();
+      const configService = yield* configureBridge();
+      yield* startAdapter(sdk, (event) => Queue.offer(received, event));
+      yield* awaitStatusState(configService, "waiting-for-member");
+      assert.equal(yield* Queue.size(received), 0);
+
+      // A later event encrypted with the same session decrypts, which is only
+      // possible because the fenced batch was processed rather than discarded.
+      sdk.deliverSyncBatch({
+        cursor: "live-batch",
+        timeline: [
+          {
+            sessionKey: "megolm-session-1",
+            event: decryptedTextEvent({
+              eventId: "$live",
+              sender: ALLOWED_USER_ID,
+              body: "sent after the bridge started",
+            }),
+          },
+        ],
+      });
+
+      const delivered = yield* Queue.take(received);
+      assert.equal(delivered.eventId, "$live");
+      assert.equal(delivered.body, "sent after the bridge started");
+      assert.equal(yield* Queue.size(received), 0);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("re-arms the fence when a changed filter clears the stored cursor", () =>
+    Effect.gen(function* () {
+      const sdk = makeFakeSdk({
+        syncToken: "stored-cursor",
+        // A filter from an older release: registering the new one wipes the
+        // cursor, so the sync that follows is catch-up, not live traffic.
+        storedFilter: { id: "stale-filter", filter: { room: { timeline: { limit: 1 } } } },
+        catchUp: {
+          roomKeys: ["megolm-session-1"],
+          timeline: [
+            {
+              sessionKey: "megolm-session-1",
+              event: decryptedTextEvent({
+                eventId: "$history",
+                sender: ALLOWED_USER_ID,
+                body: "replayed history",
+              }),
+            },
+          ],
+        },
+      });
+      const received = yield* Queue.unbounded<MatrixBridgeInboundText>();
+      const configService = yield* configureBridge();
+      yield* startAdapter(sdk, (event) => Queue.offer(received, event));
+      yield* awaitStatusState(configService, "waiting-for-member");
+
+      assert.deepEqual([...sdk.storageWrites], [null, "catch-up-1"]);
+      assert.equal(yield* Queue.size(received), 0);
+
+      sdk.deliverSyncBatch({
+        cursor: "live-batch",
+        timeline: [
+          {
+            sessionKey: "megolm-session-1",
+            event: decryptedTextEvent({
+              eventId: "$live",
+              sender: ALLOWED_USER_ID,
+              body: "live traffic",
+            }),
+          },
+        ],
+      });
+      assert.equal((yield* Queue.take(received)).eventId, "$live");
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("delivers the first batch after a restart with a stored cursor", () =>
     Effect.gen(function* () {
       const sdk = makeFakeSdk({
         syncToken: "stored-cursor",
         storedFilter: { id: "stored-filter", filter: buildSyncFilter(ROOM_ID) },
+        // A cursor means the first batch is new traffic, not replayed history.
+        catchUp: {
+          roomKeys: ["megolm-session-1"],
+          timeline: [
+            {
+              sessionKey: "megolm-session-1",
+              event: decryptedTextEvent({
+                eventId: "$after-restart",
+                sender: ALLOWED_USER_ID,
+                body: "sent while the server was down",
+              }),
+            },
+          ],
+        },
       });
+      const received = yield* Queue.unbounded<MatrixBridgeInboundText>();
       yield* configureBridge();
-      yield* startAdapter(sdk);
+      yield* startAdapter(sdk, (event) => Queue.offer(received, event));
       yield* Deferred.await(sdk.started);
 
-      assert.isUndefined(
-        sdk.requests.find((request) => request.endpoint === "/_matrix/client/v3/sync"),
-      );
+      assert.equal((yield* Queue.take(received)).eventId, "$after-restart");
+      // Nothing was refenced, so the filter survives untouched.
       assert.isUndefined(sdk.requests.find((request) => request.endpoint.endsWith("/filter")));
-      assert.lengthOf(sdk.storageWrites, 0);
       assert.deepEqual([...sdk.startedAfterStoredToken], ["stored-cursor"]);
     }).pipe(Effect.provide(testLayer)),
   );
@@ -583,19 +750,31 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
     Effect.gen(function* () {
       const sdk = makeFakeSdk();
       const received = yield* Queue.unbounded<MatrixBridgeInboundText>();
-      yield* configureBridge();
+      const configService = yield* configureBridge();
       yield* startAdapter(sdk, (event) => Queue.offer(received, event));
-      yield* Deferred.await(sdk.started);
-
-      sdk.emit(ROOM_ID, decryptedTextEvent({ eventId: "$bot", sender: BOT_USER_ID, body: "echo" }));
-      sdk.emit(
-        "!other:matrix.example.test",
-        decryptedTextEvent({ eventId: "$other-room", sender: ALLOWED_USER_ID, body: "elsewhere" }),
-      );
-      sdk.emit(
-        ROOM_ID,
-        decryptedTextEvent({ eventId: "$adam", sender: ALLOWED_USER_ID, body: "hello" }),
-      );
+      // Readiness means the catch-up batch landed, so this one is live traffic.
+      yield* awaitStatusState(configService, "waiting-for-member");
+      sdk.deliverSyncBatch({
+        cursor: "live-batch",
+        timeline: [
+          { event: decryptedTextEvent({ eventId: "$bot", sender: BOT_USER_ID, body: "echo" }) },
+          {
+            roomId: "!other:matrix.example.test",
+            event: decryptedTextEvent({
+              eventId: "$other-room",
+              sender: ALLOWED_USER_ID,
+              body: "elsewhere",
+            }),
+          },
+          {
+            event: decryptedTextEvent({
+              eventId: "$adam",
+              sender: ALLOWED_USER_ID,
+              body: "hello",
+            }),
+          },
+        ],
+      });
 
       // Only the allowed sender's message in the bridged room is delivered, so
       // the first taken event proves the two ignored ones never queued.

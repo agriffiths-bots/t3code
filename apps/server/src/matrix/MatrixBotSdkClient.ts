@@ -1,3 +1,4 @@
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -41,18 +42,6 @@ export function reconnectDelayMs(attempt: number): number {
     MATRIX_RECONNECT_MAX_DELAY_MS,
   );
 }
-
-/** Timeline fence: one cursor, zero replayed history. */
-const buildFenceFilter = (roomId: string) => ({
-  presence: { types: [] },
-  account_data: { types: [] },
-  room: {
-    rooms: [roomId],
-    timeline: { limit: 0 },
-    ephemeral: { types: [] },
-    account_data: { types: [] },
-  },
-});
 
 /**
  * Sync filter for the one bridged room. To-device traffic is deliberately
@@ -426,43 +415,70 @@ export const ensureSyncFilter = Effect.fn("MatrixBotSdkClient.ensureSyncFilter")
 });
 
 /**
- * Stores a cursor from an empty timeline before the first sync so existing
- * room history is never replayed into T3.
+ * Suppresses the catch-up sync's timeline without starving encryption.
+ *
+ * A fresh store has no cursor, so the SDK's first sync returns whatever the
+ * homeserver still holds: room keys and device-list updates that encryption
+ * needs, and old timeline messages that must never reach T3 as commands.
+ * Discarding that response would acknowledge the to-device messages and leave
+ * later events undecryptable, so the response is processed in full and only the
+ * bridge's own handlers are gated.
+ *
+ * `MatrixClient` persists each batch's cursor before it emits that batch's
+ * events (`persistTokenAfterSync` is false), so the number of stored cursors
+ * identifies the batch being emitted: the first belongs to the catch-up sync,
+ * everything after it is live.
  */
-export const fenceInitialSync = Effect.fn("MatrixBotSdkClient.fenceInitialSync")(function* (
-  client: MatrixSdkClient,
-  storage: MatrixSdkStorageProvider,
-  roomId: string,
-) {
-  const existing = yield* Effect.try({
-    try: () => storage.getSyncToken(),
-    catch: () => clientError("listen", "The Matrix sync store could not be read.", "permanent"),
-  });
-  if (existing !== null && existing !== undefined && existing !== "") return;
+export interface FencedSyncStorage {
+  /** Handed to the SDK in place of the real provider. */
+  readonly storage: MatrixSdkStorageProvider;
+  /** False only while the pre-fence catch-up batch is being emitted. */
+  readonly acceptsTimelineEvents: () => boolean;
+  readonly syncedBatches: () => number;
+  /**
+   * Completes once the catch-up boundary exists, so nothing is announced as
+   * ready while a message the owner sends could still land in the fenced batch.
+   */
+  readonly awaitSyncBoundary: Effect.Effect<void>;
+}
 
-  const response = yield* request(
-    "listen",
-    "The Matrix sync cursor could not be established.",
-    () =>
-      client.doRequest("GET", "/_matrix/client/v3/sync", {
-        filter: JSON.stringify(buildFenceFilter(roomId)),
-        timeout: 0,
-      }),
-  );
-  const nextBatch = readString(response, "next_batch");
-  if (nextBatch === null) {
-    return yield* clientError(
-      "listen",
-      "The homeserver did not return a Matrix sync cursor.",
-      "transient",
-    );
-  }
-  yield* Effect.try({
-    try: () => storage.setSyncToken(nextBatch),
-    catch: () =>
-      clientError("listen", "The Matrix sync cursor could not be persisted.", "transient"),
-  });
-});
+export function createFencedSyncStorage(inner: MatrixSdkStorageProvider): FencedSyncStorage {
+  // A store that already has a cursor cannot replay history, so nothing is
+  // fenced and no live message is dropped after a restart.
+  let fenced = (inner.getSyncToken() ?? "") === "";
+  let syncedBatches = 0;
+  let boundary = Deferred.makeUnsafe<void>();
+  if (!fenced) Deferred.doneUnsafe(boundary, Effect.void);
+
+  const storage: MatrixSdkStorageProvider = {
+    getSyncToken: () => inner.getSyncToken(),
+    setSyncToken: (token) => {
+      // The write comes first: a store that failed to persist the cursor has
+      // not advanced the batch, and a retry of the same catch-up must stay
+      // fenced rather than count as a second batch.
+      inner.setSyncToken(token);
+      if (token === null || token === "") {
+        // Registering a filter clears the cursor, and the sync that follows is
+        // a fresh catch-up: re-arm rather than trusting the state at startup.
+        fenced = true;
+        syncedBatches = 0;
+        boundary = Deferred.makeUnsafe<void>();
+      } else {
+        syncedBatches += 1;
+        Deferred.doneUnsafe(boundary, Effect.void);
+      }
+    },
+    getFilter: () => inner.getFilter(),
+    setFilter: (filter) => inner.setFilter(filter),
+  };
+
+  return {
+    storage,
+    acceptsTimelineEvents: () => !fenced || syncedBatches >= 2,
+    syncedBatches: () => syncedBatches,
+    awaitSyncBoundary: Effect.suspend(() => Deferred.await(boundary)),
+  };
+}
 
 interface MatrixConnection {
   readonly cryptoStoreGeneration: string;
@@ -480,6 +496,8 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const connectionRef = yield* Ref.make(Option.none<MatrixConnection>());
+  /** Rooms created but not yet persisted, keyed by connection generation. */
+  const createdRooms = new Map<string, string>();
 
   const currentConfig = configService.currentConfig;
 
@@ -494,8 +512,8 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
 
   /**
    * Completes when the stored connection identity is replaced or removed.
-   * Reconfiguration always mints a new crypto-store generation, so comparing
-   * that one field covers homeserver, token, and allowlist changes.
+   * Reconfiguration mints a new crypto-store generation whenever the
+   * homeserver, token, or allowlist changes.
    */
   const awaitGenerationReplaced = (cryptoStoreGeneration: string) =>
     configService.statusChanges.pipe(
@@ -503,6 +521,24 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
       Stream.filter(
         (config) =>
           Option.isNone(config) || config.value.cryptoStoreGeneration !== cryptoStoreGeneration,
+      ),
+      Stream.runHead,
+      Effect.asVoid,
+    );
+
+  /**
+   * Completes on a replaced identity or on a fresh `connecting` publication.
+   * Resubmitting identical settings keeps the generation, and an operator who
+   * fixed a permission problem elsewhere expects that Connect to retry.
+   */
+  const awaitReconnectSignal = (cryptoStoreGeneration: string) =>
+    configService.statusChanges.pipe(
+      Stream.mapEffect((status) => Effect.map(currentConfig, (config) => ({ status, config }))),
+      Stream.filter(
+        ({ status, config }) =>
+          Option.isNone(config) ||
+          config.value.cryptoStoreGeneration !== cryptoStoreGeneration ||
+          status.state === "connecting",
       ),
       Stream.runHead,
       Effect.asVoid,
@@ -554,9 +590,16 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
       return config.roomId;
     }
 
-    const roomId = yield* request("listen", "The encrypted Matrix room could not be created.", () =>
-      client.createRoom(buildEncryptedRoomCreateOptions(config.allowedUserIds)),
-    );
+    // A room created but not yet persisted is adopted on the next attempt.
+    // Without this, a secret-store outage would create and invite into a fresh
+    // room on every retry.
+    const unpersisted = createdRooms.get(config.cryptoStoreGeneration);
+    const roomId =
+      unpersisted ??
+      (yield* request("listen", "The encrypted Matrix room could not be created.", () =>
+        client.createRoom(buildEncryptedRoomCreateOptions(config.allowedUserIds)),
+      ));
+    createdRooms.set(config.cryptoStoreGeneration, roomId);
     const recorded = yield* configService
       .recordRoomIfMatches({
         cryptoStoreGeneration: config.cryptoStoreGeneration,
@@ -574,6 +617,7 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
         "permanent",
       );
     }
+    createdRooms.delete(config.cryptoStoreGeneration);
     // Presets and power levels are homeserver-implemented: confirm the room
     // really came back invite-only, encrypted, and bot-administered before
     // anything is sent to it.
@@ -597,7 +641,7 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
     yield* installQuietSdkLogger(module);
 
     const storeDir = yield* prepareStoreDirectory(config.cryptoStoreGeneration);
-    const { client, storage } = yield* Effect.acquireRelease(
+    const { client, storage, fence } = yield* Effect.acquireRelease(
       Effect.try({
         try: () => {
           const storageProvider = new module.SimpleFsStorageProvider(
@@ -607,14 +651,20 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
             path.join(storeDir, MATRIX_CRYPTO_STORE_DIRECTORY_NAME),
             MATRIX_CRYPTO_SQLITE_STORE_TYPE,
           );
+          // The SDK writes through the fence so the catch-up batch is
+          // recognisable; encryption still receives that batch in full.
+          const fencedStorage = createFencedSyncStorage(storageProvider);
           return {
             client: new module.MatrixClient(
               config.homeserverUrl,
               config.accessToken,
-              storageProvider,
+              fencedStorage.storage,
               cryptoStore,
             ),
-            storage: storageProvider,
+            // Everything writes through the fence, so a cleared cursor re-arms
+            // it wherever the clearing happened.
+            storage: fencedStorage.storage,
+            fence: fencedStorage,
           };
         },
         catch: () =>
@@ -634,15 +684,17 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
     );
     const roomId = yield* ensureRoom(client, config, botUserId);
     const syncFilter = buildSyncFilter(roomId);
-    // Filter first, fence second: registering the filter is what clears a
-    // stored cursor, so the fence has to be the last write before syncing.
+    // Registering a filter clears the stored cursor, so it happens before the
+    // sync loop starts rather than inside it.
     yield* ensureSyncFilter(client, storage, botUserId, syncFilter);
-    yield* fenceInitialSync(client, storage, roomId);
 
     const inbound = yield* Queue.dropping<MatrixBridgeInboundText>(MATRIX_INBOUND_QUEUE_CAPACITY);
     yield* Effect.acquireRelease(
       Effect.sync(() => {
         const handler: MatrixSdkEventHandler = (eventRoomId, event) => {
+          // Pre-fence history is dropped here, after the SDK has taken the
+          // batch's room keys and device updates into the crypto store.
+          if (!fence.acceptsTimelineEvents()) return;
           const message = toInboundText(event, eventRoomId, roomId, botUserId);
           if (message !== null) Queue.offerUnsafe(inbound, message);
         };
@@ -672,6 +724,15 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
         "permanent",
       );
     }
+
+    // `start` only launches the sync loop. Until its first response fixes the
+    // catch-up boundary, a message sent now would arrive inside the fenced
+    // batch and be dropped, so readiness waits for that boundary. The wait is
+    // unbounded on purpose: the SDK retries the sync itself, and `stop()`
+    // cannot cancel a request in flight, so timing out here would leave a
+    // second client writing to the same sync and crypto stores.
+    yield* Effect.logDebug("Matrix bridge waiting for its first sync response");
+    yield* fence.awaitSyncBoundary;
 
     const connection: MatrixConnection = {
       cryptoStoreGeneration: config.cryptoStoreGeneration,
@@ -722,7 +783,7 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
         if (outcome.failure.retryability === "permanent") {
           // A deterministic failure cannot be retried into success, so wait for
           // a human to reconfigure instead of looping on the same error.
-          yield* awaitGenerationReplaced(config.cryptoStoreGeneration);
+          yield* awaitReconnectSignal(config.cryptoStoreGeneration);
           attempt = 0;
           continue;
         }

@@ -15,10 +15,11 @@ import {
   buildEncryptedRoomCreateOptions,
   buildSyncFilter,
   encryptedSendEndpoint,
+  createFencedSyncStorage,
   ensureSyncFilter,
-  fenceInitialSync,
   loadMatrixBotSdk,
   verifyEncryptedRoom,
+  type FencedSyncStorage,
   type MatrixSdkClient,
 } from "./MatrixBotSdkClient.ts";
 
@@ -56,6 +57,18 @@ function readCredentials(): typeof SmokeCredentials.Type | null {
 const credentials = readCredentials();
 const describeSmoke = credentials === null ? describe.skip : describe;
 
+const FIRST_SYNC_POLL_INTERVAL_MS = 250;
+const FIRST_SYNC_ATTEMPTS = 120;
+
+/** The sync loop runs in the background, so its first batch is polled for. */
+const awaitFirstSyncBatch = Effect.fn("awaitFirstSyncBatch")(function* (fence: FencedSyncStorage) {
+  for (let attempt = 0; attempt < FIRST_SYNC_ATTEMPTS; attempt += 1) {
+    if (fence.syncedBatches() > 0) return;
+    yield* Effect.sleep(FIRST_SYNC_POLL_INTERVAL_MS);
+  }
+  assert.fail("The homeserver never delivered a sync batch.");
+});
+
 /** Cleanup-only calls the bridge never makes in production. */
 interface SmokeClient extends MatrixSdkClient {
   leaveRoom(roomId: string): Promise<unknown>;
@@ -63,7 +76,8 @@ interface SmokeClient extends MatrixSdkClient {
 }
 
 describeSmoke("MatrixBotSdkClient live homeserver smoke", () => {
-  it.effect(
+  // Real clock: this test waits on a live homeserver, not on virtual time.
+  it.live(
     "logs in, creates a verified encrypted room, and sends one idempotent message",
     () =>
       Effect.gen(function* () {
@@ -90,13 +104,14 @@ describeSmoke("MatrixBotSdkClient live homeserver smoke", () => {
           NodePath.join(storeDir, MATRIX_CRYPTO_STORE_DIRECTORY_NAME),
           MATRIX_CRYPTO_SQLITE_STORE_TYPE,
         );
+        const fence = createFencedSyncStorage(storage);
         const client = yield* Effect.acquireRelease(
           Effect.sync(
             () =>
               new module.MatrixClient(
                 credentials.homeserverUrl,
                 credentials.accessToken,
-                storage,
+                fence.storage,
                 cryptoStore,
               ) as SmokeClient,
           ),
@@ -122,11 +137,15 @@ describeSmoke("MatrixBotSdkClient live homeserver smoke", () => {
 
         yield* verifyEncryptedRoom(client, roomId, botUserId);
         const syncFilter = buildSyncFilter(roomId);
-        yield* ensureSyncFilter(client, storage, botUserId, syncFilter);
-        yield* fenceInitialSync(client, storage, roomId);
-        assert.isNotNull(storage.getSyncToken());
+        yield* ensureSyncFilter(client, fence.storage, botUserId, syncFilter);
 
         yield* Effect.promise(() => client.start(syncFilter));
+        // `start` resolves once the sync loop is launched, so the first batch
+        // has to be waited for. The SDK processes it in full, which is how its
+        // room keys reach the crypto store even though its timeline is fenced
+        // off the bridge.
+        yield* awaitFirstSyncBatch(fence);
+        assert.isNotNull(fence.storage.getSyncToken());
         const crypto = client.crypto;
         assert.isDefined(crypto);
         assert.isTrue(crypto?.isReady);

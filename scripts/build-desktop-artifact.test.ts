@@ -40,6 +40,8 @@ import {
   resolveMacPasskeySigningConfiguration,
   resolveDesktopRuntimeDependencies,
   resolveStagedRuntimeDependencies,
+  matrixCryptoBindingUrl,
+  resolveMatrixCryptoBindingTargets,
   resolveStagedOptionalRuntimeDependencies,
   resolveFfiRsNativeDependencies,
   resolveFffNativeDependencies,
@@ -302,6 +304,37 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
         catalog: {},
       }),
       {},
+    );
+  });
+
+  it("stages the Matrix crypto binding for the build target, not the build host", () => {
+    assert.deepStrictEqual(resolveMatrixCryptoBindingTargets("linux", "arm64"), [
+      { platform: "linux", arch: "arm64", fileName: "matrix-sdk-crypto.linux-arm64-gnu.node" },
+    ]);
+    assert.deepStrictEqual(resolveMatrixCryptoBindingTargets("mac", "x64"), [
+      { platform: "darwin", arch: "x64", fileName: "matrix-sdk-crypto.darwin-x64.node" },
+    ]);
+    // A universal macOS artifact runs on both architectures.
+    assert.deepStrictEqual(resolveMatrixCryptoBindingTargets("mac", "universal"), [
+      { platform: "darwin", arch: "arm64", fileName: "matrix-sdk-crypto.darwin-arm64.node" },
+      { platform: "darwin", arch: "x64", fileName: "matrix-sdk-crypto.darwin-x64.node" },
+    ]);
+    // Windows also carries the Linux binding for its WSL backend, and it is the
+    // glibc build regardless of the host the artifact is produced on.
+    assert.deepStrictEqual(resolveMatrixCryptoBindingTargets("win", "x64"), [
+      { platform: "win32", arch: "x64", fileName: "matrix-sdk-crypto.win32-x64-msvc.node" },
+      { platform: "linux", arch: "x64", fileName: "matrix-sdk-crypto.linux-x64-gnu.node" },
+    ]);
+    assert.deepStrictEqual(resolveMatrixCryptoBindingTargets("win", "arm64"), [
+      { platform: "win32", arch: "arm64", fileName: "matrix-sdk-crypto.win32-arm64-msvc.node" },
+      { platform: "linux", arch: "arm64", fileName: "matrix-sdk-crypto.linux-arm64-gnu.node" },
+    ]);
+  });
+
+  it("downloads each staged binding from the pinned crypto release", () => {
+    assert.equal(
+      matrixCryptoBindingUrl("0.4.0", "matrix-sdk-crypto.linux-x64-gnu.node"),
+      "https://github.com/matrix-org/matrix-rust-sdk-crypto-nodejs/releases/download/v0.4.0/matrix-sdk-crypto.linux-x64-gnu.node",
     );
   });
 

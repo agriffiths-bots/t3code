@@ -285,11 +285,27 @@ async function pruneScopedNativePackages(unpackedRoot, scopeDir, platform, archN
   await removeEmptyDirectories(scopeDir);
 }
 
-export function matrixCryptoBindingPrefix(platform, archName) {
-  if (platform === "darwin") return `matrix-sdk-crypto.darwin-${archName}`;
-  if (platform === "win32") return `matrix-sdk-crypto.win32-${archName}`;
-  const linuxArch = linuxArchFor(archName);
-  return linuxArch === null ? null : `matrix-sdk-crypto.linux-${linuxArch}`;
+// Windows packages also run the bundled server under WSL with Linux Node, so
+// they keep the matching Linux binding beside the Windows one, exactly as the
+// other native sidecars do.
+export function matrixCryptoBindingPrefixes(platform, archName) {
+  // A universal macOS package runs on both architectures and therefore keeps
+  // both bindings, plus the universal one the loader looks for first.
+  const archNames = archName === "universal" ? ["arm64", "x64"] : [archName];
+  if (platform === "darwin") {
+    return [
+      "matrix-sdk-crypto.darwin-universal",
+      ...archNames.map((name) => `matrix-sdk-crypto.darwin-${name}`),
+    ];
+  }
+  const linuxPrefixes = archNames
+    .map((name) => linuxArchFor(name))
+    .filter((name) => name !== null)
+    .map((name) => `matrix-sdk-crypto.linux-${name}`);
+  if (platform === "win32") {
+    return [...archNames.map((name) => `matrix-sdk-crypto.win32-${name}`), ...linuxPrefixes];
+  }
+  return linuxPrefixes;
 }
 
 // The Matrix crypto package ships one ~22 MB binding per platform plus an
@@ -300,7 +316,7 @@ async function pruneMatrixCryptoBinding(packageDir, platform, arch) {
     return;
   }
   const archName = resolveArchName(arch);
-  if (archName === null || archName === "universal") {
+  if (archName === null) {
     return;
   }
 
@@ -308,12 +324,12 @@ async function pruneMatrixCryptoBinding(packageDir, platform, arch) {
     MATRIX_CRYPTO_REMOVED_ENTRY_NAMES.map((name) => removePath(NodePath.join(packageDir, name))),
   );
 
-  const keepPrefix = matrixCryptoBindingPrefix(platform, archName);
+  const keepPrefixes = matrixCryptoBindingPrefixes(platform, archName);
   for (const entry of await listEntries(packageDir)) {
     if (!entry.name.endsWith(".node")) {
       continue;
     }
-    if (keepPrefix === null || !entry.name.startsWith(keepPrefix)) {
+    if (!keepPrefixes.some((prefix) => entry.name.startsWith(prefix))) {
       await removePath(NodePath.join(packageDir, entry.name));
     }
   }
