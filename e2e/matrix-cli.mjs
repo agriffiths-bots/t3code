@@ -9,7 +9,6 @@ import * as NodeFS from "node:fs";
 import * as NodeModule from "node:module";
 import * as NodePath from "node:path";
 import * as NodeReadline from "node:readline";
-import * as NodeURL from "node:url";
 
 import { sdkCacheDir } from "./matrix-sdk-pin.mjs";
 
@@ -19,14 +18,11 @@ const CRYPTO_STORE_SQLITE = 0;
 const MEGOLM = "m.megolm.v1.aes-sha2";
 
 function loadSdk() {
-  const here = NodePath.dirname(NodeURL.fileURLToPath(import.meta.url));
-  // Only the tree for the current pin. Earlier pins can still be sitting in the
-  // cache, and silently loading one would defeat the pin.
-  const roots = [
-    process.env.MATRIX_E2E_SDK_DIR,
-    sdkCacheDir(),
-    NodePath.join(here, "..", "apps", "server"),
-  ].filter(Boolean);
+  // Only the tree for the current pin, and no fallback. Earlier pins can still
+  // be sitting in the cache, and the workspace may carry an unrelated tree; a
+  // gate that quietly loads either passes without exercising the installation
+  // it claims to verify and gives machine-dependent results.
+  const roots = [process.env.MATRIX_E2E_SDK_DIR, sdkCacheDir()].filter(Boolean);
   const errors = [];
   for (const root of roots) {
     const pkg = NodePath.join(root, "node_modules", "matrix-bot-sdk", "package.json");
