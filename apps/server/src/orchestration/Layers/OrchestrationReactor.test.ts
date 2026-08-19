@@ -125,9 +125,9 @@ describe("OrchestrationReactor", () => {
       "thread-deletion-reactor",
       "agent-awareness-relay",
       "vcs-maintenance-reactor",
+      "matrix-bridge-reactor",
       "child-thread-coordinator",
       "scheduled-tasks-reactor",
-      "matrix-bridge-reactor",
     ]);
     await Effect.runPromise(Scope.close(scope, Exit.void));
   });

@@ -4,6 +4,7 @@ import {
   ProjectId,
   ProviderInstanceId,
   ThreadId,
+  TurnId,
   type MatrixBridgeConfigureInput,
   type OrchestrationThreadShell,
 } from "@t3tools/contracts";
@@ -48,6 +49,8 @@ const persistedConfig = (overrides: Partial<MatrixBridgeConfigV1> = {}): MatrixB
   ownerThreadId: null,
   ownershipEpoch: NonNegativeInt.make(0),
   cryptoStoreGeneration: "generation-one",
+  lastDeliveredTurnId: null,
+  deliveryCheckpointInitialized: true,
   ...overrides,
 });
 
@@ -159,6 +162,94 @@ it.layer(NodeServices.layer)("MatrixBridgeConfig", (it) => {
       const decoded = decodeMatrixBridgeConfigJson(encoded);
 
       assert.deepEqual(Option.getOrThrow(decoded), input);
+    }),
+  );
+
+  it.effect("upgrades a legacy config blob without a delivery marker", () =>
+    Effect.sync(() => {
+      const decoded = decodeMatrixBridgeConfigJson(
+        '{"version":1,"homeserverUrl":"https://matrix.example.test/","accessToken":"matrix-secret-token","allowedUserIds":["@adam:beeper.com"],"roomId":null,"pairing":{"state":"unpaired"},"ownerThreadId":null,"ownershipEpoch":0,"cryptoStoreGeneration":"legacy-generation"}',
+      );
+
+      const legacy = Option.getOrThrow(decoded);
+      assert.equal(legacy.lastDeliveredTurnId, null);
+      assert.isFalse(legacy.deliveryCheckpointInitialized);
+    }),
+  );
+
+  it.effect("persists a legacy delivery baseline before startup replay is enabled", () =>
+    Effect.gen(function* () {
+      const memory = makeMemorySecretStore(
+        new TextEncoder().encode(
+          '{"version":1,"homeserverUrl":"https://matrix.example.test/","accessToken":"matrix-secret-token","allowedUserIds":["@adam:beeper.com"],"roomId":"!room:matrix.example.test","pairing":{"state":"paired","userId":"@adam:beeper.com","pairedAt":"2026-08-19T10:00:00.000Z"},"ownerThreadId":"thread-owner-a","ownershipEpoch":4,"cryptoStoreGeneration":"legacy-generation"}',
+        ),
+      );
+      const bridge = yield* makeService(memory.service);
+      const baselineTurnId = TurnId.make("turn-legacy-baseline");
+
+      assert.isTrue(
+        yield* bridge.initializeDeliveryCheckpointIfMissing({
+          ownerThreadId: ownerA,
+          ownershipEpoch: NonNegativeInt.make(4),
+          cryptoStoreGeneration: "legacy-generation",
+          roomId: "!room:matrix.example.test",
+          baselineTurnId,
+        }),
+      );
+      const current = Option.getOrThrow(yield* bridge.currentConfig);
+      assert.isTrue(current.deliveryCheckpointInitialized);
+      assert.equal(current.lastDeliveredTurnId, baselineTurnId);
+      assert.deepEqual(
+        Option.getOrThrow(decodeMatrixBridgeConfigJson(new TextDecoder().decode(memory.read()))),
+        current,
+      );
+    }),
+  );
+
+  it.effect("persists a delivery marker only for the matching owner configuration", () =>
+    Effect.gen(function* () {
+      const turnId = TurnId.make("turn-delivered");
+      const initial = persistedConfig({
+        roomId: "!room:matrix.example.test",
+        pairing: {
+          state: "paired",
+          userId: "@adam:beeper.com",
+          pairedAt: "2026-08-19T10:00:00.000Z",
+        },
+        ownerThreadId: ownerA,
+        ownershipEpoch: NonNegativeInt.make(4),
+      });
+      const memory = makeMemorySecretStore(
+        new TextEncoder().encode(yield* encodeMatrixBridgeConfigJson(initial)),
+      );
+      const bridge = yield* makeService(memory.service);
+
+      assert.isTrue(
+        yield* bridge.markDeliveredIfMatches({
+          ownerThreadId: ownerA,
+          ownershipEpoch: initial.ownershipEpoch,
+          cryptoStoreGeneration: initial.cryptoStoreGeneration,
+          roomId: "!room:matrix.example.test",
+          turnId,
+        }),
+      );
+      assert.equal(Option.getOrThrow(yield* bridge.currentConfig).lastDeliveredTurnId, turnId);
+      assert.equal(
+        Option.getOrThrow(decodeMatrixBridgeConfigJson(new TextDecoder().decode(memory.read())))
+          .lastDeliveredTurnId,
+        turnId,
+      );
+
+      assert.isFalse(
+        yield* bridge.markDeliveredIfMatches({
+          ownerThreadId: ownerA,
+          ownershipEpoch: initial.ownershipEpoch,
+          cryptoStoreGeneration: initial.cryptoStoreGeneration,
+          roomId: "!replacement:matrix.example.test",
+          turnId: TurnId.make("turn-stale-room"),
+        }),
+      );
+      assert.equal(Option.getOrThrow(yield* bridge.currentConfig).lastDeliveredTurnId, turnId);
     }),
   );
 
@@ -348,6 +439,7 @@ it.layer(NodeServices.layer)("MatrixBridgeConfig", (it) => {
         },
         ownerThreadId: ownerA,
         ownershipEpoch: NonNegativeInt.make(7),
+        lastDeliveredTurnId: TurnId.make("turn-before-reconfigure"),
       });
       const memory = makeMemorySecretStore(
         new TextEncoder().encode(yield* encodeMatrixBridgeConfigJson(initial)),
@@ -363,6 +455,7 @@ it.layer(NodeServices.layer)("MatrixBridgeConfig", (it) => {
       assert.deepEqual(reconfigured.pairing, { state: "unpaired" });
       assert.equal(reconfigured.ownerThreadId, null);
       assert.equal(reconfigured.ownershipEpoch, 0);
+      assert.equal(reconfigured.lastDeliveredTurnId, null);
       assert.notEqual(reconfigured.cryptoStoreGeneration, initial.cryptoStoreGeneration);
 
       assert.deepEqual(yield* bridge.disconnect, {

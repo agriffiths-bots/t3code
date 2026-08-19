@@ -26,6 +26,7 @@ import * as SubscriptionRef from "effect/SubscriptionRef";
 import { TestClock } from "effect/testing";
 
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
+import { ServerActivation } from "../serverActivation.ts";
 import {
   OrchestrationEngineService,
   type OrchestrationEngineShape,
@@ -268,19 +269,43 @@ interface ReactorHarness {
   readonly publishWithoutDrain: (event: OrchestrationEvent) => Effect.Effect<void>;
   readonly setThread: (value: OrchestrationThread | null) => Effect.Effect<void>;
   readonly setOwner: (ownerThreadId: ThreadId | null) => Effect.Effect<MatrixBridgeStatus>;
+  readonly replaceConfig: (config: MatrixBridgeConfigV1) => Effect.Effect<void>;
   readonly currentConfig: Effect.Effect<Option.Option<MatrixBridgeConfigV1>>;
+  readonly inspectionCount: Effect.Effect<number>;
+  readonly blockNextInspection: (gate: Deferred.Deferred<void>) => Effect.Effect<void>;
+  readonly awaitInspection: Effect.Effect<void>;
   readonly awaitOwner: (ownerThreadId: ThreadId | null) => Effect.Effect<void>;
+}
+
+interface ReactorHarnessOptions {
+  readonly initialOwner?: ThreadId | null;
+  readonly initialThread?: OrchestrationThread | null;
+  readonly lastDeliveredTurnId?: TurnId | null;
+  readonly deliveryCheckpointInitialized?: boolean;
+  readonly activation?: Effect.Effect<void>;
 }
 
 function withHarness<A, E>(
   use: (harness: ReactorHarness) => Effect.Effect<A, E>,
-  initialOwner: ThreadId = threadA,
+  options: ReactorHarnessOptions = {},
 ) {
   return Effect.scoped(
     Effect.gen(function* () {
       const domainEvents = yield* Queue.unbounded<OrchestrationEvent>();
       const observedEvents = yield* Queue.unbounded<void>();
-      const detailRef = yield* Ref.make<Option.Option<OrchestrationThread>>(Option.none());
+      const observedInspections = yield* Queue.unbounded<void>();
+      const startupTurnId = TurnId.make("turn-startup-running");
+      const initialThread =
+        options.initialThread === undefined
+          ? thread({ turnId: startupTurnId, state: "running", messages: [] })
+          : options.initialThread;
+      const detailRef = yield* Ref.make<Option.Option<OrchestrationThread>>(
+        Option.fromNullishOr(initialThread),
+      );
+      const inspectionCountRef = yield* Ref.make(0);
+      const inspectionGateRef = yield* Ref.make<Option.Option<Deferred.Deferred<void>>>(
+        Option.none(),
+      );
       const initialConfig: MatrixBridgeConfigV1 = {
         version: 1,
         homeserverUrl: "https://matrix.example",
@@ -292,9 +317,11 @@ function withHarness<A, E>(
           userId: "@adam:example",
           pairedAt: baseAt,
         },
-        ownerThreadId: initialOwner,
+        ownerThreadId: options.initialOwner === undefined ? threadA : options.initialOwner,
         ownershipEpoch: NonNegativeInt.make(1),
         cryptoStoreGeneration: "test-generation",
+        lastDeliveredTurnId: options.lastDeliveredTurnId ?? null,
+        deliveryCheckpointInitialized: options.deliveryCheckpointInitialized ?? true,
       };
       const configRef = yield* SubscriptionRef.make<Option.Option<MatrixBridgeConfigV1>>(
         Option.some(initialConfig),
@@ -310,6 +337,14 @@ function withHarness<A, E>(
             ...current.value,
             ownerThreadId,
             ownershipEpoch: NonNegativeInt.make(current.value.ownershipEpoch + 1),
+            lastDeliveredTurnId:
+              current.value.ownerThreadId === ownerThreadId
+                ? current.value.lastDeliveredTurnId
+                : null,
+            deliveryCheckpointInitialized:
+              current.value.ownerThreadId === ownerThreadId
+                ? current.value.deliveryCheckpointInitialized
+                : true,
           };
           return [status(ownerThreadId), Option.some(next)] as const;
         });
@@ -330,8 +365,60 @@ function withHarness<A, E>(
             ...current.value,
             ownerThreadId: null,
             ownershipEpoch: NonNegativeInt.make(current.value.ownershipEpoch + 1),
+            lastDeliveredTurnId: null,
+            deliveryCheckpointInitialized: true,
           };
           return [status(null), Option.some(next)] as const;
+        });
+
+      const initializeDeliveryCheckpointIfMissing: MatrixBridgeConfig["Service"]["initializeDeliveryCheckpointIfMissing"] =
+        (expected) =>
+          SubscriptionRef.modify(configRef, (current) => {
+            if (Option.isNone(current)) return [false, current] as const;
+            if (
+              current.value.ownerThreadId !== expected.ownerThreadId ||
+              current.value.ownershipEpoch !== expected.ownershipEpoch ||
+              current.value.cryptoStoreGeneration !== expected.cryptoStoreGeneration ||
+              current.value.roomId !== expected.roomId ||
+              current.value.pairing.state !== "paired"
+            ) {
+              return [false, current] as const;
+            }
+            if (current.value.deliveryCheckpointInitialized) {
+              return [true, current] as const;
+            }
+            return [
+              true,
+              Option.some({
+                ...current.value,
+                lastDeliveredTurnId: expected.baselineTurnId,
+                deliveryCheckpointInitialized: true,
+              }),
+            ] as const;
+          });
+
+      const markDeliveredIfMatches: MatrixBridgeConfig["Service"]["markDeliveredIfMatches"] = (
+        expected,
+      ) =>
+        SubscriptionRef.modify(configRef, (current) => {
+          if (Option.isNone(current)) return [false, current] as const;
+          if (
+            current.value.ownerThreadId !== expected.ownerThreadId ||
+            current.value.ownershipEpoch !== expected.ownershipEpoch ||
+            current.value.cryptoStoreGeneration !== expected.cryptoStoreGeneration ||
+            current.value.roomId !== expected.roomId ||
+            current.value.pairing.state !== "paired"
+          ) {
+            return [false, current] as const;
+          }
+          return [
+            true,
+            Option.some({
+              ...current.value,
+              lastDeliveredTurnId: expected.turnId,
+              deliveryCheckpointInitialized: true,
+            }),
+          ] as const;
         });
 
       const configLayer = Layer.succeed(
@@ -352,6 +439,8 @@ function withHarness<A, E>(
           disconnect: unsupported(),
           setOwner,
           clearOwnerIfMatches,
+          initializeDeliveryCheckpointIfMissing,
+          markDeliveredIfMatches,
         }),
       );
       const engineLayer = Layer.succeed(OrchestrationEngineService, {
@@ -363,7 +452,15 @@ function withHarness<A, E>(
         latestSequence: Effect.succeed(0),
       } satisfies OrchestrationEngineShape);
       const projectionLayer = Layer.mock(ProjectionSnapshotQuery)({
-        getThreadDetailById: () => Ref.get(detailRef),
+        getThreadDetailById: () =>
+          Effect.gen(function* () {
+            yield* Ref.update(inspectionCountRef, (count) => count + 1);
+            yield* Queue.offer(observedInspections, undefined);
+            const detail = yield* Ref.get(detailRef);
+            const gate = yield* Ref.getAndSet(inspectionGateRef, Option.none());
+            if (Option.isSome(gate)) yield* Deferred.await(gate.value);
+            return detail;
+          }),
       });
       const environmentLayer = Layer.mock(ServerEnvironment.ServerEnvironment)({
         getEnvironmentId: Effect.succeed(EnvironmentId.make("matrix-env")),
@@ -380,6 +477,8 @@ function withHarness<A, E>(
       return yield* Effect.gen(function* () {
         const reactor = yield* MatrixBridgeReactor;
         yield* reactor.start();
+        yield* reactor.drain;
+        yield* Ref.set(inspectionCountRef, 0);
 
         const publishWithoutDrain = (event: OrchestrationEvent) =>
           Queue.offer(domainEvents, event).pipe(
@@ -407,13 +506,141 @@ function withHarness<A, E>(
           publishWithoutDrain,
           setThread: (value) => Ref.set(detailRef, Option.fromNullishOr(value)),
           setOwner,
+          replaceConfig: (config) => SubscriptionRef.set(configRef, Option.some(config)),
           currentConfig: SubscriptionRef.get(configRef),
+          inspectionCount: Ref.get(inspectionCountRef),
+          blockNextInspection: (gate) => Ref.set(inspectionGateRef, Option.some(gate)),
+          awaitInspection: Queue.take(observedInspections),
           awaitOwner,
         });
-      }).pipe(Effect.provide(reactorLayer));
+      }).pipe(
+        Effect.provide(reactorLayer),
+        Effect.provideService(ServerActivation, options.activation),
+      );
     }),
   );
 }
+
+it.effect("parks startup reconciliation until server activation", () =>
+  Effect.gen(function* () {
+    const activation = yield* Deferred.make<void>();
+    return yield* withHarness(
+      (harness) =>
+        Effect.gen(function* () {
+          expect(yield* harness.inspectionCount).toBe(0);
+          yield* Deferred.succeed(activation, undefined);
+          yield* harness.awaitInspection;
+          yield* harness.reactor.drain;
+          expect(yield* harness.inspectionCount).toBe(1);
+        }),
+      { activation: Deferred.await(activation) },
+    );
+  }),
+);
+
+it.effect("baselines a legacy terminal turn without replaying it on upgrade", () => {
+  const turnId = TurnId.make("turn-legacy-baseline");
+  const final = message({
+    id: "message-legacy-baseline-final",
+    role: "assistant",
+    text: "Historical response",
+    turnId,
+    at: "2026-08-19T10:00:09.000Z",
+  });
+  return withHarness(
+    (harness) =>
+      Effect.gen(function* () {
+        expect(yield* harness.fake.sent).toEqual([]);
+        const config = Option.getOrThrow(yield* harness.currentConfig);
+        expect(config.lastDeliveredTurnId).toBe(turnId);
+        expect(config.deliveryCheckpointInitialized).toBe(true);
+      }),
+    {
+      initialThread: thread({ turnId, state: "completed", messages: [final] }),
+      deliveryCheckpointInitialized: false,
+    },
+  );
+});
+
+it.effect("reconciles one undelivered terminal owner turn on startup", () => {
+  const turnId = TurnId.make("turn-restart-window");
+  const final = message({
+    id: "message-restart-window-final",
+    role: "assistant",
+    text: "Recovered after restart",
+    turnId,
+    at: "2026-08-19T10:00:09.000Z",
+  });
+  return withHarness(
+    (harness) =>
+      Effect.gen(function* () {
+        expect((yield* harness.fake.sent).map((entry) => entry.content.body)).toEqual([
+          "Recovered after restart",
+        ]);
+        expect(Option.getOrThrow(yield* harness.currentConfig).lastDeliveredTurnId).toBe(turnId);
+      }),
+    {
+      initialThread: thread({ turnId, state: "completed", messages: [final] }),
+      lastDeliveredTurnId: TurnId.make("turn-delivered-before-restart"),
+    },
+  );
+});
+
+it.effect("retains a projected final across restart until its terminal marker", () => {
+  const turnId = TurnId.make("turn-restart-before-terminal");
+  const final = message({
+    id: "message-restart-before-terminal-final",
+    role: "assistant",
+    text: "Recovered when terminal arrived",
+    turnId,
+    at: "2026-08-19T10:00:09.000Z",
+  });
+  return withHarness(
+    (harness) =>
+      Effect.gen(function* () {
+        expect(yield* harness.fake.sent).toEqual([]);
+        yield* harness.setThread(thread({ turnId, state: "completed", messages: [final] }));
+        yield* harness.publish(
+          terminalMarkerEvent({
+            kind: "turn-diff",
+            turnId,
+            at: "2026-08-19T10:00:10.000Z",
+          }),
+        );
+
+        expect((yield* harness.fake.sent).map((entry) => entry.content.body)).toEqual([
+          "Recovered when terminal arrived",
+        ]);
+        expect(Option.getOrThrow(yield* harness.currentConfig).lastDeliveredTurnId).toBe(turnId);
+      }),
+    {
+      initialThread: thread({ turnId, state: "running", messages: [final] }),
+      lastDeliveredTurnId: TurnId.make("turn-before-restart-window"),
+    },
+  );
+});
+
+it.effect("does not redeliver the persisted terminal owner turn on startup", () => {
+  const turnId = TurnId.make("turn-already-delivered");
+  const final = message({
+    id: "message-already-delivered-final",
+    role: "assistant",
+    text: "Already delivered",
+    turnId,
+    at: "2026-08-19T10:00:09.000Z",
+  });
+  return withHarness(
+    (harness) =>
+      Effect.gen(function* () {
+        expect(yield* harness.fake.sent).toEqual([]);
+        expect(Option.getOrThrow(yield* harness.currentConfig).lastDeliveredTurnId).toBe(turnId);
+      }),
+    {
+      initialThread: thread({ turnId, state: "completed", messages: [final] }),
+      lastDeliveredTurnId: turnId,
+    },
+  );
+});
 
 it.effect("sends only the final text after two mid-turn assistant completions and tools", () =>
   withHarness((harness) =>
@@ -487,6 +714,87 @@ it.effect("sends only the final text after two mid-turn assistant completions an
 
       const sent = yield* harness.fake.sent;
       expect(sent.map((entry) => entry.content.body)).toEqual(["The final projected answer."]);
+      expect(Option.getOrThrow(yield* harness.currentConfig).lastDeliveredTurnId).toBe(turnId);
+    }),
+  ),
+);
+
+it.effect("coalesces repeated assistant candidates before projection inspection", () =>
+  withHarness((harness) =>
+    Effect.gen(function* () {
+      const turnId = TurnId.make("turn-coalesced-inspection");
+      const segment = message({
+        id: "message-coalesced-segment",
+        role: "assistant",
+        text: "Still working",
+        turnId,
+        at: "2026-08-19T10:00:01.000Z",
+      });
+      yield* harness.setThread(thread({ turnId, state: "running", messages: [segment] }));
+      const inspectionGate = yield* Deferred.make<void>();
+      yield* harness.blockNextInspection(inspectionGate);
+
+      yield* Effect.forEach(
+        Array.from({ length: 20 }, (_, index) => index),
+        (index) =>
+          harness.publishWithoutDrain(
+            assistantEvent({
+              turnId,
+              messageId: `message-coalesced-${index}`,
+              at: segment.updatedAt,
+            }),
+          ),
+        { discard: true },
+      );
+      expect(yield* harness.inspectionCount).toBe(1);
+      yield* Deferred.succeed(inspectionGate, undefined);
+      yield* harness.reactor.drain;
+
+      expect(yield* harness.inspectionCount).toBe(1);
+      expect(yield* harness.fake.sent).toEqual([]);
+    }),
+  ),
+);
+
+it.effect("runs one trailing inspection when a terminal marker overlaps an active read", () =>
+  withHarness((harness) =>
+    Effect.gen(function* () {
+      const turnId = TurnId.make("turn-terminal-overlap");
+      const final = message({
+        id: "message-terminal-overlap-final",
+        role: "assistant",
+        text: "Delivered by trailing inspection",
+        turnId,
+        at: "2026-08-19T10:00:09.000Z",
+      });
+      yield* harness.setThread(thread({ turnId, state: "running", messages: [final] }));
+      const inspectionGate = yield* Deferred.make<void>();
+      yield* harness.blockNextInspection(inspectionGate);
+      yield* harness.publishWithoutDrain(
+        assistantEvent({
+          turnId,
+          messageId: "message-terminal-overlap-final",
+          at: final.updatedAt,
+        }),
+      );
+
+      yield* harness.setThread(thread({ turnId, state: "completed", messages: [final] }));
+      yield* harness.publishWithoutDrain(
+        terminalMarkerEvent({
+          kind: "turn-diff",
+          turnId,
+          at: "2026-08-19T10:00:10.000Z",
+        }),
+      );
+      expect(yield* harness.inspectionCount).toBe(1);
+
+      yield* Deferred.succeed(inspectionGate, undefined);
+      yield* harness.reactor.drain;
+
+      expect(yield* harness.inspectionCount).toBe(2);
+      expect((yield* harness.fake.sent).map((entry) => entry.content.body)).toEqual([
+        "Delivered by trailing inspection",
+      ]);
     }),
   ),
 );
@@ -917,6 +1225,48 @@ it.effect("retries with one transaction id and drops when the owner epoch change
         }),
       ),
     ),
+  ),
+);
+
+it.effect("drops a sleeping retry after the same owner epoch is reconfigured", () =>
+  withHarness((harness) =>
+    Effect.gen(function* () {
+      const turnId = TurnId.make("turn-stale-room-retry");
+      const final = message({
+        id: "message-stale-room-final",
+        role: "assistant",
+        text: "Never send this to the old room",
+        turnId,
+        at: "2026-08-19T10:00:09.000Z",
+      });
+      yield* harness.setThread(thread({ turnId, state: "completed", messages: [final] }));
+      yield* harness.fake.failNextSends(1);
+      yield* harness.publishWithoutDrain(
+        assistantEvent({
+          turnId,
+          messageId: "message-stale-room-final",
+          at: final.updatedAt,
+        }),
+      );
+      const drainFiber = yield* harness.reactor.drain.pipe(Effect.forkChild);
+      yield* harness.fake.awaitAttemptCount(1);
+      yield* Effect.yieldNow;
+
+      const previous = Option.getOrThrow(yield* harness.currentConfig);
+      yield* harness.replaceConfig({
+        ...previous,
+        roomId: "!replacement:example",
+        ownerThreadId: threadA,
+        ownershipEpoch: previous.ownershipEpoch,
+        cryptoStoreGeneration: "replacement-generation",
+        lastDeliveredTurnId: null,
+      });
+      yield* TestClock.adjust("1 second");
+      yield* Fiber.join(drainFiber);
+
+      expect(yield* harness.fake.attempts).toHaveLength(1);
+      expect(yield* harness.fake.sent).toEqual([]);
+    }),
   ),
 );
 

@@ -33,6 +33,7 @@ interface TerminalCandidate {
   readonly threadId: ThreadId;
   readonly turnId: TurnId;
   readonly ownershipEpoch: number;
+  readonly cryptoStoreGeneration: string;
 }
 
 interface OutboundJob extends TerminalCandidate {
@@ -41,6 +42,11 @@ interface OutboundJob extends TerminalCandidate {
   readonly body: string;
   readonly enqueuedAt: number;
 }
+
+type ActiveMatrixBridgeConfig = MatrixBridgeConfigV1 & {
+  readonly roomId: string;
+  readonly pairing: Extract<MatrixBridgeConfigV1["pairing"], { readonly state: "paired" }>;
+};
 
 export interface BoundedDrainableWorker<A> {
   readonly enqueue: (item: A) => Effect.Effect<boolean>;
@@ -194,10 +200,22 @@ export const make = Effect.gen(function* () {
   const seenTurns = new Map<ThreadId, Set<TurnId>>();
   const seenTurnOrder: Array<readonly [ThreadId, TurnId]> = [];
   const pendingCandidates = new Map<ThreadId, TerminalCandidate>();
+  const scheduledCandidates = new Map<ThreadId, TerminalCandidate>();
+  const trailingCandidates = new Map<ThreadId, TerminalCandidate>();
+
+  const sameTerminalCandidate = (left: TerminalCandidate, right: TerminalCandidate) =>
+    left.threadId === right.threadId &&
+    left.turnId === right.turnId &&
+    left.ownershipEpoch === right.ownershipEpoch &&
+    left.cryptoStoreGeneration === right.cryptoStoreGeneration;
 
   const retainPendingCandidate = (candidate: TerminalCandidate) => {
     for (const [threadId, pending] of pendingCandidates) {
-      if (threadId !== candidate.threadId || pending.ownershipEpoch !== candidate.ownershipEpoch) {
+      if (
+        threadId !== candidate.threadId ||
+        pending.ownershipEpoch !== candidate.ownershipEpoch ||
+        pending.cryptoStoreGeneration !== candidate.cryptoStoreGeneration
+      ) {
         pendingCandidates.delete(threadId);
       }
     }
@@ -206,10 +224,7 @@ export const make = Effect.gen(function* () {
 
   const forgetPendingCandidate = (candidate: TerminalCandidate) => {
     const pending = pendingCandidates.get(candidate.threadId);
-    if (
-      pending?.turnId === candidate.turnId &&
-      pending.ownershipEpoch === candidate.ownershipEpoch
-    ) {
+    if (pending !== undefined && sameTerminalCandidate(pending, candidate)) {
       pendingCandidates.delete(candidate.threadId);
     }
   };
@@ -221,28 +236,42 @@ export const make = Effect.gen(function* () {
         if (
           Option.isNone(config) ||
           config.value.ownerThreadId !== threadId ||
-          config.value.ownershipEpoch !== candidate.ownershipEpoch
+          config.value.ownershipEpoch !== candidate.ownershipEpoch ||
+          config.value.cryptoStoreGeneration !== candidate.cryptoStoreGeneration
         ) {
           pendingCandidates.delete(threadId);
+          scheduledCandidates.delete(threadId);
+          trailingCandidates.delete(threadId);
         }
       }
     },
   );
 
+  const candidateMatchesConfig = (
+    config: MatrixBridgeConfigV1 | null,
+    candidate: TerminalCandidate,
+  ): config is ActiveMatrixBridgeConfig =>
+    config !== null &&
+    config.ownershipEpoch === candidate.ownershipEpoch &&
+    config.cryptoStoreGeneration === candidate.cryptoStoreGeneration &&
+    config.deliveryCheckpointInitialized &&
+    config.pairing.state === "paired" &&
+    config.roomId !== null;
+
   const ownerStillMatches = Effect.fn("MatrixBridgeReactor.ownerStillMatches")(function* (
-    job: TerminalCandidate,
+    job: OutboundJob,
   ) {
     const current = currentOwner(yield* configService.currentConfig, job.threadId);
     return (
-      current !== null &&
-      current.ownershipEpoch === job.ownershipEpoch &&
-      current.pairing.state === "paired" &&
-      current.roomId !== null
+      candidateMatchesConfig(current, job) &&
+      current.roomId === job.roomId &&
+      current.lastDeliveredTurnId !== job.turnId
     );
   });
 
   const deliver = Effect.fn("MatrixBridgeReactor.deliver")(function* (job: OutboundJob) {
     let attempt = 0;
+    let sent = false;
     while (true) {
       if (!(yield* ownerStillMatches(job))) {
         yield* Effect.logDebug("Matrix bridge dropped stale owner turn", {
@@ -252,23 +281,42 @@ export const make = Effect.gen(function* () {
         return;
       }
 
-      const result = yield* Effect.result(
-        client.sendText({
-          roomId: job.roomId,
-          transactionId: job.transactionId,
-          content: { msgtype: "m.text", body: job.body },
-        }),
-      );
-      if (result._tag === "Success") return;
+      const result = sent
+        ? yield* Effect.result(
+            configService.markDeliveredIfMatches({
+              ownerThreadId: job.threadId,
+              ownershipEpoch: job.ownershipEpoch,
+              cryptoStoreGeneration: job.cryptoStoreGeneration,
+              roomId: job.roomId,
+              turnId: job.turnId,
+            }),
+          )
+        : yield* Effect.result(
+            client.sendText({
+              roomId: job.roomId,
+              transactionId: job.transactionId,
+              content: { msgtype: "m.text", body: job.body },
+            }),
+          );
+      if (result._tag === "Success") {
+        if (sent) return;
+        sent = true;
+        continue;
+      }
 
       const now = yield* Clock.currentTimeMillis;
       const remaining = MATRIX_BRIDGE_RETRY_WINDOW_MS - (now - job.enqueuedAt);
       if (remaining <= 0) {
-        yield* Effect.logWarning("Matrix bridge outbound retry window expired", {
-          threadId: job.threadId,
-          turnId: job.turnId,
-          attempts: attempt + 1,
-        });
+        yield* Effect.logWarning(
+          sent
+            ? "Matrix bridge delivery-marker retry window expired"
+            : "Matrix bridge outbound retry window expired",
+          {
+            threadId: job.threadId,
+            turnId: job.turnId,
+            attempts: attempt + 1,
+          },
+        );
         return;
       }
 
@@ -283,20 +331,17 @@ export const make = Effect.gen(function* () {
     deliver,
   );
 
-  const inspectTerminalCandidate = Effect.fn("MatrixBridgeReactor.inspectTerminalCandidate")(
-    function* (candidate: TerminalCandidate) {
-      const beforeRead = currentOwner(yield* configService.currentConfig, candidate.threadId);
+  const inspectProjectedCandidate = Effect.fn("MatrixBridgeReactor.inspectProjectedCandidate")(
+    function* (candidate: TerminalCandidate, detail: Option.Option<OrchestrationThread>) {
+      const current = currentOwner(yield* configService.currentConfig, candidate.threadId);
       if (
-        beforeRead === null ||
-        beforeRead.ownershipEpoch !== candidate.ownershipEpoch ||
-        beforeRead.pairing.state !== "paired" ||
-        beforeRead.roomId === null
+        !candidateMatchesConfig(current, candidate) ||
+        current.lastDeliveredTurnId === candidate.turnId
       ) {
         forgetPendingCandidate(candidate);
         return;
       }
 
-      const detail = yield* projection.getThreadDetailById(candidate.threadId);
       if (
         Option.isNone(detail) ||
         detail.value.archivedAt !== null ||
@@ -340,10 +385,8 @@ export const make = Effect.gen(function* () {
 
       const afterRead = currentOwner(yield* configService.currentConfig, candidate.threadId);
       if (
-        afterRead === null ||
-        afterRead.ownershipEpoch !== candidate.ownershipEpoch ||
-        afterRead.pairing.state !== "paired" ||
-        afterRead.roomId === null
+        !candidateMatchesConfig(afterRead, candidate) ||
+        afterRead.lastDeliveredTurnId === candidate.turnId
       ) {
         forgetPendingCandidate(candidate);
         return;
@@ -375,30 +418,85 @@ export const make = Effect.gen(function* () {
         });
       }
     },
+  );
+
+  const inspectTerminalCandidate = Effect.fn("MatrixBridgeReactor.inspectTerminalCandidate")(
+    function* (candidate: TerminalCandidate) {
+      const beforeRead = currentOwner(yield* configService.currentConfig, candidate.threadId);
+      if (
+        !candidateMatchesConfig(beforeRead, candidate) ||
+        beforeRead.lastDeliveredTurnId === candidate.turnId
+      ) {
+        forgetPendingCandidate(candidate);
+        return;
+      }
+
+      const detail = yield* projection.getThreadDetailById(candidate.threadId);
+      yield* inspectProjectedCandidate(candidate, detail);
+    },
     Effect.catchCause((cause) =>
       Cause.hasInterruptsOnly(cause)
-        ? Effect.failCause(cause)
+        ? Effect.interrupt
         : Effect.logWarning("Matrix bridge failed to inspect an outbound candidate"),
     ),
   );
 
-  const terminalWorker = yield* makeDrainableWorker(inspectTerminalCandidate);
+  let enqueueTrailingCandidate: (candidate: TerminalCandidate) => Effect.Effect<void> = () =>
+    Effect.void;
+  const terminalWorker = yield* makeDrainableWorker((candidate: TerminalCandidate) =>
+    inspectTerminalCandidate(candidate).pipe(
+      Effect.ensuring(
+        Effect.gen(function* () {
+          const scheduled = scheduledCandidates.get(candidate.threadId);
+          if (scheduled !== undefined && sameTerminalCandidate(scheduled, candidate)) {
+            scheduledCandidates.delete(candidate.threadId);
+          }
+          const trailing = trailingCandidates.get(candidate.threadId);
+          const pending = pendingCandidates.get(candidate.threadId);
+          if (
+            trailing !== undefined &&
+            sameTerminalCandidate(trailing, candidate) &&
+            pending !== undefined &&
+            sameTerminalCandidate(pending, candidate)
+          ) {
+            trailingCandidates.delete(candidate.threadId);
+            scheduledCandidates.set(candidate.threadId, candidate);
+            yield* enqueueTrailingCandidate(candidate);
+          }
+        }),
+      ),
+    ),
+  );
+  enqueueTrailingCandidate = (candidate) => terminalWorker.enqueue(candidate).pipe(Effect.asVoid);
+
+  const scheduleTerminalCandidate = (candidate: TerminalCandidate, trailingOnDuplicate = false) => {
+    const scheduled = scheduledCandidates.get(candidate.threadId);
+    if (scheduled !== undefined && sameTerminalCandidate(scheduled, candidate)) {
+      if (trailingOnDuplicate) trailingCandidates.set(candidate.threadId, candidate);
+      return Effect.void;
+    }
+    trailingCandidates.delete(candidate.threadId);
+    scheduledCandidates.set(candidate.threadId, candidate);
+    return terminalWorker.enqueue(candidate);
+  };
 
   const recheckPendingCandidate = (threadId: ThreadId, turnId?: TurnId) =>
     Effect.gen(function* () {
       const candidate = pendingCandidates.get(threadId);
       if (candidate === undefined || (turnId !== undefined && candidate.turnId !== turnId)) return;
       const current = currentOwner(yield* configService.currentConfig, threadId);
-      if (current === null || current.ownershipEpoch !== candidate.ownershipEpoch) {
+      if (!candidateMatchesConfig(current, candidate)) {
         forgetPendingCandidate(candidate);
         return;
       }
-      yield* terminalWorker.enqueue(candidate);
+      yield* scheduleTerminalCandidate(candidate, true);
     });
 
   const clearInactiveOwner = (threadId: ThreadId) =>
     Effect.gen(function* () {
       pendingCandidates.delete(threadId);
+      scheduledCandidates.delete(threadId);
+      trailingCandidates.delete(threadId);
       const current = currentOwner(yield* configService.currentConfig, threadId);
       if (current === null) return;
       yield* configService
@@ -414,6 +512,74 @@ export const make = Effect.gen(function* () {
           ),
         );
     });
+
+  const reconcileOwnerAtStartup = Effect.fn("MatrixBridgeReactor.reconcileOwnerAtStartup")(
+    function* () {
+      let config = Option.getOrNull(yield* configService.currentConfig);
+      if (
+        config === null ||
+        config.ownerThreadId === null ||
+        config.pairing.state !== "paired" ||
+        config.roomId === null
+      ) {
+        return;
+      }
+
+      const ownerThreadId = config.ownerThreadId;
+      const detail = yield* projection.getThreadDetailById(ownerThreadId);
+      if (
+        Option.isNone(detail) ||
+        detail.value.archivedAt !== null ||
+        detail.value.deletedAt !== null
+      ) {
+        yield* clearInactiveOwner(ownerThreadId);
+        return;
+      }
+
+      const latestTurn = detail.value.latestTurn;
+      if (!config.deliveryCheckpointInitialized) {
+        const baselineTurnId =
+          latestTurn !== null &&
+          projectedTerminalAt(detail.value, latestTurn.turnId, detail.value.updatedAt) !== null
+            ? latestTurn.turnId
+            : null;
+        const initialized = yield* configService.initializeDeliveryCheckpointIfMissing({
+          ownerThreadId,
+          ownershipEpoch: config.ownershipEpoch,
+          cryptoStoreGeneration: config.cryptoStoreGeneration,
+          roomId: config.roomId,
+          baselineTurnId,
+        });
+        if (!initialized) return;
+        if (baselineTurnId !== null) {
+          pendingCandidates.delete(ownerThreadId);
+          scheduledCandidates.delete(ownerThreadId);
+          trailingCandidates.delete(ownerThreadId);
+          return;
+        }
+        config = {
+          ...config,
+          lastDeliveredTurnId: null,
+          deliveryCheckpointInitialized: true,
+        };
+      }
+
+      if (latestTurn === null || config.lastDeliveredTurnId === latestTurn.turnId) return;
+      const candidate = {
+        threadId: ownerThreadId,
+        turnId: latestTurn.turnId,
+        ownershipEpoch: config.ownershipEpoch,
+        cryptoStoreGeneration: config.cryptoStoreGeneration,
+      };
+      retainPendingCandidate(candidate);
+      yield* inspectProjectedCandidate(candidate, detail);
+    },
+    Effect.catchCause((cause) =>
+      Cause.hasInterruptsOnly(cause)
+        ? Effect.interrupt
+        : Effect.logWarning("Matrix bridge failed to reconcile the owner at startup"),
+    ),
+  );
 
   const processDomainEvent = (event: OrchestrationEvent): Effect.Effect<void> => {
     if (event.type === "thread.archived" || event.type === "thread.deleted") {
@@ -439,16 +605,23 @@ export const make = Effect.gen(function* () {
         threadId: event.payload.threadId,
         turnId: event.payload.turnId as TurnId,
         ownershipEpoch: current.ownershipEpoch,
+        cryptoStoreGeneration: current.cryptoStoreGeneration,
       };
       retainPendingCandidate(candidate);
-      yield* terminalWorker.enqueue(candidate);
+      if (current.deliveryCheckpointInitialized) {
+        yield* scheduleTerminalCandidate(candidate);
+      }
     });
   };
 
   const start: MatrixBridgeReactor["Service"]["start"] = Effect.fn("MatrixBridgeReactor.start")(
     function* () {
+      // Acquire the hot PubSub subscription before activation so scheduled work
+      // cannot publish a final into a subscriber-free window.
+      const domainEventsPull = yield* Stream.toPull(orchestrationEngine.streamDomainEvents);
       yield* forkParked(
-        Stream.runForEach(orchestrationEngine.streamDomainEvents, processDomainEvent).pipe(
+        Stream.fromPull(Effect.succeed(domainEventsPull)).pipe(
+          Stream.runForEach(processDomainEvent),
           Effect.catchCause((cause) =>
             Cause.hasInterruptsOnly(cause)
               ? Effect.failCause(cause)
@@ -476,6 +649,7 @@ export const make = Effect.gen(function* () {
             ),
           ),
       );
+      yield* forkParked(reconcileOwnerAtStartup());
     },
   );
 

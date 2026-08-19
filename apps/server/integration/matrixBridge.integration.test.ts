@@ -85,6 +85,8 @@ it.live("observes a real projected final through the fake Matrix client", () =>
           ownerThreadId: threadId,
           ownershipEpoch: NonNegativeInt.make(1),
           cryptoStoreGeneration: "integration-generation",
+          lastDeliveredTurnId: null,
+          deliveryCheckpointInitialized: true,
         };
         const configLayer = Layer.succeed(
           MatrixBridgeConfig,
@@ -97,6 +99,8 @@ it.live("observes a real projected final through the fake Matrix client", () =>
             setOwner: () => Effect.die("setOwner is not used by this integration test"),
             clearOwnerIfMatches: () =>
               Effect.die("clearOwnerIfMatches is not used by this integration test"),
+            initializeDeliveryCheckpointIfMissing: () => Effect.succeed(true),
+            markDeliveredIfMatches: () => Effect.succeed(true),
           }),
         );
         const dependencies = Layer.mergeAll(
@@ -112,7 +116,6 @@ it.live("observes a real projected final through the fake Matrix client", () =>
 
         return yield* Effect.gen(function* () {
           const reactor = yield* MatrixBridgeReactor;
-          yield* reactor.start();
 
           yield* harness.engine.dispatch(
             {
@@ -148,6 +151,8 @@ it.live("observes a real projected final through the fake Matrix client", () =>
             },
             authority,
           );
+
+          yield* reactor.start();
 
           const turnResponse: TestTurnResponse = {
             events: [

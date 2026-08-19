@@ -96,7 +96,8 @@ it.effect("does not start activation-sensitive reactors before activation", () =
         expect(yield* Deferred.isDone(childCoordinatorStarted)).toBe(false);
         expect(yield* Deferred.isDone(schedulerTicked)).toBe(false);
         expect(yield* Deferred.isDone(activationStartupReady)).toBe(false);
-        expect(yield* Deferred.isDone(matrixBridgeStarted)).toBe(false);
+        expect(yield* Deferred.isDone(matrixBridgeStarted)).toBe(true);
+        expect(startOrder).toEqual(["matrix-bridge"]);
 
         yield* Deferred.succeed(activation, undefined);
         yield* Deferred.await(activationStartupReady);
@@ -104,7 +105,7 @@ it.effect("does not start activation-sensitive reactors before activation", () =
         expect(yield* Deferred.isDone(childCoordinatorStarted)).toBe(true);
         expect(yield* Deferred.isDone(schedulerTicked)).toBe(true);
         expect(yield* Deferred.isDone(matrixBridgeStarted)).toBe(true);
-        expect(startOrder).toEqual(["child-coordinator", "scheduler", "matrix-bridge"]);
+        expect(startOrder).toEqual(["matrix-bridge", "child-coordinator", "scheduler"]);
       }).pipe(Effect.provide(layer));
     }),
   ),

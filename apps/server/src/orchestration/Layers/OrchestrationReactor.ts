@@ -32,7 +32,6 @@ export const makeOrchestrationReactor = Effect.gen(function* () {
   const startActivationSensitiveReactors = Effect.gen(function* () {
     yield* childThreadCoordinator.start();
     yield* scheduledTasksReactor.start();
-    yield* matrixBridgeReactor.start();
   }).pipe(Effect.onExit((exit) => Deferred.done(activationReady, exit).pipe(Effect.asVoid)));
 
   const start: OrchestrationReactorShape["start"] = Effect.fn("start")(function* () {
@@ -42,6 +41,7 @@ export const makeOrchestrationReactor = Effect.gen(function* () {
     yield* threadDeletionReactor.start();
     yield* agentAwarenessRelay.start();
     yield* vcsMaintenanceReactor.start();
+    yield* matrixBridgeReactor.start();
     const activation = yield* ServerActivation;
     yield* activation === undefined
       ? startActivationSensitiveReactors
