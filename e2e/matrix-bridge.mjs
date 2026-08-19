@@ -75,6 +75,7 @@ const secrets = new Set();
 const pids = [];
 let tempRoot = null;
 let failed = false;
+let stopping = false;
 let teardownPromise = null;
 
 function nowIso() {
@@ -242,6 +243,10 @@ async function waitHttpOk(url, timeoutMs = 20_000) {
  */
 function execFile(file, args, options = {}) {
   return new Promise((resolve, reject) => {
+    // Same barrier as the other spawn paths: a bring-up continuation resuming
+    // after a signal must not start npm, the native downloader, or the token
+    // CLI against state teardown is already removing.
+    if (stopping) throw new Error(`refusing to run ${NodePath.basename(file)} during teardown`);
     const child = NodeChildProcess.execFile(
       file,
       args,
@@ -519,6 +524,10 @@ function lineRedactor(onLine) {
 }
 
 function spawnCaptured(command, args, options, kind, prove) {
+  // A signal can arrive while bring-up is inside a long await, such as the
+  // homeserver download. Without this the download would finish afterwards and
+  // spawn into a process list teardown has already swept.
+  if (stopping) throw new Error(`refusing to spawn ${kind} during teardown`);
   const child = NodeChildProcess.spawn(command, args, {
     stdio: ["ignore", "pipe", "pipe"],
     detached: true,
@@ -574,6 +583,7 @@ async function startConduwuit(binary, configPath, port, dataDir) {
 /** One `matrix-cli.mjs` child, spoken to over its JSON-lines protocol. */
 class MatrixCli {
   constructor(role) {
+    if (stopping) throw new Error(`refusing to spawn matrix-cli-${role} during teardown`);
     this.role = role;
     this.seq = 0;
     this.pending = new Map();
@@ -892,6 +902,17 @@ async function waitStatus(getStatus, predicate, timeoutMs, label) {
  * assistant messages (mid-turn segments), and only the last one is the final
  * the bridge is allowed to post.
  */
+/** Every non-streaming assistant message a turn produced, in order. */
+function assistantSegments(thread, turnId) {
+  return thread.messages.filter(
+    (message) =>
+      message.role === "assistant" &&
+      message.streaming === false &&
+      (turnId == null || message.turnId === turnId) &&
+      message.text.length > 0,
+  );
+}
+
 function lastAssistant(thread, turnId) {
   return (
     thread.messages.findLast(
@@ -1281,7 +1302,17 @@ async function runReleaseGate(ctx) {
     await setOwner(controlThreadId, `${marker} witness owner`);
     const before = turnMarker((await threadSnapshot(t3, controlThreadId)).thread);
     const text = `${marker}_WITNESS_${NodeCrypto.randomBytes(4).toString("hex")}`;
-    await activeCli.request({ op: "send", roomId, body: text });
+    // The room position before the send. `waitText` scans events already
+    // received, so without a floor a second witness whose provider produced the
+    // same generic reply as the first would match that first message, restore
+    // ownership, and let the silence assertions run before this outbound job
+    // had drained.
+    const sentAfter = Date.now();
+    await activeCli.request({
+      op: "send",
+      roomId,
+      body: `Reply with the exact word ${text} and nothing else.`,
+    });
     // The user message is projected before the turn it starts exists, and a
     // pending turn carries a null id, so "the message is here" and "a turn is
     // completed" can both be true while `latestTurn` is still the PREVIOUS
@@ -1292,7 +1323,8 @@ async function runReleaseGate(ctx) {
       t3,
       controlThreadId,
       (thread) =>
-        isNewTurn(thread, before) && userMessages(thread).some((message) => message.text === text),
+        isNewTurn(thread, before) &&
+        userMessages(thread).some((message) => message.text.includes(text)),
       INBOUND_MS,
       `${marker} witness message started a new turn`,
     );
@@ -1318,7 +1350,14 @@ async function runReleaseGate(ctx) {
       `${marker} witness thread received an inbound message that was not the witness`,
     );
     await activeCli.request(
-      { op: "waitText", roomId, from: botMxid, body: final, timeoutMs: LOCAL_SEND_MS },
+      {
+        op: "waitText",
+        roomId,
+        from: botMxid,
+        body: final,
+        afterTs: sentAfter,
+        timeoutMs: LOCAL_SEND_MS,
+      },
       LOCAL_SEND_MS + 1_000,
     );
     await setOwner(restoreOwnerThreadId, `${marker} owner restored`);
@@ -1449,7 +1488,7 @@ async function runReleaseGate(ctx) {
   await startTurn(
     t3,
     threadA,
-    "Run the command `echo MID_TURN_MARKER` then reply with the exact word FINAL_STREAM_A and nothing else.",
+    "Do these three steps in order. First reply with the exact word MID_TURN_SEGMENT. Then run the command `echo MID_TURN_MARKER`. Then reply with the exact word FINAL_STREAM_A and nothing else.",
     modelSelection,
   );
   const streamDeadline = Date.now() + TURN_MS;
@@ -1488,6 +1527,22 @@ async function runReleaseGate(ctx) {
     LOCAL_SEND_MS + 1_000,
   );
   assert(outboundA.event.encrypted === true, "the assistant final was not encrypted on the wire");
+  // The count is the proof, and it only means something if the turn actually
+  // produced something to suppress. A turn whose only assistant message is its
+  // final would let a bridge that forwards every assistant-message event pass
+  // this scenario, so the segment count is checked rather than assumed.
+  //
+  // Deliberately not asserted: that the one message was written after the
+  // terminal transition to the millisecond. `origin_server_ts` and
+  // `completedAt` are both millisecond wall clocks, so neither `>=` nor `>`
+  // distinguishes an event emitted just before the transition from one just
+  // after, and T3 exposes no ordering receipt to correlate against. The
+  // remaining gap is an implementation that posts the final itself a moment
+  // early, which carries the same text and no product consequence.
+  assert(
+    assistantSegments(terminalA, terminalA.latestTurn.turnId).length >= 2,
+    "the turn produced no assistant message before its final, so final-only suppression was never exercised",
+  );
   assert((await botCount()) === botBefore + 1, "expected exactly one bot message for the turn");
 
   heartbeat("9", "the bot's own event starts no turn");
@@ -1858,11 +1913,19 @@ async function main() {
 
 async function runTeardown() {
   heartbeat("teardown", failed ? "after failure" : "after success");
-  for (const record of pids.toReversed()) {
-    try {
-      await stopPid(record);
-    } catch (error) {
-      console.error(redact(error instanceof Error ? error.message : String(error)));
+  stopping = true;
+  // Sweep repeatedly: an in-flight bring-up can still register a process
+  // between passes, and the guard above only closes the window after the first
+  // sweep has started.
+  for (let pass = 0; pass < 3; pass += 1) {
+    const snapshot = pids.toReversed();
+    if (snapshot.length === 0) break;
+    for (const record of snapshot) {
+      try {
+        await stopPid(record);
+      } catch (error) {
+        console.error(redact(error instanceof Error ? error.message : String(error)));
+      }
     }
   }
   const survivors = pids.filter((record) => !treeIsGone(record));
@@ -1916,6 +1979,7 @@ function report(error) {
 for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
   process.on(signal, () => {
     failed = true;
+    stopping = true;
     teardown().finally(() => process.exit(signal === "SIGINT" ? 130 : 143));
   });
 }
