@@ -15,6 +15,24 @@ export const MATRIX_FORMATTED_BODY_MAX_BYTES = 32 * 1024;
  */
 export const MATRIX_FORMATTED_CONTENT_MAX_JSON_BYTES = 24 * 1024;
 const MATRIX_HTML_MAX_NESTING = 100;
+/** Operation cap as a multiple of input length; overage falls back to plaintext. */
+const RENDER_OPS_PER_CHAR = 32;
+const HTML_VOID_TAGS = new Set([
+  "area",
+  "base",
+  "br",
+  "col",
+  "embed",
+  "hr",
+  "img",
+  "input",
+  "link",
+  "meta",
+  "param",
+  "source",
+  "track",
+  "wbr",
+]);
 
 export type MatrixTextContent =
   | {
@@ -192,14 +210,18 @@ export function sanitizeMatrixHtml(html: string): string {
     }
 
     if (DROP_WITH_CONTENT.has(name)) {
-      i = skipDroppedElement(html, name, i);
+      // HTML ignores the self-closing slash on non-void elements, so
+      // `<script/>...` still runs to the matching `</script>`.
+      if (!HTML_VOID_TAGS.has(name)) {
+        i = skipDroppedElement(html, name, i);
+      }
       continue;
     }
     if (!ALLOWED_TAGS.has(name)) continue;
-    if (stack.length >= MATRIX_HTML_MAX_NESTING) continue;
 
     const attrs = serializeAllowedAttrs(name, parsed.attrs);
-    const emit = !tagMissingRequiredAttr(name, attrs);
+    const emit =
+      stack.length < MATRIX_HTML_MAX_NESTING && !tagMissingRequiredAttr(name, parsed.attrs);
     if (VOID_TAGS.has(name) || parsed.selfClosing) {
       if (emit) {
         out += `<${name}${attrs}>`;
@@ -288,10 +310,15 @@ function parseHtmlTag(html: string, start: number): ParsedTag | null {
   return null;
 }
 
-function tagMissingRequiredAttr(tag: string, attrs: string): boolean {
-  if (tag === "a") return !/\shref="/.test(attrs);
-  if (tag === "img") return !/\ssrc="/.test(attrs);
-  return false;
+function tagMissingRequiredAttr(tag: string, attrs: ReadonlyArray<ParsedAttr>): boolean {
+  const required = tag === "a" ? "href" : tag === "img" ? "src" : null;
+  if (required === null) return false;
+  for (const attr of attrs) {
+    if (attr.name !== required) continue;
+    const decoded = decodeHtmlEntities(attr.value);
+    if (sanitizeAttrValue(tag, attr.name, decoded) !== null) return false;
+  }
+  return true;
 }
 
 function serializeAllowedAttrs(tag: string, attrs: ReadonlyArray<ParsedAttr>): string {
@@ -393,9 +420,22 @@ function escapeAttr(value: string): string {
   return escapeHtml(value).replace(/"/g, "&quot;");
 }
 
+class RenderBudget {
+  private ops = 0;
+  private readonly maxOps: number;
+  constructor(chars: number) {
+    this.maxOps = Math.max(4096, chars * RENDER_OPS_PER_CHAR);
+  }
+  tick(n = 1): void {
+    this.ops += n;
+    if (this.ops > this.maxOps) throw new Error("matrix render op budget exceeded");
+  }
+}
+
 function renderMarkdownToHtml(markdown: string): string {
+  const budget = new RenderBudget(markdown.length);
   const lines = markdown.replace(/\r\n/g, "\n").split("\n");
-  return renderLines(lines, 0, lines.length, 0).html;
+  return renderLines(lines, 0, lines.length, 0, budget).html;
 }
 
 function renderLines(
@@ -403,10 +443,12 @@ function renderLines(
   from: number,
   to: number,
   minIndent: number,
+  budget: RenderBudget,
 ): { html: string; next: number } {
   let html = "";
   let i = from;
   while (i < to) {
+    budget.tick();
     const line = lines[i] ?? "";
     if (line.trim() === "") {
       i += 1;
@@ -425,7 +467,7 @@ function renderLines(
 
     const heading = parseAtxHeading(line);
     if (heading !== null) {
-      html += `<h${heading.level}>${renderInline(heading.text)}</h${heading.level}>`;
+      html += `<h${heading.level}>${renderInline(heading.text, budget)}</h${heading.level}>`;
       i += 1;
       continue;
     }
@@ -437,7 +479,7 @@ function renderLines(
     }
 
     if (/^[ \t]*>/.test(line)) {
-      const quote = parseBlockquote(lines, i, to);
+      const quote = parseBlockquote(lines, i, to, budget);
       html += quote.html;
       i = quote.next;
       continue;
@@ -445,7 +487,7 @@ function renderLines(
 
     const list = listMarker(line);
     if (list !== null && list.indent >= minIndent) {
-      const parsed = parseList(lines, i, to, list);
+      const parsed = parseList(lines, i, to, list, budget);
       html += parsed.html;
       i = parsed.next;
       continue;
@@ -459,11 +501,11 @@ function renderLines(
       i += 1;
     }
     if (para.length === 0) {
-      html += `<p>${renderInline(line)}</p>`;
+      html += `<p>${renderInline(line, budget)}</p>`;
       i += 1;
       continue;
     }
-    html += `<p>${renderInline(para.join("\n"))}</p>`;
+    html += `<p>${renderInline(para.join("\n"), budget)}</p>`;
   }
   return { html, next: i };
 }
@@ -515,6 +557,7 @@ function parseBlockquote(
   lines: ReadonlyArray<string>,
   from: number,
   to: number,
+  budget: RenderBudget,
 ): { html: string; next: number } {
   const inner: string[] = [];
   let i = from;
@@ -531,7 +574,7 @@ function parseBlockquote(
   }
   while (inner.length > 0 && inner[inner.length - 1] === "") inner.pop();
   return {
-    html: `<blockquote>${renderLines(inner, 0, inner.length, 0).html}</blockquote>`,
+    html: `<blockquote>${renderLines(inner, 0, inner.length, 0, budget).html}</blockquote>`,
     next: i,
   };
 }
@@ -541,10 +584,11 @@ function parseList(
   from: number,
   to: number,
   first: ListMarker,
+  budget: RenderBudget,
 ): { html: string; next: number } {
   const items: string[] = [];
   let i = from;
-  let start: number | null = first.kind === "ol" ? first.start : null;
+  const start: number | null = first.kind === "ol" ? first.start : null;
   while (i < to) {
     const line = lines[i] ?? "";
     if (line.trim() === "") {
@@ -569,7 +613,7 @@ function parseList(
     if (marker === null || marker.indent < first.indent) break;
     if (marker.indent === first.indent && marker.kind !== first.kind) break;
     if (marker.indent === first.indent) {
-      const item = collectListItem(lines, i, to, marker);
+      const item = collectListItem(lines, i, to, marker, budget);
       items.push(`<li>${item.html}</li>`);
       i = item.next;
       continue;
@@ -586,6 +630,7 @@ function collectListItem(
   from: number,
   to: number,
   marker: ListMarker,
+  budget: RenderBudget,
 ): { html: string; next: number } {
   const itemLines = [marker.text];
   let i = from + 1;
@@ -610,11 +655,11 @@ function collectListItem(
     }
     break;
   }
-  const first = renderInline(itemLines[0] ?? "");
+  const first = renderInline(itemLines[0] ?? "", budget);
   const html =
     itemLines.length === 1
       ? first
-      : `${first}${renderLines(itemLines, 1, itemLines.length, 0).html}`;
+      : `${first}${renderLines(itemLines, 1, itemLines.length, 0, budget).html}`;
   return { html, next: i };
 }
 
@@ -740,92 +785,137 @@ function indexOfOrMiss(
   return found;
 }
 
-function renderInline(src: string, scan: InlineScan = newInlineScan()): string {
-  let out = "";
+interface InlineToken {
+  html: string;
+  tag: "em" | "strong" | "del" | null;
+  nesting: -1 | 0 | 1;
+}
+
+interface Delim {
+  marker: string;
+  length: number;
+  token: number;
+  end: number;
+  open: boolean;
+  close: boolean;
+}
+
+function renderInline(
+  src: string,
+  budget: RenderBudget,
+  scan: InlineScan = newInlineScan(),
+): string {
+  const tokens: InlineToken[] = [];
+  const delimiters: Delim[] = [];
+  let text = "";
+  const flush = () => {
+    if (text.length === 0) return;
+    tokens.push({ html: text, tag: null, nesting: 0 });
+    text = "";
+  };
+  const pushHtml = (html: string) => {
+    if (html.length === 0) return;
+    text += html;
+  };
+
   let i = 0;
   while (i < src.length) {
+    budget.tick();
     const ch = src[i] ?? "";
-    if (ch === "_" && isWordChar(src[i - 1])) {
-      let run = 1;
-      while (src[i + run] === "_") run += 1;
-      out += "_".repeat(run);
-      i += run;
-      continue;
-    }
     if (ch === "\\" && i + 1 < src.length) {
       const next = src[i + 1] ?? "";
       if (isEscapableAsciiPunctuation(next)) {
-        out += escapeHtml(next);
+        pushHtml(escapeHtml(next));
         i += 2;
         continue;
       }
-      out += "\\";
+      pushHtml("\\");
       i += 1;
       continue;
     }
     if (ch === "`") {
       const span = parseCodeSpan(src, i, scan);
       if (span !== null) {
-        out += `<code>${escapeHtml(span.inner)}</code>`;
+        pushHtml(`<code>${escapeHtml(span.inner)}</code>`);
         i = span.end;
         continue;
       }
       let run = 1;
       while (src[i + run] === "`") run += 1;
-      out += escapeHtml("`".repeat(run));
+      pushHtml(escapeHtml("`".repeat(run)));
       i += run;
       continue;
     }
-    if (src.startsWith("***", i) || src.startsWith("___", i)) {
-      const delim = src.slice(i, i + 3);
-      if (canOpenRun(src, i, delim)) {
-        const close = findClosing(src, i + 3, delim, scan);
-        if (close !== -1) {
-          out += `<strong><em>${renderInline(src.slice(i + 3, close))}</em></strong>`;
-          i = close + 3;
+    if (ch === "*" || ch === "_" || ch === "~") {
+      let run = 1;
+      while (src[i + run] === ch) run += 1;
+      const after = src[i + run];
+      const before = src[i - 1];
+      const afterSpace = after === undefined || after === " " || after === "\n";
+      const beforeSpace = before === undefined || before === " " || before === "\n";
+      if (ch === "~") {
+        if (run < 2) {
+          pushHtml("~");
+          i += 1;
           continue;
         }
-      }
-    }
-    if (src.startsWith("**", i) || src.startsWith("__", i)) {
-      const delim = src.slice(i, i + 2);
-      if (canOpenRun(src, i, delim)) {
-        const close = findClosing(src, i + 2, delim, scan);
-        if (close !== -1) {
-          out += `<strong>${renderInline(src.slice(i + 2, close))}</strong>`;
-          i = close + 2;
-          continue;
+        flush();
+        let remaining = run;
+        if (remaining % 2 === 1) {
+          tokens.push({ html: "~", tag: null, nesting: 0 });
+          remaining -= 1;
         }
-      }
-    }
-    if (src.startsWith("~~", i)) {
-      const close = findClosing(src, i + 2, "~~", scan);
-      if (close !== -1) {
-        out += `<del>${renderInline(src.slice(i + 2, close))}</del>`;
-        i = close + 2;
+        while (remaining >= 2) {
+          const token = tokens.length;
+          tokens.push({ html: "~~", tag: null, nesting: 0 });
+          delimiters.push({
+            marker: "~",
+            length: 0,
+            token,
+            end: -1,
+            open: true,
+            close: !beforeSpace,
+          });
+          remaining -= 2;
+        }
+        i += run;
         continue;
       }
-    }
-    if ((ch === "*" || ch === "_") && canOpenEm(src, i, ch)) {
-      const close = findEmClose(src, i, ch, scan);
-      if (close !== -1) {
-        out += `<em>${renderInline(src.slice(i + 1, close))}</em>`;
-        i = close + 1;
+      const canOpen = !afterSpace && (ch === "*" || !isWordChar(before));
+      const canClose = !beforeSpace && (ch === "*" || !isWordChar(after));
+      if (!canOpen && !canClose) {
+        pushHtml(ch.repeat(run));
+        i += run;
         continue;
       }
+      flush();
+      for (let n = 0; n < run; n += 1) {
+        const token = tokens.length;
+        tokens.push({ html: ch, tag: null, nesting: 0 });
+        delimiters.push({
+          marker: ch,
+          length: run,
+          token,
+          end: -1,
+          open: canOpen,
+          close: canClose,
+        });
+      }
+      i += run;
+      continue;
     }
     if (ch === "!" && src[i + 1] === "[") {
-      const link = parseInlineLink(src, i, true, scan);
+      const link = parseInlineLink(src, i, true, scan, budget);
       if (link !== null) {
-        out += link.html;
+        pushHtml(link.html);
         i = link.end;
         continue;
       }
     }
     if (ch === "[") {
-      const link = parseInlineLink(src, i, false, scan);
+      const link = parseInlineLink(src, i, false, scan, budget);
       if (link !== null) {
-        out += link.html;
+        pushHtml(link.html);
         i = link.end;
         continue;
       }
@@ -833,23 +923,157 @@ function renderInline(src: string, scan: InlineScan = newInlineScan()): string {
     if (ch === "<") {
       const autolink = parseAutolink(src, i, scan);
       if (autolink !== null) {
-        out += autolink.html;
+        pushHtml(autolink.html);
         i = autolink.end;
         continue;
       }
-      out += "&lt;";
+      pushHtml("&lt;");
       i += 1;
       continue;
     }
     if (ch === "\n") {
-      out += "<br>";
+      pushHtml("<br>");
       i += 1;
       continue;
     }
-    out += escapeHtml(ch);
+    pushHtml(escapeHtml(ch));
     i += 1;
   }
+  flush();
+  matchDelimiterPairs(delimiters, budget);
+  applyEmphasis(delimiters, tokens);
+  applyStrikethrough(delimiters, tokens);
+  let out = "";
+  for (const token of tokens) {
+    if (token.nesting === 1 && token.tag !== null) out += `<${token.tag}>`;
+    else if (token.nesting === -1 && token.tag !== null) out += `</${token.tag}>`;
+    else out += token.html;
+  }
   return out;
+}
+
+/**
+ * CommonMark delimiter-stack pairing. Each closer walks back through unmatched
+ * openers of the same marker using jump links and `openersBottom`, so the whole
+ * pass is linear in the number of delimiter runs.
+ */
+function matchDelimiterPairs(delimiters: Delim[], budget: RenderBudget): void {
+  const max = delimiters.length;
+  if (max === 0) return;
+  const openersBottom = new Map<string, number[]>();
+  let headerIdx = 0;
+  let lastTokenIdx = -2;
+  const jumps = Array.from({ length: max }, () => 0);
+
+  for (let closerIdx = 0; closerIdx < max; closerIdx += 1) {
+    budget.tick();
+    const closer = delimiters[closerIdx];
+    if (closer === undefined) continue;
+
+    if (delimiters[headerIdx]?.marker !== closer.marker || lastTokenIdx !== closer.token - 1) {
+      headerIdx = closerIdx;
+    }
+    lastTokenIdx = closer.token;
+    if (!closer.close) continue;
+
+    let bottoms = openersBottom.get(closer.marker);
+    if (bottoms === undefined) {
+      bottoms = [-1, -1, -1, -1, -1, -1];
+      openersBottom.set(closer.marker, bottoms);
+    }
+    const minOpenerIdx = bottoms[(closer.open ? 3 : 0) + (closer.length % 3)] ?? -1;
+    let openerIdx = headerIdx - (jumps[headerIdx] ?? 0) - 1;
+    let newMinOpenerIdx = openerIdx;
+
+    for (; openerIdx > minOpenerIdx; openerIdx -= (jumps[openerIdx] ?? 0) + 1) {
+      const opener = delimiters[openerIdx];
+      if (opener === undefined || opener.marker !== closer.marker) continue;
+      if (!(opener.open && opener.end < 0)) continue;
+
+      let oddMatch = false;
+      if (opener.close || closer.open) {
+        if ((opener.length + closer.length) % 3 === 0) {
+          if (opener.length % 3 !== 0 || closer.length % 3 !== 0) oddMatch = true;
+        }
+      }
+      if (oddMatch) continue;
+
+      const lastJump =
+        openerIdx > 0 && delimiters[openerIdx - 1]?.open !== true
+          ? (jumps[openerIdx - 1] ?? 0) + 1
+          : 0;
+      jumps[closerIdx] = closerIdx - openerIdx + lastJump;
+      jumps[openerIdx] = lastJump;
+      closer.open = false;
+      opener.end = closerIdx;
+      opener.close = false;
+      newMinOpenerIdx = -1;
+      lastTokenIdx = -2;
+      break;
+    }
+
+    if (newMinOpenerIdx !== -1) {
+      bottoms[(closer.open ? 3 : 0) + (closer.length % 3)] = newMinOpenerIdx;
+    }
+  }
+}
+
+function applyEmphasis(delimiters: Delim[], tokens: InlineToken[]): void {
+  for (let i = delimiters.length - 1; i >= 0; i -= 1) {
+    const start = delimiters[i];
+    if (start === undefined || start.end < 0) continue;
+    if (start.marker !== "*" && start.marker !== "_") continue;
+    const end = delimiters[start.end];
+    if (end === undefined) continue;
+
+    const isStrong =
+      i > 0 &&
+      delimiters[i - 1]?.end === start.end + 1 &&
+      delimiters[i - 1]?.marker === start.marker &&
+      delimiters[i - 1]?.token === start.token - 1 &&
+      delimiters[start.end + 1]?.token === end.token + 1;
+
+    const opener = tokens[start.token];
+    const closer = tokens[end.token];
+    if (opener === undefined || closer === undefined) continue;
+    const tag = isStrong ? "strong" : "em";
+    opener.tag = tag;
+    opener.nesting = 1;
+    opener.html = "";
+    closer.tag = tag;
+    closer.nesting = -1;
+    closer.html = "";
+    if (isStrong) {
+      const prev = delimiters[i - 1];
+      const nextClose = delimiters[start.end + 1];
+      if (prev !== undefined) {
+        const adjacent = tokens[prev.token];
+        if (adjacent !== undefined) adjacent.html = "";
+      }
+      if (nextClose !== undefined) {
+        const adjacent = tokens[nextClose.token];
+        if (adjacent !== undefined) adjacent.html = "";
+      }
+      i -= 1;
+    }
+  }
+}
+
+function applyStrikethrough(delimiters: Delim[], tokens: InlineToken[]): void {
+  for (const start of delimiters) {
+    if (start.marker !== "~" || start.end < 0) continue;
+    const end = delimiters[start.end];
+    if (end === undefined) continue;
+    const opener = tokens[start.token];
+    const closer = tokens[end.token];
+    if (opener === undefined || closer === undefined) continue;
+    opener.tag = "del";
+    opener.nesting = 1;
+    opener.html = "";
+    closer.tag = "del";
+    closer.nesting = -1;
+    closer.html = "";
+  }
 }
 
 const ESCAPABLE_ASCII_PUNCTUATION = new Set([
@@ -895,29 +1119,6 @@ function isWordChar(ch: string | undefined): boolean {
   return ch !== undefined && /[A-Za-z0-9]/.test(ch);
 }
 
-function canOpenRun(src: string, i: number, delim: string): boolean {
-  const after = src[i + delim.length];
-  if (after === undefined || after === " " || after === "\n") return false;
-  if (after === delim[0]) return false;
-  if (delim.includes("_") && isWordChar(src[i - 1])) return false;
-  return true;
-}
-
-function canCloseRun(src: string, close: number, delim: string): boolean {
-  const before = src[close - 1];
-  if (before === " " || before === "\n") return false;
-  if (delim.includes("_") && isWordChar(src[close + delim.length])) return false;
-  return true;
-}
-
-function canOpenEm(src: string, i: number, delim: string): boolean {
-  return canOpenRun(src, i, delim);
-}
-
-function findEmClose(src: string, open: number, delim: string, scan: InlineScan): number {
-  return findClosing(src, open + 1, delim, scan);
-}
-
 function parseCodeSpan(
   src: string,
   from: number,
@@ -950,59 +1151,12 @@ function parseCodeSpan(
   return null;
 }
 
-function findClosing(
-  src: string,
-  from: number,
-  delim: string,
-  scan: InlineScan,
-  markMiss = true,
-): number {
-  if (from >= (scan.noCloseFrom.get(delim) ?? Number.POSITIVE_INFINITY)) return -1;
-  const runChar = delim[0] ?? "";
-  let i = from;
-  while (i < src.length) {
-    if (src[i] === "\\" && i + 1 < src.length) {
-      i += 2;
-      continue;
-    }
-    if (src[i] === "`") {
-      const span = parseCodeSpan(src, i, scan);
-      if (span === null) break;
-      i = span.end;
-      continue;
-    }
-    if (src.startsWith(delim, i)) {
-      let run = 0;
-      while (src[i + run] === runChar) run += 1;
-      if (run > delim.length) {
-        i += run;
-        continue;
-      }
-      if (run === delim.length && canCloseRun(src, i, delim)) return i;
-      if (run === delim.length && canOpenRun(src, i, delim)) {
-        const nested = findClosing(src, i + delim.length, delim, scan, false);
-        if (nested !== -1) {
-          i = nested + delim.length;
-          continue;
-        }
-      }
-      i += Math.max(run, 1);
-      continue;
-    }
-    i += 1;
-  }
-  if (markMiss) {
-    const current = scan.noCloseFrom.get(delim);
-    if (current === undefined || from < current) scan.noCloseFrom.set(delim, from);
-  }
-  return -1;
-}
-
 function parseInlineLink(
   src: string,
   i: number,
   image: boolean,
   scan: InlineScan,
+  budget: RenderBudget,
 ): { html: string; end: number } | null {
   const labelStart = image ? i + 1 : i;
   if (src[labelStart] !== "[") return null;
@@ -1034,7 +1188,7 @@ function parseInlineLink(
       end: j,
     };
   }
-  const labelHtml = image ? escapeHtml(label) : renderInline(label);
+  const labelHtml = image ? escapeHtml(label) : renderInline(label, budget, newInlineScan());
   if (!isPermittedHref(dest))
     return { html: labelHtml.length > 0 ? labelHtml : escapeHtml(dest), end: j };
   const text = labelHtml.length > 0 ? labelHtml : escapeHtml(dest);

@@ -59,7 +59,7 @@ describe("matrixTextContent rendering", () => {
       "<p><strong>strong</strong> and <strong>also</strong></p>",
     );
     expect(formatted("~~gone~~")).toBe("<p><del>gone</del></p>");
-    expect(formatted("***both***")).toBe("<p><strong><em>both</em></strong></p>");
+    expect(formatted("***both***")).toBe("<p><em><strong>both</strong></em></p>");
     expect(formatted("*outer *inner* outer*")).toBe("<p><em>outer <em>inner</em> outer</em></p>");
   });
 
@@ -197,6 +197,43 @@ describe("sanitizeMatrixHtml", () => {
     expect(sanitizeMatrixHtml("<!--secret--><p>x</p>")).toBe("<p>x</p>");
     expect(sanitizeMatrixHtml("<foo><strong>y</strong></foo>")).toBe("<strong>y</strong>");
   });
+
+  it("does not let void dropped tags consume the rest of the document", () => {
+    expect(sanitizeMatrixHtml('<p>a</p><input type="hidden"><p>b</p>')).toBe("<p>a</p><p>b</p>");
+    expect(sanitizeMatrixHtml('<p>a</p><link rel="stylesheet"><p>b</p>')).toBe("<p>a</p><p>b</p>");
+    expect(sanitizeMatrixHtml('<p>a</p><meta charset="utf-8"><p>b</p>')).toBe("<p>a</p><p>b</p>");
+    expect(sanitizeMatrixHtml('<p>a</p><embed src="x"><p>b</p>')).toBe("<p>a</p><p>b</p>");
+  });
+
+  it("still drops script contents through to the matching close tag", () => {
+    expect(sanitizeMatrixHtml("<p>a</p><script>evil</script><p>b</p>")).toBe("<p>a</p><p>b</p>");
+  });
+
+  it("still drops contents after a self-closing non-void dropped tag", () => {
+    expect(
+      sanitizeMatrixHtml('<script/><img src="mxc://server/id" alt="a"></script><p>ok</p>'),
+    ).toBe("<p>ok</p>");
+    expect(sanitizeMatrixHtml("<style/>hidden</style><p>ok</p>")).toBe("<p>ok</p>");
+    expect(sanitizeMatrixHtml("<iframe/><p>x</p></iframe><p>ok</p>")).toBe("<p>ok</p>");
+  });
+
+  it("drops img/a tags whose required attr is only a substring of another value", () => {
+    expect(sanitizeMatrixHtml('<img alt=" src=">')).toBe("");
+    expect(sanitizeMatrixHtml('<img alt=" src=" src="javascript:alert(1)">')).toBe("");
+    expect(sanitizeMatrixHtml('<a title=" href=" href="javascript:alert(1)">x</a>')).toBe("x");
+  });
+
+  it("does not let a skipped overflow open tag close an outer ancestor", () => {
+    const depth = 102;
+    const html = `${"<blockquote>".repeat(depth)}keep${"</blockquote>".repeat(depth)}`;
+    const sanitized = sanitizeMatrixHtml(html);
+    expect(sanitized.startsWith("<blockquote>")).toBe(true);
+    expect(sanitized.endsWith("</blockquote>")).toBe(true);
+    expect(sanitized.includes("keep")).toBe(true);
+    expect(sanitized.match(/<blockquote>/g)?.length).toBe(100);
+    expect(sanitized.match(/<\/blockquote>/g)?.length).toBe(100);
+    expect(sanitized).toBe(`${"<blockquote>".repeat(100)}keep${"</blockquote>".repeat(100)}`);
+  });
 });
 
 describe("matrixTextContent fallback", () => {
@@ -220,6 +257,28 @@ describe("matrixTextContent fallback", () => {
     const content = matrixTextContent(markdown);
     expect(content.body).toBe(markdown);
     expect(content.msgtype).toBe("m.text");
+  });
+
+  it("finishes adversarial unmatched emphasis well under a hard time budget", () => {
+    const cases: Array<{ name: string; markdown: string }> = [
+      { name: "unmatched *a runs", markdown: `${"*a ".repeat(400)}z` },
+      { name: "long * run", markdown: `${"*".repeat(2_000)}z` },
+      { name: "interleaved * and _", markdown: `${"*_".repeat(1_000)}z` },
+      {
+        name: "nested-looking openers then closers",
+        markdown: `${"*a ".repeat(2_000)}x${" b*".repeat(2_000)}`,
+      },
+      { name: "unmatched mixed runs", markdown: `${"***a _".repeat(500)}z` },
+    ];
+    const budgetMs = 100;
+    for (const { markdown } of cases) {
+      const started = performance.now();
+      const content = matrixTextContent(markdown);
+      const elapsed = performance.now() - started;
+      expect(elapsed).toBeLessThan(budgetMs);
+      expect(content.body).toBe(markdown);
+      expect(content.msgtype).toBe("m.text");
+    }
   });
 
   it("still formats a pairing-sized plain string", () => {

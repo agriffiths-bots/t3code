@@ -483,6 +483,7 @@ export const make = Effect.gen(function* () {
   });
 
   const deliver = Effect.fn("MatrixBridgeReactor.deliver")(function* (job: OutboundJob) {
+    const content = matrixTextContent(job.body);
     let attempt = 0;
     let sent = false;
     while (true) {
@@ -521,7 +522,7 @@ export const make = Effect.gen(function* () {
             client.sendText({
               roomId: job.roomId,
               transactionId: job.transactionId,
-              content: matrixTextContent(job.body),
+              content,
               ownershipEpoch: job.ownershipEpoch,
             }),
           );
@@ -583,6 +584,7 @@ export const make = Effect.gen(function* () {
       }
     };
 
+    const content = matrixTextContent(job.body);
     let attempt = 0;
     while (true) {
       const config = Option.getOrNull(yield* configService.currentConfig);
@@ -611,7 +613,7 @@ export const make = Effect.gen(function* () {
           client.sendText({
             roomId: job.roomId,
             transactionId: job.transactionId,
-            content: matrixTextContent(job.body),
+            content,
             // A gate message answers the room, not a bridged thread.
             ownershipEpoch: null,
           }),
