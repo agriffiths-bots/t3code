@@ -259,7 +259,18 @@ describe("matrixTextContent fallback", () => {
     expect(content.msgtype).toBe("m.text");
   });
 
-  it("finishes adversarial unmatched emphasis well under a hard time budget", () => {
+  it("still formats a short malformed link instead of throwing", () => {
+    const markdown = `${"[".repeat(20)}](${"(".repeat(20)}`;
+    const content = matrixTextContent(markdown);
+    expect(content.body).toBe(markdown);
+    expect(content.msgtype).toBe("m.text");
+    expect("formatted_body" in content).toBe(true);
+  });
+
+  it("finishes adversarial inline constructs well under a hard time budget", () => {
+    matrixTextContent("warmup **ok** `[link](https://example.com)`");
+    let unmatchedFenceLengths = "";
+    for (let n = 1; n <= 180; n += 1) unmatchedFenceLengths += `${"`".repeat(n)}x`;
     const cases: Array<{ name: string; markdown: string }> = [
       { name: "unmatched *a runs", markdown: `${"*a ".repeat(400)}z` },
       { name: "long * run", markdown: `${"*".repeat(2_000)}z` },
@@ -269,13 +280,35 @@ describe("matrixTextContent fallback", () => {
         markdown: `${"*a ".repeat(2_000)}x${" b*".repeat(2_000)}`,
       },
       { name: "unmatched mixed runs", markdown: `${"***a _".repeat(500)}z` },
+      {
+        name: "malformed links with unclosed destinations",
+        markdown: `${"[".repeat(12_000)}](${"(".repeat(12_000)}`,
+      },
+      {
+        name: "many distinct unclosed link destinations",
+        markdown: "[x](".repeat(4_000),
+      },
+      { name: "deeply nested brackets", markdown: `${"[".repeat(12_000)}${"]".repeat(12_000)}` },
+      { name: "malformed images", markdown: `${"![".repeat(6_000)}](${"(".repeat(12_000)}` },
+      { name: "long unmatched code-span run", markdown: `${"`".repeat(12_000)}x` },
+      { name: "unmatched code-span fence lengths", markdown: unmatchedFenceLengths },
+      { name: "autolink opener run", markdown: `${"<".repeat(12_000)}>` },
+      {
+        name: "nested emphasis inside a link label",
+        markdown: `[${"*a ".repeat(2_000)}x${" b*".repeat(2_000)}](https://example.com)`,
+      },
+      { name: "reference-style lookalikes", markdown: "[x][y]".repeat(4_000) },
+      {
+        name: "mixed pathological inlines",
+        markdown: `${"*a [`<".repeat(3_000)}z`,
+      },
     ];
-    const budgetMs = 100;
-    for (const { markdown } of cases) {
+    const budgetMs = 50;
+    for (const { name, markdown } of cases) {
       const started = performance.now();
       const content = matrixTextContent(markdown);
       const elapsed = performance.now() - started;
-      expect(elapsed).toBeLessThan(budgetMs);
+      expect(elapsed, `${name} took ${elapsed.toFixed(2)}ms`).toBeLessThan(budgetMs);
       expect(content.body).toBe(markdown);
       expect(content.msgtype).toBe("m.text");
     }

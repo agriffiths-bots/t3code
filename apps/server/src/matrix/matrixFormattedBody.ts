@@ -420,6 +420,7 @@ function escapeAttr(value: string): string {
   return escapeHtml(value).replace(/"/g, "&quot;");
 }
 
+/** Hard cap on parser work. Every re-enterable scan step must call tick. */
 class RenderBudget {
   private ops = 0;
   private readonly maxOps: number;
@@ -759,12 +760,19 @@ function trimTrailingHashes(value: string): string {
   return value.replace(/[ \t]+#+$/, "").trim();
 }
 
+/**
+ * Per-inline-pass memo so a closer or failed destination is never re-scanned.
+ * Combined with RenderBudget.tick on every scan step, retry paths stay linear
+ * (or abort to plaintext) instead of re-walking the same suffix.
+ */
 interface InlineScan {
   readonly noCloseFrom: Map<string, number>;
+  readonly closerHit: Map<string, { from: number; pos: number }>;
+  readonly destUnclosed: Set<number>;
 }
 
 function newInlineScan(): InlineScan {
-  return { noCloseFrom: new Map() };
+  return { noCloseFrom: new Map(), closerHit: new Map(), destUnclosed: new Set() };
 }
 
 function indexOfOrMiss(
@@ -772,16 +780,28 @@ function indexOfOrMiss(
   needle: string,
   from: number,
   scan: InlineScan,
+  budget: RenderBudget,
   key: string = needle,
 ): number {
   const missFrom = scan.noCloseFrom.get(key) ?? Number.POSITIVE_INFINITY;
-  if (from >= missFrom) return -1;
+  if (from >= missFrom) {
+    budget.tick();
+    return -1;
+  }
+  const hit = scan.closerHit.get(key);
+  if (hit !== undefined && from >= hit.from && from <= hit.pos) {
+    budget.tick();
+    return hit.pos;
+  }
   const found = src.indexOf(needle, from);
   if (found === -1) {
+    budget.tick(Math.max(1, src.length - from));
     const current = scan.noCloseFrom.get(key);
     if (current === undefined || from < current) scan.noCloseFrom.set(key, from);
     return -1;
   }
+  budget.tick(found - from + 1);
+  scan.closerHit.set(key, { from, pos: found });
   return found;
 }
 
@@ -834,7 +854,7 @@ function renderInline(
       continue;
     }
     if (ch === "`") {
-      const span = parseCodeSpan(src, i, scan);
+      const span = parseCodeSpan(src, i, scan, budget);
       if (span !== null) {
         pushHtml(`<code>${escapeHtml(span.inner)}</code>`);
         i = span.end;
@@ -921,7 +941,7 @@ function renderInline(
       }
     }
     if (ch === "<") {
-      const autolink = parseAutolink(src, i, scan);
+      const autolink = parseAutolink(src, i, scan, budget);
       if (autolink !== null) {
         pushHtml(autolink.html);
         i = autolink.end;
@@ -986,6 +1006,7 @@ function matchDelimiterPairs(delimiters: Delim[], budget: RenderBudget): void {
     let newMinOpenerIdx = openerIdx;
 
     for (; openerIdx > minOpenerIdx; openerIdx -= (jumps[openerIdx] ?? 0) + 1) {
+      budget.tick();
       const opener = delimiters[openerIdx];
       if (opener === undefined || opener.marker !== closer.marker) continue;
       if (!(opener.open && opener.end < 0)) continue;
@@ -1123,20 +1144,29 @@ function parseCodeSpan(
   src: string,
   from: number,
   scan: InlineScan,
+  budget: RenderBudget,
 ): { inner: string; end: number } | null {
+  budget.tick();
   let n = 0;
-  while (src[from + n] === "`") n += 1;
+  while (src[from + n] === "`") {
+    budget.tick();
+    n += 1;
+  }
   if (n === 0) return null;
   const key = `code:${String(n)}`;
   if (from >= (scan.noCloseFrom.get(key) ?? Number.POSITIVE_INFINITY)) return null;
   let i = from + n;
   while (i < src.length) {
+    budget.tick();
     if (src[i] !== "`") {
       i += 1;
       continue;
     }
     let m = 0;
-    while (src[i + m] === "`") m += 1;
+    while (src[i + m] === "`") {
+      budget.tick();
+      m += 1;
+    }
     if (m === n) {
       let inner = src.slice(from + n, i);
       if (inner.length >= 2 && inner.startsWith(" ") && inner.endsWith(" ")) {
@@ -1158,26 +1188,37 @@ function parseInlineLink(
   scan: InlineScan,
   budget: RenderBudget,
 ): { html: string; end: number } | null {
+  budget.tick();
   const labelStart = image ? i + 1 : i;
   if (src[labelStart] !== "[") return null;
-  const labelEnd = indexOfOrMiss(src, "]", labelStart + 1, scan);
+  const labelEnd = indexOfOrMiss(src, "]", labelStart + 1, scan, budget);
   if (labelEnd === -1 || src[labelEnd + 1] !== "(") return null;
+  const destStart = labelEnd + 2;
+  if (scan.destUnclosed.has(destStart)) {
+    budget.tick();
+    return null;
+  }
   let depth = 1;
-  let j = labelEnd + 2;
+  let j = destStart;
   while (j < src.length && depth > 0) {
     const ch = src[j];
     if (ch === "\\" && j + 1 < src.length) {
+      budget.tick(2);
       j += 2;
       continue;
     }
+    budget.tick();
     if (ch === "(") depth += 1;
     else if (ch === ")") depth -= 1;
     j += 1;
   }
-  if (depth !== 0) return null;
+  if (depth !== 0) {
+    scan.destUnclosed.add(destStart);
+    return null;
+  }
   const label = src.slice(labelStart + 1, labelEnd);
   const dest = src
-    .slice(labelEnd + 2, j - 1)
+    .slice(destStart, j - 1)
     .trim()
     .replace(/^<|>$/g, "")
     .split(/\s/)[0];
@@ -1199,13 +1240,22 @@ function parseAutolink(
   src: string,
   i: number,
   scan: InlineScan,
+  budget: RenderBudget,
 ): { html: string; end: number } | null {
+  budget.tick();
   if (src[i] !== "<") return null;
-  const end = indexOfOrMiss(src, ">", i + 1, scan);
+  const end = indexOfOrMiss(src, ">", i + 1, scan, budget);
   if (end === -1 || end - i > 2048) return null;
   const dest = src.slice(i + 1, end);
-  if (dest.includes(" ") || dest.includes("<")) return null;
-  if (!isPermittedHref(dest)) return null;
+  for (let k = 0; k < dest.length; k += 1) {
+    budget.tick();
+    const ch = dest[k];
+    if (ch === " " || ch === "<") return null;
+  }
+  if (!isPermittedHref(dest)) {
+    budget.tick(Math.max(1, dest.length));
+    return null;
+  }
   return {
     html: `<a href="${escapeAttr(dest)}">${escapeHtml(dest)}</a>`,
     end: end + 1,
