@@ -143,7 +143,13 @@ export interface MatrixSdkClient {
   getRoomState(roomId: string): Promise<ReadonlyArray<unknown>>;
   createRoom(options: MatrixCreateRoomOptions): Promise<string>;
   inviteUser(userId: string, roomId: string): Promise<unknown>;
-  doRequest(method: string, endpoint: string, qs?: unknown, body?: unknown): Promise<unknown>;
+  doRequest(
+    method: string,
+    endpoint: string,
+    qs?: unknown,
+    body?: unknown,
+    ...rest: ReadonlyArray<unknown>
+  ): Promise<unknown>;
   start(filter?: unknown): Promise<unknown>;
   stop(): void;
   on(event: string, handler: MatrixSdkEventHandler): unknown;
@@ -217,6 +223,9 @@ export const loadMatrixBotSdk: MatrixSdkLoader = async () => {
 /** Matches matrix-bot-sdk's own stored-filter comparison byte for byte. */
 const sameSyncFilter = (left: unknown, right: unknown) =>
   JSON.stringify(left) === JSON.stringify(right);
+
+/** Identity of the filter a sync loop is running, compared the same way. */
+const syncFilterIdentity = (filter: unknown) => JSON.stringify(filter);
 
 const clientError = (
   operation: "listen" | "send",
@@ -574,21 +583,12 @@ export const reconcileAllowedMembership = Effect.fn(
   }
 });
 
-export const ensureSyncFilter = Effect.fn("MatrixBotSdkClient.ensureSyncFilter")(function* (
+/** Registers a filter with the homeserver and returns its identifier. */
+export const registerSyncFilter = Effect.fn("MatrixBotSdkClient.registerSyncFilter")(function* (
   client: MatrixSdkClient,
-  storage: MatrixSdkStorageProvider,
   botUserId: string,
   filter: unknown,
 ) {
-  const existing = yield* Effect.try({
-    try: () => storage.getFilter(),
-    catch: () => clientError("listen", "The Matrix sync store could not be read.", "permanent"),
-  });
-  // Compared the way the SDK compares it, so a match there is a match here.
-  if (existing !== null && existing !== undefined && sameSyncFilter(existing.filter, filter)) {
-    return;
-  }
-
   const response = yield* request("listen", "The Matrix sync filter could not be created.", () =>
     client.doRequest(
       "POST",
@@ -605,6 +605,25 @@ export const ensureSyncFilter = Effect.fn("MatrixBotSdkClient.ensureSyncFilter")
       "transient",
     );
   }
+  return filterId;
+});
+
+export const ensureSyncFilter = Effect.fn("MatrixBotSdkClient.ensureSyncFilter")(function* (
+  client: MatrixSdkClient,
+  storage: MatrixSdkStorageProvider,
+  botUserId: string,
+  filter: unknown,
+) {
+  const existing = yield* Effect.try({
+    try: () => storage.getFilter(),
+    catch: () => clientError("listen", "The Matrix sync store could not be read.", "permanent"),
+  });
+  // Compared the way the SDK compares it, so a match there is a match here.
+  if (existing !== null && existing !== undefined && sameSyncFilter(existing.filter, filter)) {
+    return;
+  }
+
+  const filterId = yield* registerSyncFilter(client, botUserId, filter);
   yield* Effect.try({
     try: () => {
       // Same order as the SDK: a new filter invalidates any old cursor, and the
@@ -638,6 +657,8 @@ export interface FencedSyncStorage {
   /** False only while the pre-fence catch-up batch is being emitted. */
   readonly acceptsTimelineEvents: () => boolean;
   readonly syncedBatches: () => number;
+  /** Permanently drops writes and events from a client being discarded. */
+  readonly retire: () => void;
   /**
    * Completes once the catch-up boundary exists, so nothing is announced as
    * ready while a message the owner sends could still land in the fenced batch.
@@ -650,12 +671,15 @@ export function createFencedSyncStorage(inner: MatrixSdkStorageProvider): Fenced
   // fenced and no live message is dropped after a restart.
   let fenced = (inner.getSyncToken() ?? "") === "";
   let syncedBatches = 0;
+  let retired = false;
   let boundary = Deferred.makeUnsafe<void>();
   if (!fenced) Deferred.doneUnsafe(boundary, Effect.void);
-
   const storage: MatrixSdkStorageProvider = {
     getSyncToken: () => inner.getSyncToken(),
     setSyncToken: (token) => {
+      // A retired client's in-flight sync still resolves and still tries to
+      // write; its cursor belongs to a connection that no longer exists.
+      if (retired) return;
       // The write comes first: a store that failed to persist the cursor has
       // not advanced the batch, and a retry of the same catch-up must stay
       // fenced rather than count as a second batch.
@@ -672,15 +696,116 @@ export function createFencedSyncStorage(inner: MatrixSdkStorageProvider): Fenced
       }
     },
     getFilter: () => inner.getFilter(),
-    setFilter: (filter) => inner.setFilter(filter),
+    setFilter: (filter) => {
+      if (retired) return;
+      inner.setFilter(filter);
+    },
   };
 
   return {
     storage,
-    acceptsTimelineEvents: () => !fenced || syncedBatches >= 2,
+    acceptsTimelineEvents: () => !retired && (!fenced || syncedBatches >= 2),
     syncedBatches: () => syncedBatches,
     awaitSyncBoundary: Effect.suspend(() => Deferred.await(boundary)),
+    retire: () => {
+      retired = true;
+    },
   };
+}
+
+const MATRIX_SYNC_ENDPOINT = "/_matrix/client/v3/sync";
+
+interface TrackedMatrixClient {
+  readonly client: MatrixSdkClient;
+  /**
+   * Resolves once no sync request is outstanding.
+   *
+   * `MatrixClient.stop` only sets a flag, so the request it cannot cancel still
+   * resolves, writes its cursor and drives crypto. Nothing may reopen the
+   * stores until that has finished, and a request that never lands must not
+   * hold the handover open forever.
+   */
+  readonly awaitSyncIdle: Effect.Effect<void>;
+}
+
+export function trackSyncRequests(
+  MatrixClientClass: MatrixSdkModule["MatrixClient"],
+  construct: (clientClass: MatrixSdkModule["MatrixClient"]) => MatrixSdkClient,
+): TrackedMatrixClient {
+  let pending = 0;
+  let idle: Deferred.Deferred<void> | null = null;
+
+  const track = <A>(work: Promise<A>): Promise<A> => {
+    pending += 1;
+    return work.finally(() => {
+      pending -= 1;
+      if (pending > 0 || idle === null) return;
+      Deferred.doneUnsafe(idle, Effect.void);
+      idle = null;
+    });
+  };
+
+  class SyncTrackingMatrixClient extends MatrixClientClass {
+    override doRequest(
+      method: string,
+      endpoint: string,
+      qs?: unknown,
+      body?: unknown,
+      ...rest: ReadonlyArray<unknown>
+    ): Promise<unknown> {
+      const call = super.doRequest(method, endpoint, qs, body, ...rest);
+      return endpoint === MATRIX_SYNC_ENDPOINT ? track(call) : call;
+    }
+
+    /**
+     * The response is only half an iteration: the SDK then persists the cursor,
+     * feeds the crypto store and emits events. A client is idle only once that
+     * has finished too, otherwise a replacement could reopen the stores while
+     * the retired loop is still writing to them.
+     */
+    processSync(raw?: unknown, emitFn?: unknown): Promise<unknown> {
+      const base = (
+        MatrixClientClass.prototype as {
+          processSync?: (this: unknown, raw?: unknown, emitFn?: unknown) => Promise<unknown>;
+        }
+      ).processSync;
+      if (base === undefined) return Promise.resolve(undefined);
+      return track(base.call(this, raw, emitFn));
+    }
+  }
+
+  return {
+    client: construct(SyncTrackingMatrixClient),
+    // Deliberately unbounded: reopening a store a retired client might still
+    // write to is worse than a bridge that stays unavailable until it is safe.
+    awaitSyncIdle: Effect.suspend(() => {
+      if (pending === 0) return Effect.void;
+      const pendingIdle = Deferred.makeUnsafe<void>();
+      idle = pendingIdle;
+      return Deferred.await(pendingIdle);
+    }),
+  };
+}
+
+interface LiveTransport {
+  readonly storeKey: string;
+  /** Homeserver and token this client authenticates with. */
+  readonly credentialKey: string;
+  readonly client: MatrixSdkClient;
+  readonly storage: MatrixSdkStorageProvider;
+  readonly fence: FencedSyncStorage;
+  readonly awaitSyncIdle: Effect.Effect<void>;
+  /**
+   * Buffers decrypted room text for whichever connection is draining it. The
+   * handler that fills it is attached once, for the client's whole life, so a
+   * reused sync loop cannot advance its cursor through a gap between
+   * connections and drop the messages in that batch.
+   */
+  readonly inbound: Queue.Queue<MatrixBridgeInboundText>;
+  /** The room the attached handler accepts, set by the live connection. */
+  roomId: string | null;
+  /** The filter its sync loop is running, or null before it started. */
+  syncFilterKey: string | null;
 }
 
 interface MatrixConnection {
@@ -702,6 +827,19 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
   const connectionRef = yield* Ref.make(Option.none<MatrixConnection>());
   /** Rooms created but not yet persisted, keyed by connection generation. */
   const createdRooms = new Map<string, string>();
+  /**
+   * At most one Matrix client exists at a time, and only one ever opens a given
+   * device's stores. Reconfiguration reuses it, because `MatrixClient.stop`
+   * cannot cancel a sync already in flight: a second client on the same sync
+   * file and crypto database would race the first one's last response.
+   */
+  let live: LiveTransport | null = null;
+  /**
+   * One barrier per retired client's stores. Reconfiguring back to an earlier
+   * device must still wait for that device's own retired client, so the
+   * barriers are kept until each is used.
+   */
+  const retiredByStoreKey = new Map<string, Effect.Effect<void>>();
 
   const currentConfig = configService.currentConfig;
 
@@ -747,6 +885,29 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
       Stream.runHead,
       Effect.asVoid,
     );
+
+  /**
+   * Retires the running client: its fence stops accepting writes and events,
+   * and its sync loop is told to stop.
+   *
+   * The request `stop()` cannot cancel is not waited for here, because at
+   * shutdown there is nothing left to protect. The wait belongs to whatever
+   * reopens the stores, and is kept for exactly that.
+   */
+  const retireLiveTransport = Effect.fn("MatrixBotSdkClient.retireLiveTransport")(function* () {
+    const retiring = live;
+    if (retiring === null) return;
+    // One indivisible step: a reconfiguration interrupting halfway through
+    // could otherwise leave a client syncing with nothing recorded to wait for,
+    // and the next connection would open a second one on the same stores.
+    yield* Effect.sync(() => {
+      live = null;
+      retiring.fence.retire();
+      retiring.client.stop();
+      retiredByStoreKey.set(retiring.storeKey, retiring.awaitSyncIdle);
+    });
+    yield* Effect.logInfo("Matrix bridge retired its Matrix client");
+  });
 
   const installQuietSdkLogger = (module: MatrixSdkModule) =>
     Effect.sync(() => {
@@ -883,6 +1044,80 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
     return roomId;
   });
 
+  /** Opens the one client for a device, waiting out any retired predecessor. */
+  const openTransport = Effect.fn("MatrixBotSdkClient.openTransport")(function* (input: {
+    readonly module: MatrixSdkModule;
+    readonly config: MatrixBridgeConfigV1;
+    readonly storeKey: string;
+    readonly storeDir: string;
+    readonly credentialKey: string;
+    readonly botUserId: string;
+  }) {
+    // Only the stores about to be opened need protecting; another device's
+    // retired client can finish whenever it likes, and its barrier is kept in
+    // case the bridge is pointed back at it.
+    const barrier = retiredByStoreKey.get(input.storeKey);
+    if (barrier !== undefined) {
+      yield* barrier;
+      retiredByStoreKey.delete(input.storeKey);
+    }
+
+    const inbound = yield* Queue.dropping<MatrixBridgeInboundText>(MATRIX_INBOUND_QUEUE_CAPACITY);
+    return yield* Effect.try({
+      try: () => {
+        const storageProvider = new input.module.SimpleFsStorageProvider(
+          path.join(input.storeDir, MATRIX_SYNC_STORE_FILE_NAME),
+        );
+        const cryptoStore = new input.module.RustSdkCryptoStorageProvider(
+          path.join(input.storeDir, MATRIX_CRYPTO_STORE_DIRECTORY_NAME),
+          MATRIX_CRYPTO_SQLITE_STORE_TYPE,
+        );
+        // The SDK writes through the fence so the catch-up batch is
+        // recognisable; encryption still receives that batch in full.
+        const fencedStorage = createFencedSyncStorage(storageProvider);
+        const tracked = trackSyncRequests(
+          input.module.MatrixClient,
+          (MatrixClientClass) =>
+            new MatrixClientClass(
+              input.config.homeserverUrl,
+              input.config.accessToken,
+              fencedStorage.storage,
+              cryptoStore,
+            ),
+        );
+        const transport: LiveTransport = {
+          storeKey: input.storeKey,
+          credentialKey: input.credentialKey,
+          client: tracked.client,
+          awaitSyncIdle: tracked.awaitSyncIdle,
+          // Everything writes through the fence, so a cleared cursor re-arms it
+          // wherever the clearing happened.
+          storage: fencedStorage.storage,
+          fence: fencedStorage,
+          inbound,
+          roomId: null,
+          syncFilterKey: null,
+        };
+        // Attached once and never removed: the buffer outlives an individual
+        // connection so no batch is decrypted into nowhere.
+        tracked.client.on(MATRIX_DECRYPTED_EVENT, (eventRoomId, event) => {
+          // Pre-fence history is dropped here, after the SDK has taken the
+          // batch's room keys and device updates into the crypto store.
+          if (transport.roomId === null || !fencedStorage.acceptsTimelineEvents()) return;
+          const message = toInboundText(event, eventRoomId, transport.roomId, input.botUserId);
+          if (message !== null) Queue.offerUnsafe(inbound, message);
+        });
+        return transport;
+      },
+      catch: () =>
+        clientError(
+          "listen",
+          "The Matrix client could not open its encryption store.",
+          "permanent",
+        ),
+    });
+  });
+
   const runConnection = Effect.fn("MatrixBotSdkClient.runConnection")(function* (
     config: MatrixBridgeConfigV1,
     onInboundText: MatrixBridgeInboundHandler,
@@ -901,6 +1136,17 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
     // The store is named after the device, and only the homeserver can say
     // which device this token belongs to, so identity is resolved first with a
     // client that owns no persistent state.
+    // Credentials are settled before anything is asked of the homeserver.
+    // A configuration naming different ones must not leave the running client
+    // syncing under the credentials it replaced, and the replacement must not
+    // be handed to that client either: until the homeserver says which device
+    // the new token belongs to, a loop using it could pull another device's
+    // to-device messages into this one's stores.
+    const credentialKey = `${config.homeserverUrl}\n${config.accessToken}`;
+    if (live !== null && live.credentialKey !== credentialKey) {
+      yield* retireLiveTransport();
+    }
+
     const identity = yield* Effect.acquireRelease(
       Effect.try({
         try: () => new module.MatrixClient(config.homeserverUrl, config.accessToken),
@@ -909,82 +1155,81 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
       (probe) => Effect.sync(() => probe.stop()),
     ).pipe(Effect.flatMap(whoami));
     const botUserId = identity.userId;
-    const storeDir = yield* prepareStoreDirectory(
-      yield* deviceStoreKey(config, identity),
-      config.cryptoStoreGeneration,
-    );
+    const storeKey = yield* deviceStoreKey(config, identity);
+    const storeDir = yield* prepareStoreDirectory(storeKey, config.cryptoStoreGeneration);
 
-    const { client, storage, fence } = yield* Effect.acquireRelease(
-      Effect.try({
-        try: () => {
-          const storageProvider = new module.SimpleFsStorageProvider(
-            path.join(storeDir, MATRIX_SYNC_STORE_FILE_NAME),
-          );
-          const cryptoStore = new module.RustSdkCryptoStorageProvider(
-            path.join(storeDir, MATRIX_CRYPTO_STORE_DIRECTORY_NAME),
-            MATRIX_CRYPTO_SQLITE_STORE_TYPE,
-          );
-          // The SDK writes through the fence so the catch-up batch is
-          // recognisable; encryption still receives that batch in full.
-          const fencedStorage = createFencedSyncStorage(storageProvider);
-          return {
-            client: new module.MatrixClient(
-              config.homeserverUrl,
-              config.accessToken,
-              fencedStorage.storage,
-              cryptoStore,
-            ),
-            // Everything writes through the fence, so a cleared cursor re-arms
-            // it wherever the clearing happened.
-            storage: fencedStorage.storage,
-            fence: fencedStorage,
-          };
-        },
-        catch: () =>
-          clientError(
-            "listen",
-            "The Matrix client could not open its encryption store.",
-            "permanent",
-          ),
-      }),
-      ({ client }) => Effect.sync(() => client.stop()),
-    );
-
-    const roomId = yield* ensureRoom(client, config, botUserId);
+    // The device the credentials name may itself have changed, and a different
+    // device is a different set of stores.
+    if (live !== null && live.storeKey !== storeKey) {
+      yield* retireLiveTransport();
+    }
+    if (live === null) {
+      live = yield* openTransport({ module, config, storeKey, storeDir, credentialKey, botUserId });
+    }
+    const roomId = yield* ensureRoom(live.client, config, botUserId);
     const syncFilter = buildSyncFilter(roomId);
-    // Registering a filter clears the stored cursor, so it happens before the
-    // sync loop starts rather than inside it.
-    yield* ensureSyncFilter(client, storage, botUserId, syncFilter);
+    const syncFilterKey = syncFilterIdentity(syncFilter);
+    if (live.syncFilterKey !== null && live.syncFilterKey !== syncFilterKey) {
+      // A new room needs a new filter, and the running loop cannot take one:
+      // the request already in flight still carries the old filter and would
+      // advance the cursor past events for the new room. Retiring the client
+      // and opening a fresh loop on the same stores resumes from the stored
+      // cursor under the new filter, so nothing is skipped.
+      yield* retireLiveTransport();
+      live = yield* openTransport({ module, config, storeKey, storeDir, credentialKey, botUserId });
+    }
+    const { client, storage, fence } = live;
 
-    const inbound = yield* Queue.dropping<MatrixBridgeInboundText>(MATRIX_INBOUND_QUEUE_CAPACITY);
-    yield* Effect.acquireRelease(
-      Effect.sync(() => {
-        const handler: MatrixSdkEventHandler = (eventRoomId, event) => {
-          // Pre-fence history is dropped here, after the SDK has taken the
-          // batch's room keys and device updates into the crypto store.
-          if (!fence.acceptsTimelineEvents()) return;
-          const message = toInboundText(event, eventRoomId, roomId, botUserId);
-          if (message !== null) Queue.offerUnsafe(inbound, message);
-        };
-        client.on(MATRIX_DECRYPTED_EVENT, handler);
-        return handler;
-      }),
-      (handler) =>
-        Effect.sync(() => {
-          client.off(MATRIX_DECRYPTED_EVENT, handler);
+    // The handler keeps accepting this room between connections: the sync loop
+    // is still running, and a batch that lands in that gap belongs to the next
+    // connection rather than to nobody. A different room arrives with a
+    // different filter, which restarts the loop anyway.
+    live.roomId = roomId;
+    const transport = live;
+    // Room order is preserved by draining one message at a time. The queue
+    // belongs to the transport, so anything buffered between connections is
+    // delivered by the next one rather than lost, and the allowed list is read
+    // at delivery: a member removed while a message was queued is not one the
+    // bridge still listens to.
+    yield* Effect.forkScoped(
+      Stream.runForEach(Stream.fromQueue(transport.inbound), (event) =>
+        Effect.gen(function* () {
+          // The queue outlives a connection, so an event buffered for the room
+          // this connection replaced is not one it may deliver.
+          if (event.roomId !== roomId) return;
+          const stored = yield* currentConfig;
+          if (Option.isNone(stored) || !stored.value.allowedUserIds.includes(event.sender)) {
+            return;
+          }
+          yield* onInboundText(event);
         }),
+      ),
     );
-    // Room order is preserved by draining one message at a time.
-    yield* Effect.forkScoped(Stream.runForEach(Stream.fromQueue(inbound), onInboundText));
 
     // Starting the sync loop also prepares encryption. A homeserver rejects the
     // device keys when the bot token was paired with a different crypto store,
-    // which a new bot login repairs.
-    yield* request(
-      "listen",
-      "The Matrix sync and encryption session could not be started. The bot access token may belong to a device that was paired with a different encryption store.",
-      () => client.start(syncFilter),
-    );
+    // which a new bot login repairs. A loop already running this filter is left
+    // alone: restarting it would reopen stores the client still holds.
+    if (live.syncFilterKey !== syncFilterKey) {
+      const starting = live;
+      // Interruption cannot cancel the SDK's start, and a half-started client
+      // whose filter is still unrecorded would be reused and started a second
+      // time, putting two sync loops on one store. The start therefore
+      // completes before a reconfiguration is allowed to take effect.
+      yield* Effect.uninterruptible(
+        Effect.gen(function* () {
+          // Registering a filter clears the stored cursor, so it happens before
+          // the sync loop starts rather than inside it.
+          yield* ensureSyncFilter(client, storage, botUserId, syncFilter);
+          yield* request(
+            "listen",
+            "The Matrix sync and encryption session could not be started. The bot access token may belong to a device that was paired with a different encryption store.",
+            () => client.start(syncFilter),
+          );
+          starting.syncFilterKey = syncFilterKey;
+        }),
+      );
+    }
     if (client.crypto?.isReady !== true) {
       return yield* clientError(
         "listen",
@@ -1032,8 +1277,15 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
 
   const listen: MatrixBridgeClient["Service"]["listen"] = (onInboundText) =>
     Effect.gen(function* () {
+      // The client outlives an individual connection so reconfiguration can
+      // reuse it; shutting the listener down is what finally releases it.
+      yield* Effect.addFinalizer(() => retireLiveTransport());
+
       let attempt = 0;
       while (true) {
+        // Disconnect means no Matrix activity at all, not a client left
+        // syncing in the background.
+        if (Option.isNone(yield* currentConfig)) yield* retireLiveTransport();
         const config = yield* awaitConfigured;
         const outcome = yield* Effect.result(
           Effect.scoped(
@@ -1113,11 +1365,11 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
     // connection captured above may already be retired: check the live
     // configuration immediately before the request so output cannot reach a
     // room the operator has just replaced or left.
-    const live = Option.getOrNull(yield* configService.currentConfig);
+    const stored = Option.getOrNull(yield* configService.currentConfig);
     if (
-      live === null ||
-      live.cryptoStoreGeneration !== connection.cryptoStoreGeneration ||
-      live.roomId !== connection.roomId
+      stored === null ||
+      stored.cryptoStoreGeneration !== connection.cryptoStoreGeneration ||
+      stored.roomId !== connection.roomId
     ) {
       return yield* clientError(
         "send",

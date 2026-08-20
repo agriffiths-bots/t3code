@@ -19,6 +19,7 @@ import {
   MEGOLM_ALGORITHM,
   buildSyncFilter,
   make,
+  trackSyncRequests,
   type MatrixCreateRoomOptions,
   type MatrixSdkClient,
   type MatrixSdkEventHandler,
@@ -55,6 +56,12 @@ interface FakeSdkOptions {
   readonly roomCreator?: string;
   readonly roomCreateContent?: Record<string, unknown>;
   readonly deviceId?: string | null;
+  /** Room identifiers handed out by successive room creations. */
+  readonly roomIds?: ReadonlyArray<string>;
+  /** Leaves a sync request outstanding until the test settles it. */
+  readonly pendingSync?: boolean;
+  /** Leaves the post-response processing outstanding until the test settles it. */
+  readonly pendingProcessing?: boolean;
   /** Content of the catch-up batch each `start()` delivers, as a server would. */
   readonly catchUp?: {
     readonly roomKeys?: ReadonlyArray<string>;
@@ -110,7 +117,21 @@ interface FakeSdk {
       readonly sessionKey?: string;
       readonly event: unknown;
     }>;
+    /** Defaults to the newest client; earlier indexes are retired ones. */
+    readonly clientIndex?: number;
   }) => void;
+  readonly clients: Array<{
+    readonly storage: MatrixSdkStorageProvider;
+    readonly accessToken: () => string;
+    readonly filterId: () => string | undefined;
+  }>;
+  readonly storedSyncToken: (storePath: string) => string | null;
+  readonly setDeviceId: (next: string) => void;
+  readonly pendingSyncCount: () => number;
+  readonly stoppedClients: () => ReadonlyArray<number>;
+  readonly resolvePendingSyncs: () => void;
+  readonly pendingProcessingCount: () => number;
+  readonly resolvePendingProcessing: () => void;
   readonly started: Deferred.Deferred<void>;
 }
 
@@ -132,11 +153,22 @@ const makeFakeSdk = (options: FakeSdkOptions = {}): FakeSdk => {
     ...Object.entries(options.roomMembership ?? {}),
   ]);
   const started = Deferred.makeUnsafe<void>();
-  let liveClient: { readonly storage: MatrixSdkStorageProvider } | null = null;
+  const clients: Array<{
+    readonly storage: MatrixSdkStorageProvider;
+    readonly processSync: () => void;
+    readonly accessToken: () => string;
+    readonly filterId: () => string | undefined;
+  }> = [];
   const failSends = [...(options.failSendsWith ?? [])];
   const roomState = options.roomState ?? encryptedRoomState();
-  let syncToken: string | null = options.syncToken ?? null;
-  let storedFilter: MatrixSdkFilterInfo | null = options.storedFilter ?? null;
+  // One entry per store path, so a replacement client cannot silently share
+  // the retired client's cursor.
+  const storedTokens = new Map<string, string | null>();
+  const storedFilters = new Map<string, MatrixSdkFilterInfo | null>();
+  const pendingSyncs: Array<() => void> = [];
+  const pendingProcessing: Array<() => void> = [];
+  const stopCalls: Array<number> = [];
+  let deviceId = options.deviceId === undefined ? "T3DEVICE" : options.deviceId;
   let encryptionCounter = 0;
   let batchCounter = 0;
 
@@ -144,9 +176,13 @@ const makeFakeSdk = (options: FakeSdkOptions = {}): FakeSdk => {
     cursor,
     roomKeys = [],
     timeline = [],
+    clientIndex,
   }) => {
-    // matrix-bot-sdk persists the cursor before it processes the batch.
-    liveClient?.storage.setSyncToken(cursor);
+    // matrix-bot-sdk persists the cursor before it processes the batch, and the
+    // processing itself is what the drain barrier has to outlast.
+    const target = clients[clientIndex ?? clients.length - 1];
+    target?.storage.setSyncToken(cursor);
+    target?.processSync();
     // To-device room keys reach the crypto store even for a fenced batch.
     for (const key of roomKeys) knownRoomKeys.add(key);
     for (const entry of timeline) {
@@ -160,21 +196,27 @@ const makeFakeSdk = (options: FakeSdkOptions = {}): FakeSdk => {
   };
 
   class FakeStorageProvider implements MatrixSdkStorageProvider {
+    readonly path: string;
+
     constructor(filename: string, persistent = true) {
-      if (persistent) syncStorePaths.push(filename);
+      this.path = filename;
+      if (!persistent) return;
+      syncStorePaths.push(filename);
+      if (!storedTokens.has(filename)) storedTokens.set(filename, options.syncToken ?? null);
+      if (!storedFilters.has(filename)) storedFilters.set(filename, options.storedFilter ?? null);
     }
     getSyncToken(): string | null {
-      return syncToken;
+      return storedTokens.get(this.path) ?? null;
     }
     setSyncToken(token: string | null): void {
-      syncToken = token;
+      storedTokens.set(this.path, token);
       storageWrites.push(token);
     }
     getFilter(): MatrixSdkFilterInfo | null {
-      return storedFilter;
+      return storedFilters.get(this.path) ?? null;
     }
     setFilter(filter: MatrixSdkFilterInfo): void {
-      storedFilter = filter;
+      storedFilters.set(this.path, filter);
     }
   }
 
@@ -192,6 +234,10 @@ const makeFakeSdk = (options: FakeSdkOptions = {}): FakeSdk => {
   class FakeMatrixClient implements MatrixSdkClient {
     readonly storage: MatrixSdkStorageProvider;
     readonly cryptoStore: unknown;
+    /** Writable, as on the real client: a token refresh retunes it in place. */
+    accessToken: string;
+    /** -1 for the identity probe, which owns no persistent state. */
+    readonly index: number;
     readonly crypto = {
       isReady: options.cryptoReady ?? true,
       encryptRoomEvent: (roomId: string, eventType: string, content: unknown) => {
@@ -216,10 +262,23 @@ const makeFakeSdk = (options: FakeSdkOptions = {}): FakeSdk => {
     ) {
       // The identity probe owns no persistent state, exactly like the SDK's
       // default in-memory storage.
+      this.accessToken = accessToken;
       this.storage = storage ?? new FakeStorageProvider("memory", false);
       this.cryptoStore = cryptoStore;
+      this.index = storage === undefined ? -1 : clients.length;
       if (storage !== undefined) {
-        liveClient = { storage };
+        const self = this as unknown as {
+          processSync: () => unknown;
+          accessToken: string;
+          filterId?: string;
+        };
+        clients.push({
+          storage,
+          // Runs through the tracking subclass, so the barrier counts it.
+          processSync: () => void self.processSync(),
+          accessToken: () => self.accessToken,
+          filterId: () => self.filterId,
+        });
         clientOptions.push({ homeserverUrl, accessToken });
       }
     }
@@ -256,7 +315,8 @@ const makeFakeSdk = (options: FakeSdkOptions = {}): FakeSdk => {
     createRoom(createOptions: MatrixCreateRoomOptions): Promise<string> {
       createdRooms.push(createOptions);
       for (const userId of createOptions.invite) roomMembership.set(userId, "invite");
-      return Promise.resolve(ROOM_ID);
+      const roomId = (options.roomIds ?? [])[createdRooms.length - 1] ?? ROOM_ID;
+      return Promise.resolve(roomId);
     }
 
     inviteUser(userId: string, roomId: string): Promise<unknown> {
@@ -267,16 +327,20 @@ const makeFakeSdk = (options: FakeSdkOptions = {}): FakeSdk => {
 
     doRequest(method: string, endpoint: string, qs?: unknown, body?: unknown): Promise<unknown> {
       requests.push({ method, endpoint, qs, body });
-      if (endpoint === "/_matrix/client/v3/sync") {
-        return Promise.resolve({ next_batch: "fence-cursor" });
-      }
       if (endpoint.endsWith("/filter")) {
         return Promise.resolve({ filter_id: "server-filter-id" });
       }
       if (endpoint === "/_matrix/client/v3/account/whoami") {
         return Promise.resolve({
           user_id: BOT_USER_ID,
-          ...(options.deviceId === null ? {} : { device_id: options.deviceId ?? "T3DEVICE" }),
+          ...(deviceId === null ? {} : { device_id: deviceId }),
+        });
+      }
+      if (endpoint === "/_matrix/client/v3/sync") {
+        // A long poll the caller settles by hand, standing in for the request
+        // `stop()` cannot cancel.
+        return new Promise<unknown>((resolve) => {
+          pendingSyncs.push(() => resolve({ next_batch: "late-cursor" }));
         });
       }
       const failure = failSends.shift();
@@ -290,24 +354,37 @@ const makeFakeSdk = (options: FakeSdkOptions = {}): FakeSdk => {
       if (
         filter !== undefined &&
         filter !== null &&
-        JSON.stringify(storedFilter?.filter) !== JSON.stringify(filter)
+        JSON.stringify(this.storage.getFilter()?.filter) !== JSON.stringify(filter)
       ) {
-        syncToken = null;
-        storageWrites.push(null);
-        storedFilter = { id: "sdk-created-filter", filter };
+        this.storage.setSyncToken(null);
+        this.storage.setFilter({ id: "sdk-created-filter", filter });
       }
       startedFilters.push(filter);
-      startedAfterStoredToken.push(syncToken);
+      startedAfterStoredToken.push(this.storage.getSyncToken());
       Deferred.doneUnsafe(started, Effect.void);
       // The sync loop runs in the background; its first response arrives just
       // after `start` resolves.
       batchCounter += 1;
       const cursor = `catch-up-${batchCounter}`;
-      queueMicrotask(() => deliverSyncBatch({ cursor, ...options.catchUp }));
+      const clientIndex = clients.length - 1;
+      queueMicrotask(() => deliverSyncBatch({ cursor, clientIndex, ...options.catchUp }));
+      // Mirrors the SDK's own long poll, so a caller can hold one open across a
+      // handover.
+      if (options.pendingSync === true) void this.doRequest("GET", "/_matrix/client/v3/sync");
       return Promise.resolve(undefined);
     }
 
-    stop(): void {}
+    stop(): void {
+      if (this.index >= 0) stopCalls.push(this.index);
+    }
+
+    /** Stands in for the SDK's post-response work: cursor, crypto, events. */
+    processSync(): Promise<unknown> {
+      if (options.pendingProcessing !== true) return Promise.resolve(undefined);
+      return new Promise<unknown>((resolve) => {
+        pendingProcessing.push(() => resolve(undefined));
+      });
+    }
 
     on(event: string, handler: MatrixSdkEventHandler): unknown {
       const existing = handlers.get(event) ?? new Set<MatrixSdkEventHandler>();
@@ -341,6 +418,20 @@ const makeFakeSdk = (options: FakeSdkOptions = {}): FakeSdk => {
     syncStorePaths,
     cryptoStores,
     invitations,
+    clients,
+    storedSyncToken: (storePath) => storedTokens.get(storePath) ?? null,
+    setDeviceId: (next) => {
+      deviceId = next;
+    },
+    pendingSyncCount: () => pendingSyncs.length,
+    stoppedClients: () => [...stopCalls],
+    resolvePendingSyncs: () => {
+      for (const resolve of pendingSyncs.splice(0)) resolve();
+    },
+    pendingProcessingCount: () => pendingProcessing.length,
+    resolvePendingProcessing: () => {
+      for (const resolve of pendingProcessing.splice(0)) resolve();
+    },
     deliverSyncBatch,
     started,
   };
@@ -381,6 +472,15 @@ const awaitStatusState = (
     Stream.runHead,
     Effect.asVoid,
   );
+
+/** Waits on a synchronous condition without touching the test clock. */
+const awaitCondition = Effect.fn("awaitCondition")(function* (predicate: () => boolean) {
+  for (let attempt = 0; attempt < 5_000; attempt += 1) {
+    if (predicate()) return;
+    yield* Effect.yieldNow;
+  }
+  assert.fail("condition never became true");
+});
 
 /** Starts the adapter's listen loop for the life of the test scope. */
 const startAdapter = Effect.fn("startAdapter")(function* (
@@ -498,6 +598,213 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
       yield* startAdapter(rotated);
       yield* Deferred.await(rotated.started);
       assert.notDeepEqual([...rotated.syncStorePaths], [...first.syncStorePaths]);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("reuses one client for the device instead of opening its stores twice", () =>
+    Effect.gen(function* () {
+      const sdk = makeFakeSdk();
+      const configService = yield* configureBridge();
+      yield* startAdapter(sdk);
+      yield* awaitStatusState(configService, "waiting-for-member");
+
+      // An allowlist edit mints a new connection identity but not a new device,
+      // and `stop()` cannot cancel a sync already in flight, so a second client
+      // on these stores would race the first one's last response.
+      yield* configService.configure({
+        homeserverUrl: HOMESERVER_URL,
+        accessToken: "matrix-secret-token",
+        allowedUserIds: [ALLOWED_USER_ID, "@second:beeper.com"],
+      });
+      yield* awaitStatusState(configService, "waiting-for-member");
+
+      assert.lengthOf(sdk.clients, 1);
+      assert.lengthOf(sdk.cryptoStores, 1);
+      assert.lengthOf(new Set(sdk.syncStorePaths), 1);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("opens a fresh loop on the same stores when the room changes", () =>
+    Effect.gen(function* () {
+      const secondRoom = "!second:matrix.example.test";
+      const sdk = makeFakeSdk({
+        roomIds: [ROOM_ID, secondRoom],
+        joinedRooms: [ROOM_ID, secondRoom],
+      });
+      const configService = yield* configureBridge();
+      yield* startAdapter(sdk);
+      yield* awaitStatusState(configService, "waiting-for-member");
+
+      // A new connection identity means a new room and a new filter. The
+      // running loop cannot take one, because the request already in flight
+      // carries the old filter and would advance the cursor past the new
+      // room's events, so it is retired and a fresh loop opens on the same
+      // stores and resumes from the stored cursor.
+      yield* configService.configure({
+        homeserverUrl: HOMESERVER_URL,
+        accessToken: "matrix-secret-token",
+        allowedUserIds: [ALLOWED_USER_ID, "@second:beeper.com"],
+      });
+      yield* awaitCondition(() => sdk.createdRooms.length > 1);
+      yield* awaitStatusState(configService, "waiting-for-member");
+
+      assert.deepEqual([...sdk.stoppedClients()], [0]);
+      assert.lengthOf(sdk.clients, 2);
+      // Same device, so the same stores, opened only after the first client
+      // was retired and had gone idle.
+      assert.lengthOf(new Set(sdk.syncStorePaths), 1);
+      assert.deepEqual([...sdk.startedFilters].at(-1), buildSyncFilter(secondRoom));
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("retires the old client before a replacement token is used", () =>
+    Effect.gen(function* () {
+      const sdk = makeFakeSdk();
+      const configService = yield* configureBridge();
+      yield* startAdapter(sdk);
+      yield* awaitStatusState(configService, "waiting-for-member");
+
+      // Until the homeserver says which device a replacement token belongs to,
+      // no running loop may use it: it could pull another device's to-device
+      // messages into these stores. The old client is retired first, and the
+      // replacement opens the stores only once that one has gone idle.
+      yield* configService.configure({
+        homeserverUrl: HOMESERVER_URL,
+        accessToken: "replacement-token",
+        allowedUserIds: [ALLOWED_USER_ID],
+      });
+      yield* awaitCondition(() => sdk.clients.length === 2);
+      yield* awaitStatusState(configService, "waiting-for-member");
+
+      assert.deepEqual([...sdk.stoppedClients()], [0]);
+      assert.deepEqual(
+        sdk.clientOptions.map((options) => options.accessToken),
+        ["matrix-secret-token", "replacement-token"],
+      );
+      // The device is unchanged, so the replacement holds the same stores.
+      assert.lengthOf(new Set(sdk.syncStorePaths), 1);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("counts the processing that follows a sync response as busy", () =>
+    Effect.gen(function* () {
+      // The response is half an iteration: the SDK then writes the cursor,
+      // feeds crypto and emits events, and a client is only idle after that.
+      const settlers: Array<() => void> = [];
+      class BaseClient {
+        processSync(): Promise<unknown> {
+          return new Promise<unknown>((resolve) => {
+            settlers.push(() => resolve(undefined));
+          });
+        }
+      }
+      const tracked = trackSyncRequests(
+        BaseClient as unknown as MatrixSdkModule["MatrixClient"],
+        (ClientClass) => new ClientClass("https://matrix.example.test", "token"),
+      );
+      const processing = (
+        tracked.client as unknown as { processSync: () => Promise<unknown> }
+      ).processSync();
+
+      const idleBeforeSettling = yield* Effect.race(
+        Effect.as(tracked.awaitSyncIdle, true),
+        Effect.as(Effect.yieldNow, false),
+      );
+      assert.isFalse(idleBeforeSettling);
+
+      for (const settle of settlers.splice(0)) settle();
+      yield* Effect.promise(() => processing);
+      yield* tracked.awaitSyncIdle;
+    }),
+  );
+
+  it.effect("keeps buffering room text between connections on one sync loop", () =>
+    Effect.gen(function* () {
+      const sdk = makeFakeSdk();
+      const received = yield* Queue.unbounded<MatrixBridgeInboundText>();
+      const configService = yield* configureBridge();
+      yield* startAdapter(sdk, (event) => Queue.offer(received, event));
+      yield* awaitStatusState(configService, "waiting-for-member");
+
+      // An allowlist edit reuses the running sync loop, and a batch can land
+      // while one connection has ended and the next has not started.
+      yield* configService.configure({
+        homeserverUrl: HOMESERVER_URL,
+        accessToken: "matrix-secret-token",
+        allowedUserIds: [ALLOWED_USER_ID, "@second:beeper.com"],
+      });
+      sdk.deliverSyncBatch({
+        cursor: "handover-batch",
+        roomKeys: ["megolm-session-1"],
+        timeline: [
+          {
+            sessionKey: "megolm-session-1",
+            event: decryptedTextEvent({
+              eventId: "$during-handover",
+              sender: ALLOWED_USER_ID,
+              body: "sent while the bridge was reconfiguring",
+            }),
+          },
+        ],
+      });
+      yield* awaitStatusState(configService, "waiting-for-member");
+
+      assert.lengthOf(sdk.clients, 1);
+      assert.equal((yield* Queue.take(received)).eventId, "$during-handover");
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("hands the stores over only after the retired sync has landed", () =>
+    Effect.gen(function* () {
+      // The retired client keeps a long poll open across the handover, exactly
+      // as matrix-bot-sdk does when `stop()` sets its flag mid-request.
+      const sdk = makeFakeSdk({ pendingSync: true, deviceId: "T3DEVICE-1" });
+      const received = yield* Queue.unbounded<MatrixBridgeInboundText>();
+      const configService = yield* configureBridge();
+      yield* startAdapter(sdk, (event) => Queue.offer(received, event));
+      yield* awaitStatusState(configService, "waiting-for-member");
+      assert.equal(sdk.pendingSyncCount(), 1);
+      const retiredStorePath = sdk.syncStorePaths[0] ?? "";
+
+      // A new bot login is a new device, so the replacement needs its own
+      // stores and the old client must be finished with the old ones.
+      sdk.setDeviceId("T3DEVICE-2");
+      yield* configService.configure({
+        homeserverUrl: HOMESERVER_URL,
+        accessToken: "rotated-token",
+        allowedUserIds: [ALLOWED_USER_ID],
+      });
+      // Stopping the old client is the step right after retiring its fence.
+      yield* awaitCondition(() => sdk.stoppedClients().includes(0));
+
+      // The response `stop()` could not cancel now lands. It must not write the
+      // cursor, and its timeline must not reach the bridge.
+      const cursorBeforeLateBatch = sdk.storedSyncToken(retiredStorePath);
+      sdk.deliverSyncBatch({
+        cursor: "late-cursor",
+        clientIndex: 0,
+        roomKeys: ["megolm-session-late"],
+        timeline: [
+          {
+            sessionKey: "megolm-session-late",
+            event: decryptedTextEvent({
+              eventId: "$late",
+              sender: ALLOWED_USER_ID,
+              body: "arrived after the handover",
+            }),
+          },
+        ],
+      });
+      assert.equal(sdk.storedSyncToken(retiredStorePath), cursorBeforeLateBatch);
+      assert.equal(yield* Queue.size(received), 0);
+
+      // The replacement is a different device, so it holds different stores and
+      // the retired request can land whenever it likes.
+      sdk.resolvePendingSyncs();
+      yield* awaitCondition(() => sdk.clients.length === 2);
+      yield* awaitStatusState(configService, "waiting-for-member");
+      assert.lengthOf(new Set(sdk.syncStorePaths), 2);
+      assert.notEqual(sdk.syncStorePaths[1], retiredStorePath);
     }).pipe(Effect.provide(testLayer)),
   );
 
