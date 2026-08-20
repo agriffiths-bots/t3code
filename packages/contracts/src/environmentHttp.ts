@@ -88,6 +88,7 @@ export const EnvironmentInternalErrorReason = Schema.Literals([
   "bootstrap_validation_failed",
   "browser_session_issuance_failed",
   "browser_session_replacement_failed",
+  "browser_session_replacement_reverted",
   "browser_session_cookie_failed",
   "access_token_issuance_failed",
   "websocket_ticket_issuance_failed",

@@ -12,10 +12,12 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   describeAuthenticatedPairingApply,
+  describeAuthenticatedPairingFailure,
   errorMessageFromUnknown,
   incomingGrantFromPairingLinks,
   incomingDropsCurrentScopes,
   isNarrowerAudienceCeiling,
+  pairingApplyFailureKindFromUnknown,
   submitPairingCredentialAndUnblock,
 } from "./PairingRouteSurface.logic";
 
@@ -98,7 +100,10 @@ describe("submitPairingCredentialAndUnblock", () => {
 
     const error = await submitPairingCredentialAndUnblock(deps, "BADCODE");
 
-    expect(error).toBe("Invalid pairing token.");
+    expect(error).toEqual({
+      message: "Invalid pairing token.",
+      kind: "generic",
+    });
     expect(calls.retried).toEqual([]);
   });
 
@@ -107,7 +112,25 @@ describe("submitPairingCredentialAndUnblock", () => {
 
     const error = await submitPairingCredentialAndUnblock(deps, "BADCODE");
 
-    expect(error).toBe("Authentication failed.");
+    expect(error).toEqual({
+      message: "Authentication failed.",
+      kind: "generic",
+    });
+  });
+
+  it("classifies tagged pairing failures so the apply surface can match copy to the outcome", async () => {
+    const { deps } = makeDeps({
+      submitError: Object.assign(new Error("used"), {
+        _tag: "PrimaryEnvironmentPairingCredentialConsumedError",
+      }),
+    });
+
+    const error = await submitPairingCredentialAndUnblock(deps, "USEDCODE");
+
+    expect(error).toEqual({
+      message: "used",
+      kind: "consumed",
+    });
   });
 });
 
@@ -226,5 +249,78 @@ describe("describeAuthenticatedPairingApply", () => {
         incoming: { scopes: [...AuthStandardClientScopes], audienceCeiling: "factory" },
       }).downgradeWarning,
     ).toBeNull();
+  });
+});
+
+describe("pairingApplyFailureKindFromUnknown", () => {
+  it("maps tagged primary pairing errors", () => {
+    expect(
+      pairingApplyFailureKindFromUnknown({
+        _tag: "PrimaryEnvironmentSessionReplacementError",
+      }),
+    ).toBe("replacement-failed");
+    expect(
+      pairingApplyFailureKindFromUnknown({
+        _tag: "PrimaryEnvironmentSessionReplacementRevertedError",
+      }),
+    ).toBe("consumed");
+    expect(
+      pairingApplyFailureKindFromUnknown({
+        _tag: "PrimaryEnvironmentPairingCredentialConsumedError",
+      }),
+    ).toBe("consumed");
+    expect(
+      pairingApplyFailureKindFromUnknown({
+        _tag: "PrimaryEnvironmentPairingCredentialRejectedError",
+      }),
+    ).toBe("rejected");
+    expect(pairingApplyFailureKindFromUnknown(new Error("nope"))).toBe("generic");
+  });
+});
+
+describe("describeAuthenticatedPairingFailure", () => {
+  it("keeps retry and current-session copy when replacement failed and the browser is still signed in", () => {
+    const copy = describeAuthenticatedPairingFailure({
+      kind: "replacement-failed",
+      stillAuthenticated: true,
+    });
+
+    expect(copy.title).toBe("Pairing link was not applied");
+    expect(copy.explanation).toMatch(/kept its current session/i);
+    expect(copy.explanation).toMatch(/retry with this link/i);
+    expect(copy.retryLabel).toBe("Retry");
+    expect(copy.continueLabel).toBe("Continue with current session");
+  });
+
+  it("does not offer retry when the link was already used", () => {
+    const signedIn = describeAuthenticatedPairingFailure({
+      kind: "consumed",
+      stillAuthenticated: true,
+    });
+    const signedOut = describeAuthenticatedPairingFailure({
+      kind: "consumed",
+      stillAuthenticated: false,
+    });
+
+    expect(signedIn.explanation).toMatch(/already used/i);
+    expect(signedIn.explanation).toMatch(/kept its current session/i);
+    expect(signedIn.retryLabel).toBeNull();
+    expect(signedOut.explanation).toMatch(/already used/i);
+    expect(signedOut.explanation).toMatch(/no longer signed in/i);
+    expect(signedOut.retryLabel).toBeNull();
+    expect(signedOut.continueLabel).toBe("Continue");
+  });
+
+  it("tells the truth when displacement ended the current session", () => {
+    const copy = describeAuthenticatedPairingFailure({
+      kind: "generic",
+      stillAuthenticated: false,
+    });
+
+    expect(copy.explanation).toMatch(/no longer signed in/i);
+    expect(copy.explanation).toMatch(/retry with this link/i);
+    expect(copy.retryLabel).toBe("Retry");
+    expect(copy.continueLabel).toBe("Continue");
+    expect(copy.explanation).not.toMatch(/kept its current session/i);
   });
 });

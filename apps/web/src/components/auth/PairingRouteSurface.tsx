@@ -19,8 +19,10 @@ import { Input } from "../ui/input";
 import { useAtomCommand } from "../../state/use-atom-command";
 import {
   describeAuthenticatedPairingApply,
+  describeAuthenticatedPairingFailure,
   errorMessageFromUnknown,
   incomingGrantFromPairingLinks,
+  type PairingApplyFailureKind,
   type PairingGrantView,
   submitPairingCredentialAndUnblock,
 } from "./PairingRouteSurface.logic";
@@ -120,7 +122,7 @@ export function PairingRouteSurface({
       setIsSubmitting(false);
 
       if (submitError) {
-        setErrorMessage(submitError);
+        setErrorMessage(submitError.message);
         return;
       }
 
@@ -232,6 +234,10 @@ export function AuthenticatedPairingApplySurface({
   const [errorMessage, setErrorMessage] = useState(() =>
     credential.length > 0 ? "" : "This pairing link is missing its token.",
   );
+  const [applyFailure, setApplyFailure] = useState<{
+    readonly kind: PairingApplyFailureKind;
+    readonly stillAuthenticated: boolean;
+  } | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const strippedUrlRef = useRef(false);
   const primaryEnvironmentId = usePrimaryEnvironmentId();
@@ -244,11 +250,23 @@ export function AuthenticatedPairingApplySurface({
     current: currentGrant,
     incoming: incomingGrant,
   });
+  const failureCopy =
+    applyFailure !== null
+      ? describeAuthenticatedPairingFailure(applyFailure)
+      : errorMessage && credential.length === 0
+        ? {
+            title: "Pairing link was not applied",
+            explanation: "This pairing link is missing its token.",
+            retryLabel: null,
+            continueLabel: "Continue with current session",
+          }
+        : null;
 
   const submitCredential = useCallback(
     async (nextCredential: string) => {
       setIsSubmitting(true);
       setErrorMessage("");
+      setApplyFailure(null);
 
       const submitError = await submitPairingCredentialAndUnblock(
         {
@@ -260,12 +278,22 @@ export function AuthenticatedPairingApplySurface({
         nextCredential,
       );
 
-      setIsSubmitting(false);
-
       if (submitError) {
-        setErrorMessage(submitError);
+        let stillAuthenticated = true;
+        try {
+          const session = await fetchSessionState();
+          stillAuthenticated = session.authenticated;
+        } catch {
+          // Pairing errors on this surface keep or restore the original cookie.
+          // A probe failure must not claim the browser was signed out.
+        }
+        setErrorMessage(submitError.message);
+        setApplyFailure({ kind: submitError.kind, stillAuthenticated });
+        setIsSubmitting(false);
         return;
       }
+
+      setIsSubmitting(false);
 
       startTransition(() => {
         onAuthenticated();
@@ -331,12 +359,10 @@ export function AuthenticatedPairingApplySurface({
           {APP_DISPLAY_NAME}
         </p>
         <h1 className="mt-3 text-2xl font-semibold tracking-tight sm:text-3xl">
-          {errorMessage ? "Pairing link was not applied" : copy.title}
+          {failureCopy?.title ?? copy.title}
         </h1>
         <p className="mt-2 text-sm leading-relaxed text-muted-foreground">
-          {errorMessage
-            ? "This browser kept its current session. You can retry with this link or continue as you are."
-            : copy.explanation}
+          {failureCopy?.explanation ?? copy.explanation}
         </p>
 
         {scopeProbeReady && copy.downgradeWarning ? (
@@ -352,7 +378,7 @@ export function AuthenticatedPairingApplySurface({
         ) : null}
 
         <div className="mt-6 flex flex-wrap gap-2">
-          {credential.length > 0 ? (
+          {credential.length > 0 && failureCopy?.retryLabel !== null ? (
             <Button
               size="sm"
               disabled={isSubmitting || !scopeProbeReady}
@@ -362,9 +388,7 @@ export function AuthenticatedPairingApplySurface({
                 ? "Pairing..."
                 : !scopeProbeReady
                   ? "Checking permissions..."
-                  : errorMessage
-                    ? "Retry"
-                    : "Apply this link"}
+                  : (failureCopy?.retryLabel ?? "Apply this link")}
             </Button>
           ) : null}
           <Button
@@ -373,7 +397,7 @@ export function AuthenticatedPairingApplySurface({
             disabled={isSubmitting}
             onClick={onContinueWithoutApplying}
           >
-            Continue with current session
+            {failureCopy?.continueLabel ?? "Continue with current session"}
           </Button>
         </div>
       </section>

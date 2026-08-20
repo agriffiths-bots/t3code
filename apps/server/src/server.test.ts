@@ -1942,15 +1942,21 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     "does not replace the browser session when revoking the existing cookie session fails",
     () =>
       Effect.gen(function* () {
+        let remainingForcedRevokeFailures = 1;
         yield* buildAppUnderTest({
           wrapEnvironmentAuth: (inner) => ({
             ...inner,
-            revokeSession: () =>
-              Effect.fail(
-                new EnvironmentAuth.ServerAuthSessionRevocationError({
-                  cause: new Error("session revoke unavailable"),
-                }),
-              ),
+            revokeSession: (sessionId) => {
+              if (remainingForcedRevokeFailures > 0) {
+                remainingForcedRevokeFailures -= 1;
+                return Effect.fail(
+                  new EnvironmentAuth.ServerAuthSessionRevocationError({
+                    cause: new Error("session revoke unavailable"),
+                  }),
+                );
+              }
+              return inner.revokeSession(sessionId);
+            },
           }),
         });
 
@@ -1977,10 +1983,176 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
 
         assert.equal(credentialResponse.status, 200);
         assert.equal(replacement.response.status, 500);
-        assert.equal(replacementBody.reason, "browser_session_replacement_failed");
+        assert.equal(replacementBody.reason, "browser_session_replacement_reverted");
         assert.isUndefined(replacement.cookie);
         assert.equal(originalBody.authenticated, true);
+
+        const retryWhileBlocked = yield* bootstrapBrowserSession(credential.credential, {
+          headers: { cookie: ownerCookie },
+        });
+        const retryWhileBlockedBody = yield* responseJsonEffect<{
+          readonly reason?: string;
+        }>(retryWhileBlocked.response);
+        assert.equal(retryWhileBlocked.response.status, 401);
+        assert.equal(retryWhileBlockedBody.reason, "consumed_credential");
+        assert.isUndefined(retryWhileBlocked.cookie);
       }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect(
+    "rolls back the new pairing session after displacement failure so the original cookie stays",
+    () =>
+      Effect.gen(function* () {
+        let remainingForcedRevokeFailures = 1;
+        yield* buildAppUnderTest({
+          wrapEnvironmentAuth: (inner) => ({
+            ...inner,
+            revokeSession: (sessionId) => {
+              if (remainingForcedRevokeFailures > 0) {
+                remainingForcedRevokeFailures -= 1;
+                return Effect.fail(
+                  new EnvironmentAuth.ServerAuthSessionRevocationError({
+                    cause: new Error("session revoke unavailable"),
+                  }),
+                );
+              }
+              return inner.revokeSession(sessionId);
+            },
+          }),
+        });
+
+        const ownerCookie = yield* getAuthenticatedSessionCookieHeader();
+        const credentialResponse = yield* HttpClient.post("/api/auth/pairing-token", {
+          headers: { cookie: ownerCookie },
+          body: yield* HttpBody.json({ audienceCeiling: "private" }),
+        });
+        const credential = (yield* credentialResponse.json) as { readonly credential: string };
+        const blocked = yield* bootstrapBrowserSession(credential.credential, {
+          headers: { cookie: ownerCookie },
+        });
+        const blockedBody = yield* responseJsonEffect<{
+          readonly reason?: string;
+        }>(blocked.response);
+        const clientsWhileBlockedResponse = yield* HttpClient.get("/api/auth/clients", {
+          headers: { cookie: ownerCookie },
+        });
+        const clientsWhileBlocked = (yield* clientsWhileBlockedResponse.json) as ReadonlyArray<{
+          readonly current: boolean;
+        }>;
+        const retry = yield* bootstrapBrowserSession(credential.credential, {
+          headers: { cookie: ownerCookie },
+        });
+        const retryBody = yield* responseJsonEffect<{
+          readonly reason?: string;
+        }>(retry.response);
+
+        const sessionUrl = yield* getHttpServerUrl("/api/auth/session");
+        const originalResponse = yield* fetchEffect(sessionUrl, {
+          headers: { cookie: ownerCookie },
+        });
+        const originalBody = yield* responseJsonEffect<{ readonly authenticated: boolean }>(
+          originalResponse,
+        );
+
+        assert.equal(credentialResponse.status, 200);
+        assert.equal(blocked.response.status, 500);
+        assert.equal(blockedBody.reason, "browser_session_replacement_reverted");
+        assert.isUndefined(blocked.cookie);
+        assert.equal(clientsWhileBlockedResponse.status, 200);
+        assert.equal(clientsWhileBlocked.filter((client) => client.current).length, 1);
+        assert.equal(retry.response.status, 401);
+        assert.equal(retryBody.reason, "consumed_credential");
+        assert.isUndefined(retry.cookie);
+        assert.equal(originalBody.authenticated, true);
+      }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect(
+    "installs the replacement cookie when session revoke persisted but MCP cleanup failed",
+    () =>
+      Effect.gen(function* () {
+        yield* buildAppUnderTest({
+          wrapEnvironmentAuth: (inner) => ({
+            ...inner,
+            revokeSession: (sessionId) =>
+              inner.revokeSession(sessionId).pipe(
+                Effect.flatMap(() =>
+                  Effect.fail(
+                    new EnvironmentAuth.ServerAuthSessionRevocationError({
+                      cause: new Error("MCP peer credential cleanup unavailable"),
+                    }),
+                  ),
+                ),
+              ),
+          }),
+        });
+
+        const ownerCookie = yield* getAuthenticatedSessionCookieHeader();
+        const credentialResponse = yield* HttpClient.post("/api/auth/pairing-token", {
+          headers: { cookie: ownerCookie },
+          body: yield* HttpBody.json({ audienceCeiling: "private" }),
+        });
+        const credential = (yield* credentialResponse.json) as { readonly credential: string };
+        const replacement = yield* bootstrapBrowserSession(credential.credential, {
+          headers: { cookie: ownerCookie },
+        });
+        const replacementCookie = replacement.cookie?.split(";")[0] ?? "";
+
+        const sessionUrl = yield* getHttpServerUrl("/api/auth/session");
+        const originalResponse = yield* fetchEffect(sessionUrl, {
+          headers: { cookie: ownerCookie },
+        });
+        const originalBody = yield* responseJsonEffect<{ readonly authenticated: boolean }>(
+          originalResponse,
+        );
+        const nextResponse = yield* fetchEffect(sessionUrl, {
+          headers: { cookie: replacementCookie },
+        });
+        const nextBody = yield* responseJsonEffect<{ readonly authenticated: boolean }>(
+          nextResponse,
+        );
+
+        assert.equal(credentialResponse.status, 200);
+        assert.equal(replacement.response.status, 200);
+        assert.isDefined(replacement.cookie);
+        assert.equal(originalBody.authenticated, false);
+        assert.equal(nextBody.authenticated, true);
+      }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("does not sign out a live cookie session when the pairing token is already dead", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest();
+
+      const ownerCookie = yield* getAuthenticatedSessionCookieHeader();
+      const credentialResponse = yield* HttpClient.post("/api/auth/pairing-token", {
+        headers: { cookie: ownerCookie },
+        body: yield* HttpBody.json({ audienceCeiling: "private" }),
+      });
+      const credential = (yield* credentialResponse.json) as { readonly credential: string };
+      const first = yield* bootstrapBrowserSession(credential.credential, {
+        headers: { cookie: ownerCookie },
+      });
+      const firstCookie = first.cookie?.split(";")[0] ?? "";
+      const reused = yield* bootstrapBrowserSession(credential.credential, {
+        headers: { cookie: firstCookie },
+      });
+      const reusedBody = yield* responseJsonEffect<{
+        readonly reason?: string;
+      }>(reused.response);
+
+      const sessionUrl = yield* getHttpServerUrl("/api/auth/session");
+      const liveResponse = yield* fetchEffect(sessionUrl, {
+        headers: { cookie: firstCookie },
+      });
+      const liveBody = yield* responseJsonEffect<{ readonly authenticated: boolean }>(liveResponse);
+
+      assert.equal(first.response.status, 200);
+      assert.equal(reused.response.status, 401);
+      assert.equal(reusedBody.reason, "consumed_credential");
+      assert.isUndefined(reused.cookie);
+      assert.equal(liveBody.authenticated, true);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
   it.effect("does not replace the browser session when interrupting displaced sockets fails", () =>
@@ -2021,10 +2193,71 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
 
       assert.equal(credentialResponse.status, 200);
       assert.equal(replacement.response.status, 500);
-      assert.equal(replacementBody.reason, "browser_session_replacement_failed");
+      assert.equal(replacementBody.reason, "browser_session_replacement_reverted");
       assert.isUndefined(replacement.cookie);
       assert.equal(originalBody.authenticated, true);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect(
+    "does not replace the browser session when displacement cannot be confirmed after revoke fails",
+    () =>
+      Effect.gen(function* () {
+        let remainingForcedRevokeFailures = 1;
+        yield* buildAppUnderTest({
+          wrapEnvironmentAuth: (inner) => ({
+            ...inner,
+            revokeSession: (sessionId) => {
+              if (remainingForcedRevokeFailures > 0) {
+                remainingForcedRevokeFailures -= 1;
+                return Effect.fail(
+                  new EnvironmentAuth.ServerAuthSessionRevocationError({
+                    cause: new Error("session revoke unavailable"),
+                  }),
+                );
+              }
+              return inner.revokeSession(sessionId);
+            },
+          }),
+          wrapSessionStore: (inner) => ({
+            ...inner,
+            getActive: (sessionId) =>
+              Effect.fail(
+                new SessionStore.SessionCredentialVerificationError({
+                  sessionId,
+                  cause: new Error("session lookup unavailable"),
+                }),
+              ),
+          }),
+        });
+
+        const ownerCookie = yield* getAuthenticatedSessionCookieHeader();
+        const credentialResponse = yield* HttpClient.post("/api/auth/pairing-token", {
+          headers: { cookie: ownerCookie },
+          body: yield* HttpBody.json({ audienceCeiling: "private" }),
+        });
+        const credential = (yield* credentialResponse.json) as { readonly credential: string };
+        const replacement = yield* bootstrapBrowserSession(credential.credential, {
+          headers: { cookie: ownerCookie },
+        });
+        const replacementBody = yield* responseJsonEffect<{
+          readonly reason?: string;
+        }>(replacement.response);
+
+        const sessionUrl = yield* getHttpServerUrl("/api/auth/session");
+        const originalResponse = yield* fetchEffect(sessionUrl, {
+          headers: { cookie: ownerCookie },
+        });
+        const originalBody = yield* responseJsonEffect<{ readonly authenticated: boolean }>(
+          originalResponse,
+        );
+
+        assert.equal(credentialResponse.status, 200);
+        assert.equal(replacement.response.status, 500);
+        assert.equal(replacementBody.reason, "browser_session_replacement_reverted");
+        assert.isUndefined(replacement.cookie);
+        assert.equal(originalBody.authenticated, true);
+      }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
   it.effect("does not revoke a bearer session when pairing installs a browser cookie", () =>

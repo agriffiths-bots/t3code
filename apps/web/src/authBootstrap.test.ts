@@ -406,6 +406,58 @@ describe("resolveInitialServerAuthGateState", () => {
     expect(testApi.calls.browserSession).toEqual([{ credential: "replace-token" }]);
   });
 
+  it("surfaces a reverted replacement as a spent link that kept the current session", async () => {
+    const cause = new EnvironmentInternalError({
+      code: "internal_error",
+      reason: "browser_session_replacement_reverted",
+      traceId: "trace-replacement-reverted",
+    });
+    const testApi = await installAuthApi({
+      browserSession: () => Effect.fail(cause),
+    });
+
+    const { isPrimaryEnvironmentSessionReplacementRevertedError, submitServerAuthCredential } =
+      await import("./environments/primary");
+
+    const error = await submitServerAuthCredential("revert-token").then(
+      () => null,
+      (failure: unknown) => failure,
+    );
+    expect(error).toMatchObject({
+      _tag: "PrimaryEnvironmentSessionReplacementRevertedError",
+      message:
+        "Could not replace the existing session. This browser kept its current session, but the pairing link was used up. Get a new pairing link if you still need to replace it.",
+    });
+    expect(isPrimaryEnvironmentSessionReplacementRevertedError(error)).toBe(true);
+    expect(testApi.calls.browserSession).toEqual([{ credential: "revert-token" }]);
+  });
+
+  it("surfaces a consumed pairing token as already used rather than invalid", async () => {
+    const cause = new EnvironmentAuthInvalidError({
+      code: "auth_invalid",
+      reason: "consumed_credential",
+      traceId: "trace-consumed-credential",
+    });
+    const testApi = await installAuthApi({
+      browserSession: () => Effect.fail(cause),
+    });
+
+    const { isPrimaryEnvironmentPairingCredentialConsumedError, submitServerAuthCredential } =
+      await import("./environments/primary");
+
+    const error = await submitServerAuthCredential("used-token").then(
+      () => null,
+      (failure: unknown) => failure,
+    );
+    expect(error).toMatchObject({
+      _tag: "PrimaryEnvironmentPairingCredentialConsumedError",
+      providedLength: 10,
+      message: "That pairing link has already been used. Get a new pairing link and try again.",
+    });
+    expect(isPrimaryEnvironmentPairingCredentialConsumedError(error)).toBe(true);
+    expect(testApi.calls.browserSession).toEqual([{ credential: "used-token" }]);
+  });
+
   it("derives primary request messages from structural request context", async () => {
     const cause = new Error("private transport detail");
     const { PrimaryEnvironmentRequestError } = await import("./environments/primary");
