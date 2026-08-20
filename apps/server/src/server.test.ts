@@ -149,6 +149,7 @@ import * as ReviewService from "./review/ReviewService.ts";
 import * as SourceControlRepositoryService from "./sourceControl/SourceControlRepositoryService.ts";
 import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
+import * as SessionStore from "./auth/SessionStore.ts";
 import * as MatrixBridgeConfig from "./matrix/MatrixBridgeConfig.ts";
 import * as CloudManagedEndpointRuntime from "./cloud/ManagedEndpointRuntime.ts";
 import * as CloudCliTokenManager from "./cloud/CliTokenManager.ts";
@@ -317,25 +318,39 @@ const browserOtlpTracingLayer = Layer.mergeAll(
   Layer.succeed(HttpClient.TracerDisabledWhen, () => true),
 );
 
-const makeAuthTestLayer = (
-  wrap?: (
+const makeAuthTestLayer = (options?: {
+  wrapAuth?: (
     inner: EnvironmentAuth.EnvironmentAuth["Service"],
-  ) => EnvironmentAuth.EnvironmentAuth["Service"],
-) => {
-  const base = EnvironmentAuth.layer.pipe(
+  ) => EnvironmentAuth.EnvironmentAuth["Service"];
+  wrapSessions?: (
+    inner: SessionStore.SessionStore["Service"],
+  ) => SessionStore.SessionStore["Service"];
+}) => {
+  let layer = EnvironmentAuth.layer.pipe(
     Layer.provide(SqlitePersistenceMemory),
     Layer.provide(ServerSecretStore.layer),
   );
-  if (wrap === undefined) {
-    return base;
+  if (options?.wrapSessions !== undefined) {
+    const wrapSessions = options.wrapSessions;
+    layer = Layer.effect(
+      SessionStore.SessionStore,
+      Effect.gen(function* () {
+        const inner = yield* SessionStore.SessionStore;
+        return wrapSessions(inner);
+      }),
+    ).pipe(Layer.provideMerge(layer));
   }
-  return Layer.effect(
-    EnvironmentAuth.EnvironmentAuth,
-    Effect.gen(function* () {
-      const inner = yield* EnvironmentAuth.EnvironmentAuth;
-      return wrap(inner);
-    }),
-  ).pipe(Layer.provideMerge(base));
+  if (options?.wrapAuth !== undefined) {
+    const wrapAuth = options.wrapAuth;
+    layer = Layer.effect(
+      EnvironmentAuth.EnvironmentAuth,
+      Effect.gen(function* () {
+        const inner = yield* EnvironmentAuth.EnvironmentAuth;
+        return wrapAuth(inner);
+      }),
+    ).pipe(Layer.provideMerge(layer));
+  }
+  return layer;
 };
 
 const makeBrowserOtlpPayload = (spanName: string) =>
@@ -442,6 +457,9 @@ const buildAppUnderTest = (options?: {
   wrapEnvironmentAuth?: (
     inner: EnvironmentAuth.EnvironmentAuth["Service"],
   ) => EnvironmentAuth.EnvironmentAuth["Service"];
+  wrapSessionStore?: (
+    inner: SessionStore.SessionStore["Service"],
+  ) => SessionStore.SessionStore["Service"];
   layers?: {
     keybindings?: Partial<Keybindings.Keybindings["Service"]>;
     providerRegistry?: Partial<ProviderRegistry.ProviderRegistry["Service"]>;
@@ -1156,7 +1174,16 @@ const buildAppUnderTest = (options?: {
           ...options?.layers?.cloudCliTokenManager,
         }),
       ),
-      Layer.provideMerge(makeAuthTestLayer(options?.wrapEnvironmentAuth)),
+      Layer.provideMerge(
+        makeAuthTestLayer({
+          ...(options?.wrapEnvironmentAuth === undefined
+            ? {}
+            : { wrapAuth: options.wrapEnvironmentAuth }),
+          ...(options?.wrapSessionStore === undefined
+            ? {}
+            : { wrapSessions: options.wrapSessionStore }),
+        }),
+      ),
       Layer.provideMerge(MatrixBridgeConfig.layer.pipe(Layer.provide(ServerSecretStore.layer))),
       Layer.provideMerge(ServerSecretStore.layer),
       Layer.provide(workspaceAndProjectServicesLayer),
@@ -1954,6 +1981,50 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         assert.isUndefined(replacement.cookie);
         assert.equal(originalBody.authenticated, true);
       }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("does not replace the browser session when interrupting displaced sockets fails", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest({
+        wrapSessionStore: (inner) => ({
+          ...inner,
+          interruptSockets: (sessionId) =>
+            Effect.fail(
+              new SessionStore.SessionSocketInterruptError({
+                sessionId,
+                cause: new Error("socket interrupt unavailable"),
+              }),
+            ),
+        }),
+      });
+
+      const ownerCookie = yield* getAuthenticatedSessionCookieHeader();
+      const credentialResponse = yield* HttpClient.post("/api/auth/pairing-token", {
+        headers: { cookie: ownerCookie },
+        body: yield* HttpBody.json({ audienceCeiling: "private" }),
+      });
+      const credential = (yield* credentialResponse.json) as { readonly credential: string };
+      const replacement = yield* bootstrapBrowserSession(credential.credential, {
+        headers: { cookie: ownerCookie },
+      });
+      const replacementBody = yield* responseJsonEffect<{
+        readonly reason?: string;
+      }>(replacement.response);
+
+      const sessionUrl = yield* getHttpServerUrl("/api/auth/session");
+      const originalResponse = yield* fetchEffect(sessionUrl, {
+        headers: { cookie: ownerCookie },
+      });
+      const originalBody = yield* responseJsonEffect<{ readonly authenticated: boolean }>(
+        originalResponse,
+      );
+
+      assert.equal(credentialResponse.status, 200);
+      assert.equal(replacement.response.status, 500);
+      assert.equal(replacementBody.reason, "browser_session_replacement_failed");
+      assert.isUndefined(replacement.cookie);
+      assert.equal(originalBody.authenticated, true);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
   it.effect("does not revoke a bearer session when pairing installs a browser cookie", () =>

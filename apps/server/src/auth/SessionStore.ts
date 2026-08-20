@@ -352,6 +352,18 @@ export class OtherSessionsRevocationError extends Schema.TaggedErrorClass<OtherS
   }
 }
 
+export class SessionSocketInterruptError extends Schema.TaggedErrorClass<SessionSocketInterruptError>()(
+  "SessionSocketInterruptError",
+  {
+    sessionId: AuthSessionId,
+    ...sessionCredentialInternalErrorContext,
+  },
+) {
+  override get message(): string {
+    return "Failed to interrupt live sockets for the session.";
+  }
+}
+
 export const SessionCredentialInternalError = Schema.Union([
   SessionClaimsEncodingError,
   SessionCredentialIssueError,
@@ -361,6 +373,7 @@ export const SessionCredentialInternalError = Schema.Union([
   ActiveSessionsListError,
   SessionRevocationError,
   OtherSessionsRevocationError,
+  SessionSocketInterruptError,
 ]);
 export type SessionCredentialInternalError = typeof SessionCredentialInternalError.Type;
 export const isSessionCredentialInternalError = Schema.is(SessionCredentialInternalError);
@@ -422,6 +435,9 @@ export class SessionStore extends Context.Service<
     readonly markConnected: (sessionId: AuthSessionId) => Effect.Effect<void, never>;
     readonly markDisconnected: (sessionId: AuthSessionId) => Effect.Effect<void, never>;
     readonly awaitRevocation: (sessionId: AuthSessionId) => Effect.Effect<void, never>;
+    readonly interruptSockets: (
+      sessionId: AuthSessionId,
+    ) => Effect.Effect<void, SessionCredentialInternalError>;
   }
 >()("t3/auth/SessionStore") {}
 
@@ -1086,6 +1102,7 @@ export const make = Effect.gen(function* () {
     markConnected,
     markDisconnected,
     awaitRevocation,
+    interruptSockets: (sessionId) => signalRevoked(sessionId),
   });
 });
 

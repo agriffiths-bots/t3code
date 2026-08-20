@@ -45,6 +45,7 @@ const makeFakeSessionStore = (
     markConnected: () => Effect.die("unused"),
     markDisconnected: () => Effect.die("unused"),
     awaitRevocation: () => Effect.die("unused"),
+    interruptSockets: () => Effect.die("unused"),
   });
 const PersistedPeerTokenStoreFixture = Schema.Struct({
   version: Schema.Literal(1),

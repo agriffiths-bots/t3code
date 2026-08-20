@@ -38,10 +38,11 @@ scoped session model; the response never exposes the session secret to browser
 JavaScript. Opening a pairing link in a browser that already has a session
 reaches an apply surface that requires an explicit click. After that click, the
 grant's scopes replace that browser's session. Replacement is fail-closed: the
-previous cookie-backed session must be revoked before the new cookie is
-installed. If displacement cannot be confirmed, the request fails, the original
-session stays usable, and nothing is replaced. Bearer and DPoP sessions on the
-same request are left alone. It is not an upgrade-only merge.
+previous cookie-backed session must be revoked and its live sockets signaled
+before the new cookie is installed. If displacement cannot be confirmed, the
+request fails, the original session stays usable, and nothing is replaced.
+Bearer and DPoP sessions on the same request are left alone. It is not an
+upgrade-only merge.
 
 `POST /api/auth/session/sign-out` revokes the caller's own session and expires
 the browser session cookie. It does not require `access:write`. Administrative

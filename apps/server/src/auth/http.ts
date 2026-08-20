@@ -351,7 +351,8 @@ export const authHttpApiLayer = HttpApiBuilder.group(
             const request = yield* HttpServerRequest.HttpServerRequest;
             // Replacement is a security boundary. Fail closed unless the
             // previous cookie session is confirmed gone: do not install a cookie
-            // when the existing session cannot be read or revoked.
+            // when the existing session cannot be read, its live sockets cannot
+            // be signaled, or it cannot be revoked.
             const previousSession = yield* serverAuth.authenticateHttpRequest(request).pipe(
               Effect.catchIf(EnvironmentAuth.isServerAuthCredentialError, () =>
                 Effect.succeed(null),
@@ -377,6 +378,13 @@ export const authHttpApiLayer = HttpApiBuilder.group(
               ),
             ).pipe(Effect.catch(() => failEnvironmentInternal("browser_session_cookie_failed")));
             if (previousSession !== null && previousSession.method === "browser-session-cookie") {
+              yield* sessions
+                .interruptSockets(previousSession.sessionId)
+                .pipe(
+                  Effect.catchIf(SessionStore.isSessionCredentialInternalError, (error) =>
+                    failEnvironmentInternal("browser_session_replacement_failed", error),
+                  ),
+                );
               yield* serverAuth
                 .revokeSession(previousSession.sessionId)
                 .pipe(
