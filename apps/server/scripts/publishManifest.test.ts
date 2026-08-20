@@ -53,9 +53,9 @@ describe("publish manifest", () => {
       overrides: {},
     });
 
+    // The SDK is bundled, so only its native binding needs to be installed.
     expect(manifest.optionalDependencies).toMatchObject({
       "@matrix-org/matrix-sdk-crypto-nodejs": "0.4.0",
-      "matrix-bot-sdk": "0.8.0",
     });
     // Exact pins: the crypto binding above 0.4.0 requires Node 24, which this
     // package does not require of its users.

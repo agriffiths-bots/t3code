@@ -25,8 +25,10 @@ describe("server Vite packaging", () => {
     expect(shouldBundleCliDependency("node:fs")).toBe(false);
   });
 
-  it("leaves the optional Matrix bridge packages external", () => {
-    expect(shouldBundleCliDependency("matrix-bot-sdk")).toBe(false);
+  it("bundles the Matrix SDK while its native binding stays external", () => {
+    // The SDK is packed into its own module, so a packaged artifact carries one
+    // file instead of the SDK's dependency tree.
+    expect(shouldBundleCliDependency("matrix-bot-sdk")).toBe(true);
     expect(shouldBundleCliDependency("@matrix-org/matrix-sdk-crypto-nodejs")).toBe(false);
   });
 });

@@ -14,11 +14,10 @@ const externalRuntimePackageNames = new Set([
   "@effect/platform-bun",
   "@effect/sql-sqlite-bun",
   "@ff-labs/fff-node",
-  // Optional Matrix bridge dependencies: the crypto package is a native
-  // binding, and the SDK is only resolved when a bridge is configured. Keeping
-  // both external means an install without them still produces a working CLI.
+  // The Matrix crypto package is a native binding, so it stays external and
+  // optional. The SDK that loads it is plain JavaScript and is bundled, which
+  // keeps four thousand files out of every packaged artifact.
   "@matrix-org/matrix-sdk-crypto-nodejs",
-  "matrix-bot-sdk",
   "ffi-rs",
   "node-pty",
 ]);
@@ -63,7 +62,10 @@ export default mergeConfig(
       },
     },
     pack: {
-      entry: ["src/bin.ts"],
+      // The Matrix SDK is packed as its own module so the packaged server
+      // carries one file instead of its four-thousand-file dependency tree,
+      // and so nothing loads it until a bridge is configured.
+      entry: ["src/bin.ts", "src/matrix/matrixBotSdkModule.ts"],
       outDir: "dist",
       sourcemap: true,
       clean: true,

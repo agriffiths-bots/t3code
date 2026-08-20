@@ -211,13 +211,19 @@ export const whoami = Effect.fn("MatrixBotSdkClient.whoami")(function* (client: 
 
 export type MatrixSdkLoader = () => Promise<MatrixSdkModule>;
 
-// Resolved through a widened specifier so the optional dependency is never a
-// build-time or typecheck-time requirement: an install without it still starts
-// a healthy server with the bridge reported unavailable.
+/**
+ * The packed SDK that ships beside the server bundle, and the bare specifier a
+ * source checkout resolves instead. Either way the import happens only when a
+ * bridge is configured, so an installation without the native crypto binding
+ * still starts a healthy server with the bridge reported unavailable.
+ */
+const MATRIX_BOT_SDK_PACKED_MODULE = "./matrix/matrixBotSdkModule.mjs";
 const MATRIX_BOT_SDK_SPECIFIER: string = "matrix-bot-sdk";
 
 export const loadMatrixBotSdk: MatrixSdkLoader = async () => {
-  const loaded: unknown = await import(MATRIX_BOT_SDK_SPECIFIER);
+  const loaded: unknown = await import(
+    new URL(MATRIX_BOT_SDK_PACKED_MODULE, import.meta.url).href
+  ).catch(() => import(MATRIX_BOT_SDK_SPECIFIER));
   const module = loaded as Partial<MatrixSdkModule>;
   if (
     typeof module.MatrixClient !== "function" ||

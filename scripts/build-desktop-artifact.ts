@@ -718,12 +718,21 @@ export const DESKTOP_NATIVE_ASAR_UNPACK_PACKAGE_PATTERNS = [
   "@clerk/electron-passkeys-*",
   "@ff-labs/fff-bin-*",
   "@ff-labs/fff-node",
-  // The Matrix crypto binding is dlopen'd, so its .node must sit outside the
-  // archive. The pure-JS SDK that loads it stays packed.
-  "@matrix-org/matrix-sdk-crypto-nodejs",
   "@msgpackr-extract/*",
   "@yuuang/ffi-rs-*",
   "ffi-rs",
+] as const;
+/**
+ * The binding is dlopen'd, which cannot read an asar, and its small loader goes
+ * with it so the Windows WSL backend, running plain Linux node outside the
+ * archive, can require the package at all. Nothing else from it is unpacked,
+ * and the SDK that requires it is packed into the server bundle rather than
+ * staged as a package.
+ */
+export const DESKTOP_MATRIX_CRYPTO_ASAR_UNPACK_PATTERNS = [
+  "@matrix-org/matrix-sdk-crypto-nodejs/package.json",
+  "@matrix-org/matrix-sdk-crypto-nodejs/index.js",
+  "@matrix-org/matrix-sdk-crypto-nodejs/*.node",
 ] as const;
 export const DESKTOP_NODE_PTY_ASAR_UNPACK_PATTERNS = [
   "node-pty/LICENSE",
@@ -746,11 +755,13 @@ export const DESKTOP_STAGED_RUNTIME_DEPENDENCY_NAMES = [
 ] as const;
 /**
  * Staged as optional so a Matrix crypto download failure degrades the bridge to
- * unavailable instead of failing the desktop build.
+ * unavailable instead of failing the desktop build. The SDK that loads this
+ * binding is not staged: it is packed into the server bundle, because its
+ * dependency tree would otherwise put thousands of loose files into an
+ * artifact that unpacks its whole `node_modules` for the WSL backend.
  */
 export const DESKTOP_STAGED_OPTIONAL_RUNTIME_DEPENDENCY_NAMES = [
   "@matrix-org/matrix-sdk-crypto-nodejs",
-  "matrix-bot-sdk",
 ] as const;
 
 function toAsarUnpackPackagePatterns(packagePattern: string): readonly string[] {
@@ -768,6 +779,7 @@ export const DESKTOP_ASAR_UNPACK = [
   ...DESKTOP_ASAR_UNPACK_BASE,
   ...DESKTOP_NATIVE_ASAR_UNPACK_PACKAGE_PATTERNS.flatMap(toAsarUnpackPackagePatterns),
   ...DESKTOP_NODE_PTY_ASAR_UNPACK_PATTERNS.flatMap(toAsarUnpackPathPatterns),
+  ...DESKTOP_MATRIX_CRYPTO_ASAR_UNPACK_PATTERNS.flatMap(toAsarUnpackPathPatterns),
 ] as const;
 
 export function createDesktopPackageBuildEnv(
