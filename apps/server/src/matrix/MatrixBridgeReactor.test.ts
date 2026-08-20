@@ -29,7 +29,11 @@ import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import { TestClock } from "effect/testing";
 
-import { EnvironmentAuth, ServerAuthInvalidCredentialError } from "../auth/EnvironmentAuth.ts";
+import {
+  EnvironmentAuth,
+  ServerAuthBootstrapCredentialValidationError,
+  ServerAuthInvalidCredentialError,
+} from "../auth/EnvironmentAuth.ts";
 import { PersistenceSqlError } from "../persistence/Errors.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import { ServerActivation } from "../serverActivation.ts";
@@ -365,12 +369,15 @@ interface ReactorHarness {
   readonly awaitDispatchAttempt: Effect.Effect<void>;
   readonly failNextDispatches: (count: number) => Effect.Effect<void>;
   readonly failThreadShellReads: (count: number) => Effect.Effect<void>;
+  readonly failSnapshotReads: (count: number) => Effect.Effect<void>;
+  readonly failDetailReads: (count: number) => Effect.Effect<void>;
   readonly consumedCodes: Effect.Effect<ReadonlyArray<string>>;
   readonly requestedProofs: Effect.Effect<
     ReadonlyArray<{ readonly audienceCeiling: string; readonly scopes: ReadonlyArray<string> }>
   >;
   readonly livePairingCodes: Effect.Effect<ReadonlyArray<string>>;
   readonly failPairingPersistence: Effect.Effect<void>;
+  readonly failCredentialChecks: (count: number) => Effect.Effect<void>;
   readonly setThreadShell: (value: OrchestrationThreadShell | null) => Effect.Effect<void>;
   readonly awaitStatusState: (state: MatrixBridgeStatus["state"]) => Effect.Effect<void>;
   readonly statusState: Effect.Effect<MatrixBridgeStatus["state"]>;
@@ -474,6 +481,8 @@ function withHarness<A, E>(
       const observedDispatchAttempts = yield* Queue.unbounded<void>();
       const failDispatchesRef = yield* Ref.make(0);
       const failShellReadsRef = yield* Ref.make(0);
+      const failSnapshotReadsRef = yield* Ref.make(0);
+      const failDetailReadsRef = yield* Ref.make(0);
       const consumedRef = yield* Ref.make<ReadonlyArray<string>>([]);
       // Only these strings are redeemable; anything else is unknown, expired,
       // revoked, or already spent, which the gate answers identically.
@@ -484,6 +493,7 @@ function withHarness<A, E>(
         ReadonlyArray<{ readonly audienceCeiling: string; readonly scopes: ReadonlyArray<string> }>
       >([]);
       const failPersistRef = yield* Ref.make(false);
+      const failCredentialChecksRef = yield* Ref.make(0);
       const fake = yield* makeFakeMatrixBridgeClient;
 
       const setStatus = (state: MatrixBridgeStatus["state"]) =>
@@ -544,8 +554,7 @@ function withHarness<A, E>(
               current.value.ownerThreadId !== expected.ownerThreadId ||
               current.value.ownershipEpoch !== expected.ownershipEpoch ||
               current.value.cryptoStoreGeneration !== expected.cryptoStoreGeneration ||
-              current.value.roomId !== expected.roomId ||
-              current.value.pairing.state !== "paired"
+              current.value.roomId !== expected.roomId
             ) {
               return [false, current] as const;
             }
@@ -701,7 +710,18 @@ function withHarness<A, E>(
             yield* Ref.update(consumedRef, (consumed) => [...consumed, credential]);
           }),
         isLivePairingCredential: (credential) =>
-          Ref.get(liveCodesRef).pipe(Effect.map((live) => live.includes(credential))),
+          Effect.gen(function* () {
+            const failing = yield* Ref.getAndUpdate(failCredentialChecksRef, (count) =>
+              Math.max(0, count - 1),
+            );
+            if (failing > 0) {
+              return yield* new ServerAuthBootstrapCredentialValidationError({
+                cause: new Error("Injected credential store failure."),
+              });
+            }
+            const live = yield* Ref.get(liveCodesRef);
+            return live.includes(credential);
+          }),
       });
 
       const dispatcherLayer = Layer.succeed(BootstrapTurnStartDispatcher, {
@@ -766,13 +786,34 @@ function withHarness<A, E>(
         return { detail, snapshotSequence };
       });
       const projectionLayer = Layer.mock(ProjectionSnapshotQuery)({
-        getThreadDetailById: () => inspectThread.pipe(Effect.map(({ detail }) => detail)),
+        getThreadDetailById: () =>
+          Effect.gen(function* () {
+            const failing = yield* Ref.getAndUpdate(failDetailReadsRef, (count) =>
+              Math.max(0, count - 1),
+            );
+            if (failing > 0) {
+              return yield* new PersistenceSqlError({
+                operation: "getThreadDetailById",
+                detail: "Injected projection failure.",
+              });
+            }
+            const { detail } = yield* inspectThread;
+            return detail;
+          }),
         getThreadDetailSnapshot: () =>
-          inspectThread.pipe(
-            Effect.map(({ detail, snapshotSequence }) =>
-              Option.map(detail, (thread) => ({ snapshotSequence, thread })),
-            ),
-          ),
+          Effect.gen(function* () {
+            const failing = yield* Ref.getAndUpdate(failSnapshotReadsRef, (count) =>
+              Math.max(0, count - 1),
+            );
+            if (failing > 0) {
+              return yield* new PersistenceSqlError({
+                operation: "getThreadDetailSnapshot",
+                detail: "Injected projection failure.",
+              });
+            }
+            const { detail, snapshotSequence } = yield* inspectThread;
+            return Option.map(detail, (thread) => ({ snapshotSequence, thread }));
+          }),
         getThreadShellByIdIncludingArchived: (threadId) =>
           Effect.gen(function* () {
             const failing = yield* Ref.getAndUpdate(failShellReadsRef, (count) =>
@@ -854,10 +895,13 @@ function withHarness<A, E>(
           awaitDispatchAttempt: Queue.take(observedDispatchAttempts),
           failNextDispatches: (count) => Ref.set(failDispatchesRef, count),
           failThreadShellReads: (count) => Ref.set(failShellReadsRef, count),
+          failSnapshotReads: (count) => Ref.set(failSnapshotReadsRef, count),
+          failDetailReads: (count) => Ref.set(failDetailReadsRef, count),
           consumedCodes: Ref.get(consumedRef),
           requestedProofs: Ref.get(requestedProofsRef),
           livePairingCodes: Ref.get(liveCodesRef),
           failPairingPersistence: Ref.set(failPersistRef, true),
+          failCredentialChecks: (count) => Ref.set(failCredentialChecksRef, count),
           setThreadShell: (value) => Ref.set(shellRef, Option.fromNullishOr(value)),
           awaitStatusState: (state) =>
             SubscriptionRef.changes(statusRef).pipe(
@@ -3063,3 +3107,304 @@ it.effect("reports an inbound message it never managed to handle", () =>
     }),
   ),
 );
+
+it.effect("delivers a final that completed while the room was still locked", () =>
+  withHarness(
+    (harness) =>
+      Effect.gen(function* () {
+        const turnId = TurnId.make("turn-before-pairing");
+        const final = message({
+          id: "message-before-pairing",
+          role: "assistant",
+          text: "Answer from before the code",
+          turnId,
+          at: "2026-08-19T10:00:09.000Z",
+        });
+        yield* harness.fake.awaitListening;
+        yield* harness.fake.emitInbound(inboundMembership([botUserId, allowedUserId]));
+        yield* harness.reactor.drain;
+
+        // Bridge a thread, send it a message, and let it answer while the room
+        // is still locked: the reply is held, not lost.
+        yield* harness.setThread(thread({ turnId, state: "completed", messages: [final] }));
+        yield* harness.publish(
+          assistantEvent({ turnId, messageId: "message-before-pairing", at: final.updatedAt }),
+        );
+        expect((yield* harness.fake.sent).map((entry) => entry.content.body)).toEqual([
+          MATRIX_BRIDGE_PAIRING_PROMPT,
+        ]);
+
+        // Then paste the code. The held reply is what the room should show.
+        yield* harness.fake.emitInbound(inboundText({ eventId: "$code", body: "valid-code" }));
+        yield* harness.reactor.drain;
+
+        const sent = (yield* harness.fake.sent).map((entry) => entry.content.body);
+        expect(sent).toContain(MATRIX_BRIDGE_PAIRING_SUCCESS);
+        expect(sent).toContain("Answer from before the code");
+      }),
+    {
+      pairing: { state: "unpaired" },
+      initialStatusState: "waiting-for-member",
+    },
+  ),
+);
+
+it.effect("retries a held final the terminal worker could not inspect", () => {
+  const heldTurnId = TurnId.make("turn-held-under-a-newer-turn");
+  const runningTurnId = TurnId.make("turn-still-running");
+  const final = message({
+    id: "message-held-under-a-newer-turn",
+    role: "assistant",
+    text: "Answer from the earlier turn",
+    turnId: heldTurnId,
+    at: "2026-08-19T10:00:09.000Z",
+  });
+  const heldTurn = {
+    turnId: heldTurnId,
+    state: "completed",
+    requestedAt: baseAt,
+    startedAt: baseAt,
+    completedAt: "2026-08-19T10:00:10.000Z",
+    assistantMessageId: null,
+  } as const;
+  return withHarness(
+    (harness) =>
+      Effect.gen(function* () {
+        yield* harness.fake.awaitListening;
+        yield* harness.fake.emitInbound(inboundMembership([botUserId, allowedUserId]));
+        yield* harness.reactor.drain;
+
+        // The held reply belongs to an earlier turn, and a newer turn is
+        // already running, so rebuilding from history cannot find it: only the
+        // pending candidate can, and its inspection is what fails.
+        const runningTurn = {
+          turnId: runningTurnId,
+          state: "running",
+          requestedAt: "2026-08-19T10:00:11.000Z",
+          startedAt: "2026-08-19T10:00:11.000Z",
+          completedAt: null,
+          assistantMessageId: null,
+        } as const;
+        yield* harness.setThread(
+          thread({
+            turnId: runningTurnId,
+            state: "running",
+            requestedAt: runningTurn.requestedAt,
+            messages: [final],
+            turns: [heldTurn, runningTurn],
+          }),
+        );
+        yield* harness.publish(
+          assistantEvent({
+            turnId: heldTurnId,
+            messageId: "message-held-under-a-newer-turn",
+            at: final.updatedAt,
+          }),
+        );
+        yield* harness.failDetailReads(1);
+
+        const emitting = yield* harness.fake
+          .emitInbound(inboundText({ eventId: "$code", body: "valid-code" }))
+          .pipe(Effect.forkChild);
+        yield* TestClock.adjust("1 second");
+        yield* TestClock.adjust("2 seconds");
+        yield* Fiber.join(emitting);
+        yield* harness.reactor.drain;
+
+        // The worker logs its own read failures rather than raising them, so
+        // recovery has to notice the candidate is still pending and try again.
+        const sent = (yield* harness.fake.sent).map((entry) => entry.content.body);
+        expect(sent).toContain(MATRIX_BRIDGE_PAIRING_SUCCESS);
+        expect(sent).toContain("Answer from the earlier turn");
+      }),
+    {
+      pairing: { state: "unpaired" },
+      initialStatusState: "waiting-for-member",
+    },
+  );
+});
+
+it.effect("retries recovery of a held final when the projection read fails at pairing", () => {
+  const turnId = TurnId.make("turn-held-through-a-blip");
+  const final = message({
+    id: "message-held-through-a-blip",
+    role: "assistant",
+    text: "Answer from before the blip",
+    turnId,
+    at: "2026-08-19T10:00:09.000Z",
+  });
+  return withHarness(
+    (harness) =>
+      Effect.gen(function* () {
+        yield* harness.fake.awaitListening;
+        yield* harness.fake.emitInbound(inboundMembership([botUserId, allowedUserId]));
+        yield* harness.reactor.drain;
+
+        // The only record of the held turn is the projection and the event
+        // history, and the projection cannot answer for the first two tries.
+        yield* harness.failSnapshotReads(2);
+        const emitting = yield* harness.fake
+          .emitInbound(inboundText({ eventId: "$code", body: "valid-code" }))
+          .pipe(Effect.forkChild);
+        yield* TestClock.adjust("1 second");
+        yield* TestClock.adjust("2 seconds");
+        yield* Fiber.join(emitting);
+        yield* harness.reactor.drain;
+
+        // Pairing is committed either way; what must survive the blip is the
+        // reply that was waiting on it.
+        const sent = (yield* harness.fake.sent).map((entry) => entry.content.body);
+        expect(sent).toContain(MATRIX_BRIDGE_PAIRING_SUCCESS);
+        expect(sent).toContain("Answer from before the blip");
+        // The spent code is never replayed as an ordinary message.
+        expect(yield* harness.dispatched).toEqual([]);
+      }),
+    {
+      pairing: { state: "unpaired" },
+      initialStatusState: "waiting-for-member",
+      initialThread: thread({ turnId, state: "completed", messages: [final] }),
+      historicalEvents: [
+        atSequence(
+          assistantEvent({ turnId, messageId: "message-held-through-a-blip", at: final.updatedAt }),
+          4,
+        ),
+      ],
+    },
+  );
+});
+
+it.effect("retries an inbound message the credential store could not answer for", () =>
+  withHarness((harness) =>
+    Effect.gen(function* () {
+      yield* harness.fake.awaitListening;
+      yield* harness.failCredentialChecks(2);
+
+      const emitting = yield* harness.fake
+        .emitInbound(inboundText({ eventId: "$blip", body: "Do the thing" }))
+        .pipe(Effect.forkChild);
+      yield* TestClock.adjust("1 second");
+      yield* TestClock.adjust("2 seconds");
+      yield* Fiber.join(emitting);
+      yield* harness.reactor.drain;
+
+      // Withholding is right while the store cannot answer, but the message
+      // must survive the blip rather than being dropped on the way.
+      expect((yield* harness.dispatched).map((entry) => entry.text)).toEqual(["Do the thing"]);
+    }),
+  ),
+);
+
+it.effect("withholds a message the credential store never answers for, and reports it", () =>
+  withHarness((harness) =>
+    Effect.gen(function* () {
+      yield* harness.fake.awaitListening;
+      yield* harness.failCredentialChecks(99);
+
+      const emitting = yield* harness.fake
+        .emitInbound(inboundText({ eventId: "$doomed-credential", body: "Do the thing" }))
+        .pipe(Effect.forkChild);
+      yield* TestClock.adjust("1 second");
+      yield* TestClock.adjust("2 seconds");
+      yield* Fiber.join(emitting);
+      yield* harness.reactor.drain;
+
+      expect(yield* harness.dispatched).toEqual([]);
+      expect(yield* harness.statusState).toBe("degraded");
+    }),
+  ),
+);
+
+it.effect("delivers a final held by the gate across a restart", () => {
+  const turnId = TurnId.make("turn-held-across-restart");
+  const final = message({
+    id: "message-held-across-restart",
+    role: "assistant",
+    text: "Answer from before the restart",
+    turnId,
+    at: "2026-08-19T10:00:09.000Z",
+  });
+  return withHarness(
+    (harness) =>
+      Effect.gen(function* () {
+        yield* harness.fake.awaitListening;
+        yield* harness.fake.emitInbound(inboundMembership([botUserId, allowedUserId]));
+        yield* harness.reactor.drain;
+        // Nothing is in memory to recheck: this process never saw the turn
+        // finish, it only finds it in the projection and the event history.
+        expect((yield* harness.fake.sent).map((entry) => entry.content.body)).toEqual([
+          MATRIX_BRIDGE_PAIRING_PROMPT,
+        ]);
+
+        yield* harness.fake.emitInbound(inboundText({ eventId: "$code", body: "valid-code" }));
+        yield* harness.reactor.drain;
+
+        const sent = (yield* harness.fake.sent).map((entry) => entry.content.body);
+        expect(sent).toContain("Answer from before the restart");
+      }),
+    {
+      pairing: { state: "unpaired" },
+      initialStatusState: "waiting-for-member",
+      initialThread: thread({ turnId, state: "completed", messages: [final] }),
+      historicalEvents: [
+        atSequence(
+          assistantEvent({ turnId, messageId: "message-held-across-restart", at: final.updatedAt }),
+          4,
+        ),
+      ],
+    },
+  );
+});
+
+it.effect("delivers a final held by the gate on an upgraded installation", () => {
+  const turnId = TurnId.make("turn-held-on-legacy-upgrade");
+  const final = message({
+    id: "message-held-on-legacy-upgrade",
+    role: "assistant",
+    text: "Answer from an upgraded install",
+    turnId,
+    at: "2026-08-19T10:00:09.000Z",
+  });
+  return withHarness(
+    (harness) =>
+      Effect.gen(function* () {
+        // A saved connection from before delivery checkpoints, still unpaired:
+        // the baseline is established at start, so a turn that finishes while
+        // the room is locked is still after it.
+        expect(Option.getOrThrow(yield* harness.currentConfig).deliveryCheckpointInitialized).toBe(
+          true,
+        );
+        yield* harness.fake.awaitListening;
+        yield* harness.fake.emitInbound(inboundMembership([botUserId, allowedUserId]));
+        yield* harness.reactor.drain;
+
+        yield* harness.setThread(thread({ turnId, state: "completed", messages: [final] }));
+        yield* harness.publish(
+          assistantEvent({
+            turnId,
+            messageId: "message-held-on-legacy-upgrade",
+            at: final.updatedAt,
+          }),
+        );
+        expect((yield* harness.fake.sent).map((entry) => entry.content.body)).toEqual([
+          MATRIX_BRIDGE_PAIRING_PROMPT,
+        ]);
+
+        yield* harness.fake.emitInbound(inboundText({ eventId: "$code", body: "valid-code" }));
+        yield* harness.reactor.drain;
+
+        expect((yield* harness.fake.sent).map((entry) => entry.content.body)).toContain(
+          "Answer from an upgraded install",
+        );
+      }),
+    {
+      pairing: { state: "unpaired" },
+      initialStatusState: "waiting-for-member",
+      deliveryCheckpointInitialized: false,
+      initialThread: thread({
+        turnId: TurnId.make("turn-before-upgrade"),
+        state: "completed",
+        messages: [],
+      }),
+    },
+  );
+});

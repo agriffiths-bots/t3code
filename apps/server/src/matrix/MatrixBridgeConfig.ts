@@ -823,11 +823,12 @@ export const make = Effect.gen(function* () {
             current.ownerThreadId !== expected.ownerThreadId ||
             current.ownershipEpoch !== expected.ownershipEpoch ||
             current.cryptoStoreGeneration !== expected.cryptoStoreGeneration ||
-            current.roomId !== expected.roomId ||
-            current.pairing.state !== "paired"
+            current.roomId !== expected.roomId
           ) {
             return false;
           }
+          // Not gated on pairing: the baseline records where this installation
+          // starts, and a bridge waiting for its code is still past that point.
           if (current.deliveryCheckpointInitialized) return true;
 
           const next: MatrixBridgeConfigV1 = {

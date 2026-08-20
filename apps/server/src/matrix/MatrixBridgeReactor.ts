@@ -1001,6 +1001,48 @@ export const make = Effect.gen(function* () {
     return yield* new MatrixBridgeInboundNotHandledError({ eventId: event.eventId });
   });
 
+  /**
+   * Delivers what the gate was holding, without the pairing event riding on the
+   * outcome. It retries on its own and never fails: pairing is already
+   * committed when this runs, so its caller has nothing left to redo.
+   */
+  const recoverHeldFinalsAfterPairing = Effect.fn(
+    "MatrixBridgeReactor.recoverHeldFinalsAfterPairing",
+  )(
+    function* (ownerThreadId: ThreadId) {
+      for (let attempt = 0; attempt < MATRIX_BRIDGE_INBOUND_ATTEMPTS; attempt += 1) {
+        const recovered = yield* Effect.result(
+          // The in-memory candidate first, then the same rebuild startup does
+          // for a process that never saw the turn finish. Reconciliation's
+          // failing view, so a read that fails here is retried rather than
+          // logged and counted as recovered.
+          recheckPendingCandidate(ownerThreadId).pipe(Effect.andThen(reconcileOwner())),
+        );
+        if (recovered._tag === "Success") {
+          // Both of those hand the candidate to the terminal worker, which
+          // keeps a thread's deliveries in order and swallows its own read
+          // failures. So the outcome is read from the queue rather than from
+          // the call: an inspected candidate has been sent or forgotten, and
+          // one still pending once the worker is idle is one to try again.
+          yield* terminalWorker.drain;
+          if (!pendingCandidates.has(ownerThreadId)) return;
+        }
+        yield* Effect.logWarning("Matrix bridge could not recover a final held by the gate", {
+          threadId: ownerThreadId,
+          attempt: attempt + 1,
+        });
+        if (attempt + 1 < MATRIX_BRIDGE_INBOUND_ATTEMPTS) {
+          yield* Effect.sleep(retryDelayMs(attempt));
+        }
+      }
+    },
+    Effect.catchCause((cause) =>
+      Cause.hasInterruptsOnly(cause)
+        ? Effect.interrupt
+        : Effect.logWarning("Matrix bridge gave up recovering a final held by the gate"),
+    ),
+  );
+
   const attemptPairing = Effect.fn("MatrixBridgeReactor.attemptPairing")(function* (
     config: MatrixBridgeConfigV1 & { readonly roomId: string },
     event: MatrixBridgeInboundText,
@@ -1062,6 +1104,15 @@ export const make = Effect.gen(function* () {
       body: MATRIX_BRIDGE_PAIRING_SUCCESS,
       validWhile: "paired",
     });
+
+    // A turn that finished while the room was still locked was held rather than
+    // delivered, because an unpaired bridge may not send. Pairing is what makes
+    // it deliverable, so it is looked at again, in its own retry: the code is
+    // spent and the pairing is committed by this point, and a recovery that
+    // failed into the inbound retry would replay this event as ordinary text.
+    if (config.ownerThreadId !== null) {
+      yield* recoverHeldFinalsAfterPairing(config.ownerThreadId);
+    }
   });
 
   const handleRoomMembership = Effect.fn("MatrixBridgeReactor.handleRoomMembership")(function* (
@@ -1168,10 +1219,10 @@ export const make = Effect.gen(function* () {
       // mistake, must not become a user message: thread history and model
       // context are the last places a redeemable credential should land. An
       // unavailable credential store withholds too, rather than guessing.
-      const credentialCheck = yield* Effect.result(
-        environmentAuth.isLivePairingCredential(event.body.trim()),
-      );
-      if (credentialCheck._tag === "Failure" || credentialCheck.success) {
+      // A store that cannot answer fails into the retry above rather than
+      // returning: withholding is right, but dropping the message on the way
+      // would lose a command to a blip in a component it only consults.
+      if (yield* environmentAuth.isLivePairingCredential(event.body.trim())) {
         yield* Effect.logWarning(
           "Matrix bridge withheld a possible pairing credential from a turn",
         );
@@ -1248,100 +1299,112 @@ export const make = Effect.gen(function* () {
       ),
     );
 
-  const reconcileOwnerAtStartup = Effect.fn("MatrixBridgeReactor.reconcileOwnerAtStartup")(
-    function* () {
-      let config = Option.getOrNull(yield* configService.currentConfig);
-      if (
-        config === null ||
-        config.ownerThreadId === null ||
-        config.pairing.state !== "paired" ||
-        config.roomId === null
-      ) {
-        return;
-      }
+  const reconcileOwner = Effect.fn("MatrixBridgeReactor.reconcileOwner")(function* () {
+    let config = Option.getOrNull(yield* configService.currentConfig);
+    // Deliberately not gated on pairing. The delivery baseline exists so an
+    // upgrade does not replay history, which has nothing to do with the gate:
+    // establishing it at start is what lets a turn completed while the room
+    // is still locked be recovered once the code arrives, rather than being
+    // baselined away by an initialization that runs after it.
+    if (config === null || config.ownerThreadId === null || config.roomId === null) {
+      return;
+    }
 
-      const ownerThreadId = config.ownerThreadId;
-      const detailSnapshot = yield* projection.getThreadDetailSnapshot(ownerThreadId);
-      if (
-        Option.isNone(detailSnapshot) ||
-        detailSnapshot.value.thread.archivedAt !== null ||
-        detailSnapshot.value.thread.deletedAt !== null
-      ) {
-        yield* clearInactiveOwner(ownerThreadId);
-        return;
-      }
+    const ownerThreadId = config.ownerThreadId;
+    const detailSnapshot = yield* projection.getThreadDetailSnapshot(ownerThreadId);
+    if (
+      Option.isNone(detailSnapshot) ||
+      detailSnapshot.value.thread.archivedAt !== null ||
+      detailSnapshot.value.thread.deletedAt !== null
+    ) {
+      yield* clearInactiveOwner(ownerThreadId);
+      return;
+    }
 
-      const detail = detailSnapshot.value.thread;
-      const latestTurn = detail.latestTurn;
-      if (!config.deliveryCheckpointInitialized) {
-        const hasInFlightTurn = latestTurn?.state === "running";
-        const baselineTurnId = hasInFlightTurn ? null : (latestTurn?.turnId ?? null);
-        const baselineSequence = hasInFlightTurn
-          ? config.deliveryBaselineSequence
-          : detailSnapshot.value.snapshotSequence;
-        const initialized = yield* configService.initializeDeliveryCheckpointIfMissing({
-          ownerThreadId,
-          ownershipEpoch: config.ownershipEpoch,
-          cryptoStoreGeneration: config.cryptoStoreGeneration,
-          roomId: config.roomId,
-          baselineTurnId,
-          baselineSequence,
-        });
-        if (!initialized) return;
-
-        const initializedConfig = currentOwner(yield* configService.currentConfig, ownerThreadId);
-        if (
-          initializedConfig === null ||
-          initializedConfig.ownershipEpoch !== config.ownershipEpoch ||
-          initializedConfig.cryptoStoreGeneration !== config.cryptoStoreGeneration ||
-          !initializedConfig.deliveryCheckpointInitialized ||
-          initializedConfig.pairing.state !== "paired" ||
-          initializedConfig.roomId === null
-        ) {
-          return;
-        }
-        config = initializedConfig;
-        for (const candidates of [pendingCandidates, scheduledCandidates, trailingCandidates]) {
-          const candidate = candidates.get(ownerThreadId);
-          if (
-            candidate !== undefined &&
-            candidate.ownershipEpoch === config.ownershipEpoch &&
-            candidate.cryptoStoreGeneration === config.cryptoStoreGeneration &&
-            candidate.sequence <= config.deliveryBaselineSequence
-          ) {
-            candidates.delete(ownerThreadId);
-          }
-        }
-        yield* recheckPendingCandidate(ownerThreadId);
-      }
-
-      if (latestTurn === null || config.lastDeliveredTurnId === latestTurn.turnId) return;
-      const recoveryEvent = yield* orchestrationEngine
-        .readEvents(config.deliveryBaselineSequence, Number.MAX_SAFE_INTEGER)
-        .pipe(
-          Stream.filter(
-            (event) =>
-              event.type === "thread.message-sent" &&
-              event.payload.threadId === ownerThreadId &&
-              event.payload.role === "assistant" &&
-              event.payload.streaming === false &&
-              event.payload.turnId === latestTurn.turnId,
-          ),
-          Stream.runHead,
-        );
-      if (Option.isNone(recoveryEvent)) return;
-
-      const candidate = {
-        threadId: ownerThreadId,
-        turnId: latestTurn.turnId,
-        sequence: recoveryEvent.value.sequence,
+    const detail = detailSnapshot.value.thread;
+    const latestTurn = detail.latestTurn;
+    if (!config.deliveryCheckpointInitialized) {
+      const hasInFlightTurn = latestTurn?.state === "running";
+      const baselineTurnId = hasInFlightTurn ? null : (latestTurn?.turnId ?? null);
+      const baselineSequence = hasInFlightTurn
+        ? config.deliveryBaselineSequence
+        : detailSnapshot.value.snapshotSequence;
+      const initialized = yield* configService.initializeDeliveryCheckpointIfMissing({
+        ownerThreadId,
         ownershipEpoch: config.ownershipEpoch,
         cryptoStoreGeneration: config.cryptoStoreGeneration,
-        origin: "startup-recovery" as const,
-      };
-      if (retainPendingCandidate(candidate)) {
-        yield* inspectProjectedCandidate(candidate, Option.some(detail));
+        roomId: config.roomId,
+        baselineTurnId,
+        baselineSequence,
+      });
+      if (!initialized) return;
+
+      const initializedConfig = currentOwner(yield* configService.currentConfig, ownerThreadId);
+      if (
+        initializedConfig === null ||
+        initializedConfig.ownershipEpoch !== config.ownershipEpoch ||
+        initializedConfig.cryptoStoreGeneration !== config.cryptoStoreGeneration ||
+        !initializedConfig.deliveryCheckpointInitialized ||
+        initializedConfig.pairing.state !== "paired" ||
+        initializedConfig.roomId === null
+      ) {
+        return;
       }
+      config = initializedConfig;
+      for (const candidates of [pendingCandidates, scheduledCandidates, trailingCandidates]) {
+        const candidate = candidates.get(ownerThreadId);
+        if (
+          candidate !== undefined &&
+          candidate.ownershipEpoch === config.ownershipEpoch &&
+          candidate.cryptoStoreGeneration === config.cryptoStoreGeneration &&
+          candidate.sequence <= config.deliveryBaselineSequence
+        ) {
+          candidates.delete(ownerThreadId);
+        }
+      }
+      yield* recheckPendingCandidate(ownerThreadId);
+    }
+
+    // Recovery itself waits for the gate: an unpaired bridge may not send,
+    // and the candidate stays pending until pairing looks again.
+    if (config.pairing.state !== "paired") return;
+    if (latestTurn === null || config.lastDeliveredTurnId === latestTurn.turnId) return;
+    const recoveryEvent = yield* orchestrationEngine
+      .readEvents(config.deliveryBaselineSequence, Number.MAX_SAFE_INTEGER)
+      .pipe(
+        Stream.filter(
+          (event) =>
+            event.type === "thread.message-sent" &&
+            event.payload.threadId === ownerThreadId &&
+            event.payload.role === "assistant" &&
+            event.payload.streaming === false &&
+            event.payload.turnId === latestTurn.turnId,
+        ),
+        Stream.runHead,
+      );
+    if (Option.isNone(recoveryEvent)) return;
+
+    const candidate = {
+      threadId: ownerThreadId,
+      turnId: latestTurn.turnId,
+      sequence: recoveryEvent.value.sequence,
+      ownershipEpoch: config.ownershipEpoch,
+      cryptoStoreGeneration: config.cryptoStoreGeneration,
+      origin: "startup-recovery" as const,
+    };
+    if (retainPendingCandidate(candidate)) {
+      yield* inspectProjectedCandidate(candidate, Option.some(detail));
+    }
+  });
+
+  /**
+   * Startup's fail-safe view of the same work: nothing is waiting on it there,
+   * and a read that fails must not take the reactor down with it. Callers that
+   * can retry use {@link reconcileOwner} and see the failure.
+   */
+  const reconcileOwnerAtStartup = Effect.fn("MatrixBridgeReactor.reconcileOwnerAtStartup")(
+    function* () {
+      yield* reconcileOwner();
     },
     Effect.catchCause((cause) =>
       Cause.hasInterruptsOnly(cause)
