@@ -508,6 +508,7 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
       assert.equal(created?.visibility, "private");
       // `trusted_private_chat` would promote invitees to the bot's power level.
       assert.equal(created?.preset, "private_chat");
+      assert.equal(created?.room_version, "11");
       assert.isTrue(created?.is_direct);
       assert.deepEqual([...(created?.invite ?? [])], [ALLOWED_USER_ID]);
       assert.equal(created?.power_level_content_override.invite, 100);

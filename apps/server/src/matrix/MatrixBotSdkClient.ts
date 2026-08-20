@@ -71,6 +71,7 @@ export const buildSyncFilter = (roomId: string) => ({
 export interface MatrixCreateRoomOptions {
   readonly visibility: "private";
   readonly preset: "private_chat";
+  readonly room_version: string;
   readonly is_direct: true;
   readonly invite: ReadonlyArray<string>;
   readonly power_level_content_override: Record<string, unknown>;
@@ -83,6 +84,8 @@ export interface MatrixCreateRoomOptions {
 
 /** Room administration stays with the bot; members may only send messages. */
 export const MATRIX_BRIDGE_ADMIN_POWER_LEVEL = 100;
+/** Requested for new rooms; within the versions this bridge verifies. */
+export const MATRIX_BRIDGE_ROOM_VERSION = "11";
 
 /**
  * One private, invite-only, Megolm-encrypted room; no plaintext fallback.
@@ -96,6 +99,9 @@ export const buildEncryptedRoomCreateOptions = (
 ): MatrixCreateRoomOptions => ({
   visibility: "private",
   preset: "private_chat",
+  // Asked for explicitly: a homeserver whose default sits outside the versions
+  // this bridge verifies would otherwise create a room it must then refuse.
+  room_version: MATRIX_BRIDGE_ROOM_VERSION,
   is_direct: true,
   invite: [...invite],
   power_level_content_override: {
