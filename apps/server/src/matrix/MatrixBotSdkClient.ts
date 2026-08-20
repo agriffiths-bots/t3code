@@ -106,6 +106,9 @@ export const buildEncryptedRoomCreateOptions = (
     kick: MATRIX_BRIDGE_ADMIN_POWER_LEVEL,
     ban: MATRIX_BRIDGE_ADMIN_POWER_LEVEL,
     redact: MATRIX_BRIDGE_ADMIN_POWER_LEVEL,
+    // Members send messages and nothing else; a redaction from a member on the
+    // bot's own homeserver would otherwise be authorised by domain alone.
+    events: { "m.room.redaction": MATRIX_BRIDGE_ADMIN_POWER_LEVEL },
   },
   initial_state: [
     { type: "m.room.encryption", state_key: "", content: { algorithm: MEGOLM_ALGORITHM } },
@@ -257,7 +260,9 @@ function readStatusCode(cause: unknown): number | null {
 function retryabilityFor(cause: unknown): "transient" | "permanent" {
   const status = readStatusCode(cause);
   if (status === null) return "transient";
-  if (status === 429) return "transient";
+  // Rate limiting and request timeouts are the two 4xx answers that say "later",
+  // not "never".
+  if (status === 408 || status === 429) return "transient";
   return status >= 400 && status < 500 ? "permanent" : "transient";
 }
 
@@ -311,6 +316,13 @@ const PROTECTED_ROOM_STATE_TYPES = [
   "m.room.power_levels",
   "m.room.encryption",
 ] as const;
+/**
+ * Message types members must not be able to send. A redaction is authorised by
+ * the `redact` level *or* by the sender sharing the original sender's domain,
+ * so on a shared homeserver the level alone would not stop a member erasing
+ * the bridge's output: the send level has to be out of reach too.
+ */
+const PROTECTED_ROOM_MESSAGE_TYPES = ["m.room.redaction"] as const;
 
 /**
  * Only the bot may widen the room. Members can send messages and nothing else,
@@ -330,8 +342,14 @@ function roomIsBotAdministered(
 
   const usersDefault = readPowerLevel(record.users_default) ?? 0;
   const stateDefault = readPowerLevel(record.state_default) ?? 50;
+  const eventsDefault = readPowerLevel(record.events_default) ?? 0;
   const inviteLevel = readPowerLevel(record.invite) ?? 0;
-  if (usersDefault === "invalid" || stateDefault === "invalid" || inviteLevel === "invalid") {
+  if (
+    usersDefault === "invalid" ||
+    stateDefault === "invalid" ||
+    eventsDefault === "invalid" ||
+    inviteLevel === "invalid"
+  ) {
     return false;
   }
 
@@ -350,10 +368,18 @@ function roomIsBotAdministered(
     highestMemberLevel = Math.max(highestMemberLevel, level);
   }
 
+  const redactLevel = readPowerLevel(record.redact) ?? 50;
+  if (redactLevel === "invalid") return false;
+
   const events = readRecord(record.events) ?? {};
-  const requiredLevels: Array<number> = [inviteLevel];
+  const requiredLevels: Array<number> = [inviteLevel, redactLevel];
   for (const type of PROTECTED_ROOM_STATE_TYPES) {
     const level = readPowerLevel(events[type]) ?? stateDefault;
+    if (level === "invalid") return false;
+    requiredLevels.push(level);
+  }
+  for (const type of PROTECTED_ROOM_MESSAGE_TYPES) {
+    const level = readPowerLevel(events[type]) ?? eventsDefault;
     if (level === "invalid") return false;
     requiredLevels.push(level);
   }

@@ -83,6 +83,7 @@ const botAdministeredPowerLevels = () => ({
   kick: 100,
   ban: 100,
   redact: 100,
+  events: { "m.room.redaction": 100 },
   users: { [BOT_USER_ID]: 100 },
 });
 
@@ -513,6 +514,9 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
       assert.equal(created?.power_level_content_override.users_default, 0);
       assert.equal(created?.power_level_content_override.events_default, 0);
       assert.equal(created?.power_level_content_override.state_default, 100);
+      assert.deepEqual(created?.power_level_content_override.events, {
+        "m.room.redaction": 100,
+      });
       assert.deepEqual(
         [...(created?.initial_state ?? [])],
         [
@@ -918,7 +922,13 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
         roomState: {
           "m.room.join_rules": { join_rule: "invite" },
           "m.room.encryption": { algorithm: MEGOLM_ALGORITHM },
-          "m.room.power_levels": { users_default: 0, invite: 100, state_default: 100 },
+          "m.room.power_levels": {
+            users_default: 0,
+            invite: 100,
+            state_default: 100,
+            redact: 100,
+            events: { "m.room.redaction": 100 },
+          },
         },
       });
       const configService = yield* configureBridge();
@@ -1094,6 +1104,39 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
 
       assert.include((yield* configService.status).reason ?? "", "pending invitation");
       assert.lengthOf(sdk.startedFilters, 0);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("refuses a room whose members can send redactions", () =>
+    Effect.gen(function* () {
+      const sdk = makeFakeSdk({
+        roomState: {
+          "m.room.join_rules": { join_rule: "invite" },
+          "m.room.encryption": { algorithm: MEGOLM_ALGORITHM },
+          // Everything is locked down except redaction, which would let a
+          // member erase the bridge's own output after the fact.
+          "m.room.power_levels": {
+            users_default: 0,
+            invite: 100,
+            state_default: 100,
+            redact: 100,
+            // Redaction is authorised by the sender's domain as well as by the
+            // redact level, so the send level has to be out of reach too.
+            events_default: 0,
+            users: { [BOT_USER_ID]: 100 },
+          },
+        },
+      });
+      const configService = yield* configureBridge();
+      yield* configService.recordRoomIfMatches({
+        cryptoStoreGeneration: Option.getOrThrow(yield* configService.currentConfig)
+          .cryptoStoreGeneration,
+        roomId: ROOM_ID,
+      });
+      yield* startAdapter(sdk);
+      yield* awaitStatusState(configService, "unavailable");
+
+      assert.include((yield* configService.status).reason ?? "", "change its access rules");
     }).pipe(Effect.provide(testLayer)),
   );
 

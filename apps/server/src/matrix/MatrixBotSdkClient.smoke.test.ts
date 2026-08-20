@@ -21,7 +21,6 @@ import {
   reconcileAllowedMembership,
   verifyEncryptedRoom,
   whoami,
-  type FencedSyncStorage,
   type MatrixSdkClient,
 } from "./MatrixBotSdkClient.ts";
 
@@ -58,18 +57,6 @@ function readCredentials(): typeof SmokeCredentials.Type | null {
 
 const credentials = readCredentials();
 const describeSmoke = credentials === null ? describe.skip : describe;
-
-const FIRST_SYNC_POLL_INTERVAL_MS = 250;
-const FIRST_SYNC_ATTEMPTS = 120;
-
-/** The sync loop runs in the background, so its first batch is polled for. */
-const awaitFirstSyncBatch = Effect.fn("awaitFirstSyncBatch")(function* (fence: FencedSyncStorage) {
-  for (let attempt = 0; attempt < FIRST_SYNC_ATTEMPTS; attempt += 1) {
-    if (fence.syncedBatches() > 0) return;
-    yield* Effect.sleep(FIRST_SYNC_POLL_INTERVAL_MS);
-  }
-  assert.fail("The homeserver never delivered a sync batch.");
-});
 
 /** Cleanup-only calls the bridge never makes in production. */
 interface SmokeClient extends MatrixSdkClient {
@@ -150,7 +137,7 @@ describeSmoke("MatrixBotSdkClient live homeserver smoke", () => {
         // has to be waited for. The SDK processes it in full, which is how its
         // room keys reach the crypto store even though its timeline is fenced
         // off the bridge.
-        yield* awaitFirstSyncBatch(fence);
+        yield* fence.awaitSyncBoundary;
         assert.isNotNull(fence.storage.getSyncToken());
         const crypto = client.crypto;
         assert.isDefined(crypto);
