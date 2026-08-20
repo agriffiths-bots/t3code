@@ -42,6 +42,7 @@ import {
   type MatrixBridgeRoomMembership,
 } from "./MatrixBridgeClient.ts";
 import { MatrixBridgeConfig, type MatrixBridgeConfigV1 } from "./MatrixBridgeConfig.ts";
+import { matrixTextContent } from "./matrixFormattedBody.ts";
 
 export const MATRIX_BRIDGE_OUTBOUND_CAPACITY = 64;
 /** Reserved separately so a full model-output queue cannot hide the gate. */
@@ -484,6 +485,7 @@ export const make = Effect.gen(function* () {
   const deliver = Effect.fn("MatrixBridgeReactor.deliver")(function* (job: OutboundJob) {
     let attempt = 0;
     let sent = false;
+    let content: ReturnType<typeof matrixTextContent> | undefined;
     while (true) {
       if (!(yield* ownerStillMatches(job))) {
         yield* Effect.logDebug("Matrix bridge dropped stale owner turn", {
@@ -492,6 +494,7 @@ export const make = Effect.gen(function* () {
         });
         return;
       }
+      content ??= matrixTextContent(job.body);
 
       if (!sent && outboundPaused(job.cryptoStoreGeneration)) {
         if (yield* waitBeforeRetry(job.enqueuedAt, attempt)) {
@@ -520,7 +523,7 @@ export const make = Effect.gen(function* () {
             client.sendText({
               roomId: job.roomId,
               transactionId: job.transactionId,
-              content: { msgtype: "m.text", body: job.body },
+              content,
               ownershipEpoch: job.ownershipEpoch,
             }),
           );
@@ -582,6 +585,7 @@ export const make = Effect.gen(function* () {
       }
     };
 
+    const content = matrixTextContent(job.body);
     let attempt = 0;
     while (true) {
       const config = Option.getOrNull(yield* configService.currentConfig);
@@ -610,7 +614,7 @@ export const make = Effect.gen(function* () {
           client.sendText({
             roomId: job.roomId,
             transactionId: job.transactionId,
-            content: { msgtype: "m.text", body: job.body },
+            content,
             // A gate message answers the room, not a bridged thread.
             ownershipEpoch: null,
           }),

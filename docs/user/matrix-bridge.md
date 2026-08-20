@@ -4,7 +4,7 @@
 
 Use this when you want one T3 Code thread to appear as a private encrypted chat on Matrix, including Beeper.
 
-The bridge is one room and at most one owner thread per T3 environment. Mid-turn tool output, streaming fragments, and activity notices stay in T3. Matrix receives each completed assistant reply as a single plain-text message.
+The bridge is one room and at most one owner thread per T3 environment. Mid-turn tool output, streaming fragments, and activity notices stay in T3. Matrix receives each completed assistant reply as a single message: formatted rich text in Beeper and other Matrix clients, with the original markdown as the plain-text fallback.
 
 ## What You Need
 
@@ -39,7 +39,7 @@ With no owner selected, Matrix messages do not start T3 turns, and T3 does not p
 
 After pairing, with an owner thread selected:
 
-- Each completed T3 reply on that thread arrives once as plain text.
+- Each completed T3 reply on that thread arrives once as formatted markdown.
 - A Matrix message you send starts a T3 turn. If a turn is already running, the same message steers it.
 - Replies from the bot are ignored and do not create extra T3 turns.
 

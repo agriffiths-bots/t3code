@@ -26,7 +26,7 @@ HTTP homeservers are accepted only for literal loopback hosts.
 
 Subscribe to the live domain stream. On each owner-thread `thread.message-sent` with assistant role and `streaming:false`, schedule the drainable worker. The worker re-reads the projection and sends only if that turn is terminal (`completed` / `interrupted` / `error`, or awareness phase `completed`), then drops stale-terminal cases where a newer user message exists after the terminal timestamp. Dedupe `(threadId, turnId)` runs after the terminal check. Never send `event.payload.text`; take the last matching non-streaming assistant message from the projection.
 
-A turn with tool calls and mid-turn assistant segments therefore produces exactly one Matrix `m.text`. An approval-opening segment produces none.
+A turn with tool calls and mid-turn assistant segments therefore produces exactly one Matrix `m.text`. An approval-opening segment produces none. The event's `body` is the original markdown; when rendering succeeds it also carries `format: org.matrix.custom.html` and a `formatted_body` restricted to the spec's suggested HTML subset for `m.room.message`. Rendering failures and oversize HTML fall back to plaintext `body` only.
 
 Immediately before encrypt/send and before every retry, re-read owner and epoch. Moving ownership drops the previous owner's in-progress turn. Transaction ids are stable per environment/thread/turn.
 

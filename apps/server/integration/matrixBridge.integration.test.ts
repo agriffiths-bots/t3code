@@ -37,6 +37,7 @@ import {
   layer as MatrixBridgeReactorLive,
 } from "../src/matrix/MatrixBridgeReactor.ts";
 import { MatrixBridgeConfig, type MatrixBridgeConfigV1 } from "../src/matrix/MatrixBridgeConfig.ts";
+import { matrixTextContent } from "../src/matrix/matrixFormattedBody.ts";
 import { trustedSystemDispatchAuthority } from "../src/orchestration/commandAudienceGuard.ts";
 import { BootstrapTurnStartDispatcher } from "../src/orchestration/Services/BootstrapTurnStartDispatcher.ts";
 import { OrchestrationEngineService } from "../src/orchestration/Services/OrchestrationEngine.ts";
@@ -273,10 +274,7 @@ it.live("observes a real projected final through the fake Matrix client", () =>
 
           const sent = yield* fake.awaitSentCount(1);
           assert.strictEqual(sent.length, 1);
-          assert.deepStrictEqual(sent[0]?.content, {
-            msgtype: "m.text",
-            body: finalText,
-          });
+          assert.deepStrictEqual(sent[0]?.content, matrixTextContent(finalText));
 
           const projected = yield* harness.snapshotQuery.getThreadDetailById(threadId);
           assert.isTrue(Option.isSome(projected));
