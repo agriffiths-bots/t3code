@@ -98,6 +98,12 @@ describe("matrixTextContent rendering", () => {
     expect(formatted("* a\n* b")).toBe("<ul><li>a</li><li>b</li></ul>");
     expect(formatted("1. a\n2. b")).toBe("<ol><li>a</li><li>b</li></ol>");
     expect(formatted("3. a\n4. b")).toBe('<ol start="3"><li>a</li><li>b</li></ol>');
+    expect(formatted("- a\n\n- b")).toBe("<ul><li>a</li><li>b</li></ul>");
+    expect(formatted("- a\n\n\n- b")).toBe("<ul><li>a</li><li>b</li></ul>");
+  });
+
+  it("still formats a list after a long run of blank lines", () => {
+    expect(formatted(`- a\n${"\n".repeat(200)}- b`)).toBe("<ul><li>a</li><li>b</li></ul>");
   });
 
   it("renders nested lists inside list items", () => {
@@ -298,6 +304,7 @@ describe("matrixTextContent fallback", () => {
         markdown: `[${"*a ".repeat(2_000)}x${" b*".repeat(2_000)}](https://example.com)`,
       },
       { name: "reference-style lookalikes", markdown: "[x][y]".repeat(4_000) },
+      { name: "blank lines between list items", markdown: `- a\n${"\n".repeat(20_000)}- b` },
       {
         name: "mixed pathological inlines",
         markdown: `${"*a [`<".repeat(3_000)}z`,

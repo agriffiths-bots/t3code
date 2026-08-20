@@ -483,9 +483,9 @@ export const make = Effect.gen(function* () {
   });
 
   const deliver = Effect.fn("MatrixBridgeReactor.deliver")(function* (job: OutboundJob) {
-    const content = matrixTextContent(job.body);
     let attempt = 0;
     let sent = false;
+    let content: ReturnType<typeof matrixTextContent> | undefined;
     while (true) {
       if (!(yield* ownerStillMatches(job))) {
         yield* Effect.logDebug("Matrix bridge dropped stale owner turn", {
@@ -494,6 +494,7 @@ export const make = Effect.gen(function* () {
         });
         return;
       }
+      content ??= matrixTextContent(job.body);
 
       if (!sent && outboundPaused(job.cryptoStoreGeneration)) {
         if (yield* waitBeforeRetry(job.enqueuedAt, attempt)) {

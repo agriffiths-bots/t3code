@@ -593,19 +593,19 @@ function parseList(
   while (i < to) {
     const line = lines[i] ?? "";
     if (line.trim() === "") {
-      const next = peekNonEmpty(lines, i + 1, to);
+      const next = peekNonEmpty(lines, i + 1, to, budget);
       if (next === null) break;
-      const nextMarker = listMarker(next);
+      const nextMarker = listMarker(next.line);
       if (
         nextMarker !== null &&
         nextMarker.indent === first.indent &&
         nextMarker.kind === first.kind
       ) {
-        i += 1;
+        i = next.index;
         continue;
       }
-      if (leadingIndent(next) > first.indent) {
-        i += 1;
+      if (leadingIndent(next.line) > first.indent) {
+        i = next.index;
         continue;
       }
       break;
@@ -638,11 +638,13 @@ function collectListItem(
   while (i < to) {
     const line = lines[i] ?? "";
     if (line.trim() === "") {
-      const next = peekNonEmpty(lines, i + 1, to);
+      const next = peekNonEmpty(lines, i + 1, to, budget);
       if (next === null) break;
-      if (leadingIndent(next) >= marker.contentIndent) {
-        itemLines.push("");
-        i += 1;
+      if (leadingIndent(next.line) >= marker.contentIndent) {
+        while (i < next.index) {
+          itemLines.push("");
+          i += 1;
+        }
         continue;
       }
       break;
@@ -738,10 +740,16 @@ function isHorizontalRule(line: string): boolean {
   return /^([-*_])\1{2,}$/.test(trimmed) && !/[^-_*]/.test(trimmed);
 }
 
-function peekNonEmpty(lines: ReadonlyArray<string>, from: number, to: number): string | null {
+function peekNonEmpty(
+  lines: ReadonlyArray<string>,
+  from: number,
+  to: number,
+  budget: RenderBudget,
+): { index: number; line: string } | null {
   for (let i = from; i < to; i += 1) {
+    budget.tick();
     const line = lines[i] ?? "";
-    if (line.trim() !== "") return line;
+    if (line.trim() !== "") return { index: i, line };
   }
   return null;
 }
