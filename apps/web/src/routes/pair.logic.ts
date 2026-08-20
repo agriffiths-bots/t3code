@@ -8,6 +8,7 @@ export type PairRouteAuthStatus =
 export type PairRouteDisposition =
   | "hosted-pairing"
   | "apply-pairing-credential"
+  | "desktop-local-session"
   | "pairing-form"
   | "redirect-home";
 
@@ -21,6 +22,7 @@ export type PairRouteDisposition =
 export function pairRouteDisposition(input: {
   readonly authStatus: PairRouteAuthStatus;
   readonly pairingToken: string | null;
+  readonly isDesktop?: boolean;
 }): PairRouteDisposition {
   if (input.authStatus === "hosted-pairing") {
     return "hosted-pairing";
@@ -36,7 +38,13 @@ export function pairRouteDisposition(input: {
 
   const pairingToken = input.pairingToken?.trim() ?? "";
   if (input.authStatus === "authenticated") {
-    return pairingToken.length > 0 ? "apply-pairing-credential" : "redirect-home";
+    if (pairingToken.length === 0) {
+      return "redirect-home";
+    }
+    // Desktop's primary connection is the main-process bearer, not the cookie
+    // pairing replace would install. Applying here would consume the link and
+    // report success while the administrative session stayed in place.
+    return input.isDesktop === true ? "desktop-local-session" : "apply-pairing-credential";
   }
 
   return "pairing-form";

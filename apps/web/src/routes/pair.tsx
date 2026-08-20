@@ -2,6 +2,7 @@ import { createFileRoute, redirect, useNavigate } from "@tanstack/react-router";
 
 import {
   AuthenticatedPairingApplySurface,
+  DesktopLocalPairingSurface,
   HostedPairingRouteSurface,
   PairingPendingSurface,
   PairingRouteSurface,
@@ -15,6 +16,7 @@ export const Route = createFileRoute("/pair")({
     const disposition = pairRouteDisposition({
       authStatus: authGateState.status,
       pairingToken: peekPairingTokenFromUrl(),
+      isDesktop: window.desktopBridge !== undefined,
     });
 
     if (disposition === "redirect-home") {
@@ -23,6 +25,7 @@ export const Route = createFileRoute("/pair")({
 
     return {
       authGateState,
+      pairDisposition: disposition,
     };
   },
   component: PairRouteView,
@@ -30,14 +33,14 @@ export const Route = createFileRoute("/pair")({
 });
 
 function PairRouteView() {
-  const { authGateState } = Route.useRouteContext();
+  const { authGateState, pairDisposition } = Route.useRouteContext();
   const navigate = useNavigate();
 
   if (!authGateState) {
     return null;
   }
 
-  if (authGateState.status === "hosted-pairing") {
+  if (pairDisposition === "hosted-pairing" || authGateState.status === "hosted-pairing") {
     return <HostedPairingRouteSurface />;
   }
 
@@ -45,7 +48,11 @@ function PairRouteView() {
     void navigate({ to: "/", replace: true });
   };
 
-  if (authGateState.status === "authenticated") {
+  if (pairDisposition === "desktop-local-session") {
+    return <DesktopLocalPairingSurface onContinue={goHome} />;
+  }
+
+  if (pairDisposition === "apply-pairing-credential" || authGateState.status === "authenticated") {
     return (
       <AuthenticatedPairingApplySurface
         onAuthenticated={() => {

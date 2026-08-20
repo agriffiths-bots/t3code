@@ -21,6 +21,16 @@ describe("pairRouteDisposition", () => {
     ).toBe("apply-pairing-credential");
   });
 
+  it("does not apply a pairing link against the desktop app's local session", () => {
+    expect(
+      pairRouteDisposition({
+        authStatus: "authenticated",
+        pairingToken: "PAIRME12345",
+        isDesktop: true,
+      }),
+    ).toBe("desktop-local-session");
+  });
+
   it("treats whitespace-only pairing credentials as absent", () => {
     expect(
       pairRouteDisposition({

@@ -41,8 +41,11 @@ grant's scopes replace that browser's session. Replacement is fail-closed: the
 previous cookie-backed session must be revoked and its live sockets signaled
 before the new cookie is installed. If displacement cannot be confirmed, the
 request fails, the original session stays usable, and nothing is replaced.
-Bearer and DPoP sessions on the same request are left alone. It is not an
-upgrade-only merge.
+Bearer and DPoP sessions on the same request are left alone. The desktop app
+does not offer pairing replacement against its local backend session: the
+primary transport is the main-process bearer, so applying a cookie would
+consume the link and report success without changing the live session. It is
+not an upgrade-only merge.
 
 `POST /api/auth/session/sign-out` revokes the caller's own session and expires
 the browser session cookie. It does not require `access:write`. Administrative
