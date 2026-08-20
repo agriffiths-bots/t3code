@@ -211,6 +211,20 @@ function runGit(
   });
 }
 
+function disableAutomaticGitMaintenance(
+  cwd: string,
+): Effect.Effect<void, GitCommandError, GitVcsDriver.GitVcsDriver> {
+  return Effect.gen(function* () {
+    // A foreground command may launch `git maintenance run --auto --detach`.
+    // Its parent exits before the packer, so a scoped test repository can be
+    // removed while that detached process is still writing under objects/pack.
+    yield* runGit(cwd, ["config", "maintenance.auto", "false"]);
+    // Older Git versions use gc.auto directly instead of the maintenance
+    // command, so keep those test repositories synchronous too.
+    yield* runGit(cwd, ["config", "gc.auto", "0"]);
+  });
+}
+
 function initRepo(
   cwd: string,
 ): Effect.Effect<
@@ -221,6 +235,7 @@ function initRepo(
   return Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
     yield* runGit(cwd, ["init", "--initial-branch=main"]);
+    yield* disableAutomaticGitMaintenance(cwd);
     yield* runGit(cwd, ["config", "user.email", "test@example.com"]);
     yield* runGit(cwd, ["config", "user.name", "Test User"]);
     yield* fs.writeFileString(NodePath.join(cwd, "README.md"), "hello\n");
@@ -237,6 +252,7 @@ function createBareRemote(): Effect.Effect<
   return Effect.gen(function* () {
     const remoteDir = yield* makeTempDir("t3code-git-remote-");
     yield* runGit(remoteDir, ["init", "--bare"]);
+    yield* disableAutomaticGitMaintenance(remoteDir);
     return remoteDir;
   });
 }
@@ -1737,6 +1753,7 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
     Effect.gen(function* () {
       const repoDir = yield* makeTempDir("t3code-git-manager-");
       yield* runGit(repoDir, ["init", "--initial-branch=main"]);
+      yield* disableAutomaticGitMaintenance(repoDir);
       yield* runGit(repoDir, ["config", "user.email", "test@example.com"]);
       yield* runGit(repoDir, ["config", "user.name", "Test User"]);
       NodeFS.writeFileSync(NodePath.join(repoDir, "README.md"), "hello\n");
@@ -2791,6 +2808,7 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
 
       const peerDir = yield* makeTempDir("t3code-git-peer-");
       yield* runGit(peerDir, ["clone", remoteDir, "."]);
+      yield* disableAutomaticGitMaintenance(peerDir);
       yield* runGit(peerDir, ["config", "user.email", "peer@example.com"]);
       yield* runGit(peerDir, ["config", "user.name", "Peer User"]);
       NodeFS.writeFileSync(NodePath.join(peerDir, "remote.txt"), "remote\n");
