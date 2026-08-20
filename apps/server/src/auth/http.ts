@@ -350,8 +350,8 @@ export const authHttpApiLayer = HttpApiBuilder.group(
             yield* annotateEnvironmentRequest(args.endpoint.name);
             const request = yield* HttpServerRequest.HttpServerRequest;
             // Replacement is a security boundary. Fail closed unless the
-            // previous session is confirmed gone: do not install a cookie when
-            // the existing session cannot be read or revoked.
+            // previous cookie session is confirmed gone: do not install a cookie
+            // when the existing session cannot be read or revoked.
             const previousSession = yield* serverAuth.authenticateHttpRequest(request).pipe(
               Effect.catchIf(EnvironmentAuth.isServerAuthCredentialError, () =>
                 Effect.succeed(null),
@@ -376,7 +376,7 @@ export const authHttpApiLayer = HttpApiBuilder.group(
                 }),
               ),
             ).pipe(Effect.catch(() => failEnvironmentInternal("browser_session_cookie_failed")));
-            if (previousSession !== null) {
+            if (previousSession !== null && previousSession.method === "browser-session-cookie") {
               yield* serverAuth
                 .revokeSession(previousSession.sessionId)
                 .pipe(

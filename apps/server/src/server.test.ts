@@ -1956,6 +1956,43 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("does not revoke a bearer session when pairing installs a browser cookie", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest();
+
+      const { body: tokenBody } = yield* exchangeAccessToken();
+      const bearer = tokenBody.access_token ?? "";
+      const credentialResponse = yield* HttpClient.post("/api/auth/pairing-token", {
+        headers: { authorization: `Bearer ${bearer}` },
+        body: yield* HttpBody.json({ audienceCeiling: "private" }),
+      });
+      const credential = (yield* credentialResponse.json) as { readonly credential: string };
+      const replacement = yield* bootstrapBrowserSession(credential.credential, {
+        headers: { authorization: `Bearer ${bearer}` },
+      });
+
+      const sessionUrl = yield* getHttpServerUrl("/api/auth/session");
+      const bearerResponse = yield* fetchEffect(sessionUrl, {
+        headers: { authorization: `Bearer ${bearer}` },
+      });
+      const bearerBody = yield* responseJsonEffect<{ readonly authenticated: boolean }>(
+        bearerResponse,
+      );
+      const cookieHeader = replacement.cookie?.split(";")[0] ?? "";
+      const cookieResponse = yield* fetchEffect(sessionUrl, {
+        headers: { cookie: cookieHeader },
+      });
+      const cookieBody = yield* responseJsonEffect<{ readonly authenticated: boolean }>(
+        cookieResponse,
+      );
+
+      assert.equal(credentialResponse.status, 200);
+      assert.equal(replacement.response.status, 200);
+      assert.equal(bearerBody.authenticated, true);
+      assert.equal(cookieBody.authenticated, true);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("exchanges a bootstrap grant for a scoped bearer access token", () =>
     Effect.gen(function* () {
       yield* buildAppUnderTest();

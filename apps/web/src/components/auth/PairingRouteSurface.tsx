@@ -6,6 +6,8 @@ import { APP_DISPLAY_NAME } from "../../branding";
 import { environmentCatalog } from "../../connection/catalog";
 import { connectPairing } from "../../connection/onboarding";
 import {
+  fetchSessionState,
+  listServerPairingLinks,
   peekPairingTokenFromUrl,
   stripPairingTokenFromUrl,
   submitServerAuthCredential,
@@ -16,7 +18,10 @@ import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { useAtomCommand } from "../../state/use-atom-command";
 import {
+  describeAuthenticatedPairingApply,
   errorMessageFromUnknown,
+  incomingGrantFromPairingLinks,
+  type PairingGrantView,
   submitPairingCredentialAndUnblock,
 } from "./PairingRouteSurface.logic";
 
@@ -190,14 +195,24 @@ export function AuthenticatedPairingApplySurface({
   onContinueWithoutApplying: () => void;
 }) {
   const autoPairTokenRef = useRef<string | null>(peekPairingTokenFromUrl());
-  const [errorMessage, setErrorMessage] = useState("");
+  const [credential] = useState(() => autoPairTokenRef.current ?? "");
+  const [currentGrant, setCurrentGrant] = useState<PairingGrantView | null>(null);
+  const [incomingGrant, setIncomingGrant] = useState<PairingGrantView | null>(null);
+  const [scopeProbeReady, setScopeProbeReady] = useState(credential.length === 0);
+  const [errorMessage, setErrorMessage] = useState(() =>
+    credential.length > 0 ? "" : "This pairing link is missing its token.",
+  );
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const autoSubmitAttemptedRef = useRef(false);
+  const strippedUrlRef = useRef(false);
   const primaryEnvironmentId = usePrimaryEnvironmentId();
   const primaryEnvironmentIdRef = useRef(primaryEnvironmentId);
   primaryEnvironmentIdRef.current = primaryEnvironmentId;
   const retryPrimaryEnvironment = useAtomCommand(environmentCatalog.retryNow, {
     reportFailure: false,
+  });
+  const copy = describeAuthenticatedPairingApply({
+    current: currentGrant,
+    incoming: incomingGrant,
   });
 
   const submitCredential = useCallback(
@@ -230,20 +245,48 @@ export function AuthenticatedPairingApplySurface({
   );
 
   useEffect(() => {
-    if (autoSubmitAttemptedRef.current) {
+    if (strippedUrlRef.current) {
       return;
     }
-    autoSubmitAttemptedRef.current = true;
-
-    const token = autoPairTokenRef.current;
-    if (!token) {
-      setErrorMessage("This pairing link is missing its token.");
-      return;
-    }
-
+    strippedUrlRef.current = true;
     stripPairingTokenFromUrl();
-    void submitCredential(token);
-  }, [submitCredential]);
+  }, []);
+
+  useEffect(() => {
+    if (credential.length === 0) {
+      return;
+    }
+
+    let cancelled = false;
+    void (async () => {
+      const [sessionResult, linksResult] = await Promise.allSettled([
+        fetchSessionState(),
+        listServerPairingLinks(),
+      ]);
+      if (cancelled) {
+        return;
+      }
+      if (
+        sessionResult.status === "fulfilled" &&
+        sessionResult.value.authenticated &&
+        sessionResult.value.scopes !== undefined &&
+        sessionResult.value.audienceCeiling !== undefined
+      ) {
+        setCurrentGrant({
+          scopes: sessionResult.value.scopes,
+          audienceCeiling: sessionResult.value.audienceCeiling,
+        });
+      }
+      if (linksResult.status === "fulfilled") {
+        setIncomingGrant(incomingGrantFromPairingLinks(credential, linksResult.value));
+      }
+      setScopeProbeReady(true);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [credential]);
 
   return (
     <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-background px-4 py-10 text-foreground sm:px-6">
@@ -258,13 +301,19 @@ export function AuthenticatedPairingApplySurface({
           {APP_DISPLAY_NAME}
         </p>
         <h1 className="mt-3 text-2xl font-semibold tracking-tight sm:text-3xl">
-          {errorMessage ? "Pairing link was not applied" : "Applying pairing link"}
+          {errorMessage ? "Pairing link was not applied" : copy.title}
         </h1>
         <p className="mt-2 text-sm leading-relaxed text-muted-foreground">
           {errorMessage
-            ? "This browser kept its current session. Request a new pairing link if you still need to change permissions."
-            : "This one-time link replaces the session on this browser with the permissions it grants."}
+            ? "This browser kept its current session. You can retry with this link or continue as you are."
+            : copy.explanation}
         </p>
+
+        {scopeProbeReady && copy.downgradeWarning ? (
+          <div className="mt-5 rounded-lg border border-destructive/30 bg-destructive/6 px-3 py-2 text-sm text-destructive">
+            {copy.downgradeWarning}
+          </div>
+        ) : null}
 
         {errorMessage ? (
           <div className="mt-5 rounded-lg border border-destructive/30 bg-destructive/6 px-3 py-2 text-sm text-destructive">
@@ -273,15 +322,29 @@ export function AuthenticatedPairingApplySurface({
         ) : null}
 
         <div className="mt-6 flex flex-wrap gap-2">
-          {isSubmitting && !errorMessage ? (
-            <Button disabled size="sm">
-              Pairing...
+          {credential.length > 0 ? (
+            <Button
+              size="sm"
+              disabled={isSubmitting || !scopeProbeReady}
+              onClick={() => void submitCredential(credential)}
+            >
+              {isSubmitting
+                ? "Pairing..."
+                : !scopeProbeReady
+                  ? "Checking permissions..."
+                  : errorMessage
+                    ? "Retry"
+                    : "Apply this link"}
             </Button>
-          ) : (
-            <Button size="sm" variant="outline" onClick={onContinueWithoutApplying}>
-              Continue with current session
-            </Button>
-          )}
+          ) : null}
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={isSubmitting}
+            onClick={onContinueWithoutApplying}
+          >
+            Continue with current session
+          </Button>
         </div>
       </section>
     </div>

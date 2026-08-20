@@ -36,15 +36,20 @@ credentials additionally grant `access:read access:write relay:write`.
 browser session cookie. The cookie is an HTTP transport adapter for the same
 scoped session model; the response never exposes the session secret to browser
 JavaScript. Opening a pairing link in a browser that already has a session
-redeems the credential the same way: the grant's scopes replace that browser's
-session. Replacement is fail-closed. The previous session must be revoked
-before the new cookie is installed. If that displacement cannot be confirmed,
-the request fails, the original session stays usable, and nothing is replaced.
-It is not an upgrade-only merge.
+reaches an apply surface that requires an explicit click. After that click, the
+grant's scopes replace that browser's session. Replacement is fail-closed: the
+previous cookie-backed session must be revoked before the new cookie is
+installed. If displacement cannot be confirmed, the request fails, the original
+session stays usable, and nothing is replaced. Bearer and DPoP sessions on the
+same request are left alone. It is not an upgrade-only merge.
 
 `POST /api/auth/session/sign-out` revokes the caller's own session and expires
 the browser session cookie. It does not require `access:write`. Administrative
-revoke of other clients remains on `POST /api/auth/clients/revoke`.
+revoke of other clients remains on `POST /api/auth/clients/revoke`. Desktop
+does not offer this action for its local backend: the unbounded desktop
+bootstrap credential would recreate an administrative session on the next
+load. Mobile pairing is a saved-environment flow and has no self-sign-out
+yet.
 
 ### Bearer Access Token
 

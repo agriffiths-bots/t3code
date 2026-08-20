@@ -66,6 +66,7 @@ import {
   parseRemotePairingFields,
   selectQrEndpointOption,
   clientSessionRowAction,
+  currentPrimarySignOutMode,
   type MatrixBridgePairingCode,
 } from "./ConnectionsSettings.logic";
 import {
@@ -889,9 +890,7 @@ type ConnectedClientListRowProps = {
   presentation?: AccessSectionPresentation;
   canManageAccess: boolean;
   revokingClientSessionId: string | null;
-  isSigningOut: boolean;
   onRevokeSession: (sessionId: ServerClientSessionRecord["sessionId"]) => void;
-  onSignOutCurrent: () => void;
 };
 
 const ConnectedClientListRow = memo(function ConnectedClientListRow({
@@ -899,9 +898,7 @@ const ConnectedClientListRow = memo(function ConnectedClientListRow({
   presentation = "current",
   canManageAccess,
   revokingClientSessionId,
-  isSigningOut,
   onRevokeSession,
-  onSignOutCurrent,
 }: ConnectedClientListRowProps) {
   const nowMs = useRelativeTimeTick(1_000);
   const isLive = clientSession.current || clientSession.connected;
@@ -958,16 +955,7 @@ const ConnectedClientListRow = memo(function ConnectedClientListRow({
           </p>
         </div>
         <div className="flex w-full shrink-0 items-center gap-2 sm:w-auto sm:justify-end">
-          {rowAction === "sign-out" ? (
-            <Button
-              size="xs"
-              variant="destructive-outline"
-              disabled={isSigningOut}
-              onClick={() => void onSignOutCurrent()}
-            >
-              {isSigningOut ? "Signing out…" : "Sign out"}
-            </Button>
-          ) : rowAction === "revoke" ? (
+          {rowAction === "revoke" ? (
             <Button
               size="xs"
               variant="destructive-outline"
@@ -1168,10 +1156,8 @@ type PairingClientsListProps = {
   clientSessions: ReadonlyArray<ServerClientSessionRecord>;
   revokingPairingLinkId: string | null;
   revokingClientSessionId: string | null;
-  isSigningOut: boolean;
   onRevokePairingLink: (id: string) => void;
   onRevokeClientSession: (sessionId: ServerClientSessionRecord["sessionId"]) => void;
-  onSignOutCurrent: () => void;
 };
 
 const PairingClientsList = memo(function PairingClientsList({
@@ -1185,10 +1171,8 @@ const PairingClientsList = memo(function PairingClientsList({
   clientSessions,
   revokingPairingLinkId,
   revokingClientSessionId,
-  isSigningOut,
   onRevokePairingLink,
   onRevokeClientSession,
-  onSignOutCurrent,
 }: PairingClientsListProps) {
   return (
     <>
@@ -1212,9 +1196,7 @@ const PairingClientsList = memo(function PairingClientsList({
           presentation={presentation}
           canManageAccess={canManageAccess}
           revokingClientSessionId={revokingClientSessionId}
-          isSigningOut={isSigningOut}
           onRevokeSession={onRevokeClientSession}
-          onSignOutCurrent={onSignOutCurrent}
         />
       ))}
 
@@ -2244,6 +2226,10 @@ export function ConnectionsSettings() {
   );
   const canManageLocalBackend = currentSessionScopes?.includes(AuthAccessWriteScope) ?? false;
   const canManageRelay = currentSessionScopes?.includes(AuthRelayWriteScope) ?? false;
+  const signOutMode = currentPrimarySignOutMode({
+    isDesktop: Boolean(desktopBridge),
+    authenticated: primarySessionState.data?.authenticated === true,
+  });
   const authAccessChanges = useEnvironmentQuery(
     canManageLocalBackend && primaryEnvironmentId !== null
       ? authEnvironment.accessChanges({
@@ -3457,10 +3443,8 @@ export function ConnectionsSettings() {
         clientSessions={desktopClientSessions}
         revokingPairingLinkId={revokingDesktopPairingLinkId}
         revokingClientSessionId={revokingDesktopClientSessionId}
-        isSigningOut={isSigningOutCurrentSession}
         onRevokePairingLink={handleRevokeDesktopPairingLink}
         onRevokeClientSession={handleRevokeDesktopClientSession}
-        onSignOutCurrent={() => void handleSignOutCurrentSession()}
       />
     </>
   );
@@ -3526,15 +3510,25 @@ export function ConnectionsSettings() {
     />
   );
 
+  const renderCurrentDeviceSignOut = () =>
+    signOutMode === "sign-out" ? (
+      <CurrentDeviceSignOutRow
+        isSigningOut={isSigningOutCurrentSession}
+        onSignOut={() => void handleSignOutCurrentSession()}
+      />
+    ) : signOutMode === "desktop-managed" ? (
+      <SettingsRow
+        {...searchableSetting("sign-out")}
+        description="This desktop app signs back in automatically with the local backend. Sign out from a paired browser instead."
+      />
+    ) : null;
+
   return (
     <SettingsPageContainer>
       {canManageLocalBackend ? (
         <>
           <SettingsSection title="This environment">
-            <CurrentDeviceSignOutRow
-              isSigningOut={isSigningOutCurrentSession}
-              onSignOut={() => void handleSignOutCurrentSession()}
-            />
+            {renderCurrentDeviceSignOut()}
             {primaryVersionMismatch || primaryServerUpdateState.status !== "idle" ? (
               <SettingsRow
                 title={
@@ -3882,13 +3876,14 @@ export function ConnectionsSettings() {
         </>
       ) : (
         <SettingsSection title="This environment">
-          <CurrentDeviceSignOutRow
-            isSigningOut={isSigningOutCurrentSession}
-            onSignOut={() => void handleSignOutCurrentSession()}
-          />
+          {renderCurrentDeviceSignOut()}
           <SettingsRow
             title="Administrative access"
-            description="Pairing links and other clients' sessions require the access:write scope for this backend. You can still sign this browser out."
+            description={
+              signOutMode === "sign-out"
+                ? "Pairing links and other clients' sessions require the access:write scope for this backend. You can still sign this browser out."
+                : "Pairing links and other clients' sessions require the access:write scope for this backend."
+            }
           />
           <CloudLinkRow canManageRelay={canManageRelay} />
         </SettingsSection>

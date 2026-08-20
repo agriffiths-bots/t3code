@@ -14,9 +14,9 @@ export type PairRouteDisposition =
 /**
  * Decide what `/pair` should do for the current auth gate and URL credential.
  *
- * An already-signed-in browser that just opened a same-origin pairing link is
- * a deliberate act: redeem the credential and let its scopes replace the
- * current session. Never discard the link silently.
+ * An already-signed-in browser that just opened a same-origin pairing link
+ * reaches the apply surface. That surface requires an explicit click before
+ * the grant replaces the current session. Never discard the link silently.
  */
 export function pairRouteDisposition(input: {
   readonly authStatus: PairRouteAuthStatus;

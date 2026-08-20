@@ -58,9 +58,9 @@ available. You can set another endpoint as the default from the expanded endpoin
 
 If the copied link points directly at `http://192.168.x.y:3773`, open it from a client that can reach that LAN address. If it points at `https://app.t3.codes/pair?...`, the hosted web app will save the environment and connect directly to the backend URL in the link.
 
-Opening a pairing link in a browser that is already signed in applies that link. The new session uses the permissions from the link, replacing the previous session on that browser. If replacement cannot be completed, that browser stays signed in as it was and the link is not applied.
+Opening a pairing link in a browser that is already signed in asks you to apply it. Applying replaces this browser's session with the permissions from the link. If the link grants fewer permissions than you have now, the confirmation says so before you apply. If replacement cannot be completed, that browser stays signed in as it was and the link is not applied.
 
-To sign this browser out without affecting other devices, open **Settings** → **Connections** and choose **Sign out**. That works even when this session cannot create pairing links or manage other clients.
+To sign this browser out without affecting other devices, open **Settings** → **Connections** and choose **Sign out**. That works even when this session cannot create pairing links or manage other clients. The desktop app does not offer Sign out for its local backend, because it would sign itself back in immediately. The mobile app does not yet offer a way to sign this device out of a saved environment.
 
 In the mobile app's **Add Environment** form, a numeric IP address without a scheme uses HTTP. Include `https://` explicitly when the backend is served over HTTPS.
 

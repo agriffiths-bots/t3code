@@ -16,17 +16,35 @@ export function isQrShareableEndpoint(endpoint: AdvertisedEndpoint): boolean {
 }
 
 /**
- * Current-device sign-out is self-service. Administrative revoke of other
- * clients stays behind access:write.
+ * Current-device sign-out lives on the dedicated Sign out row, not on each
+ * authorized-clients row. The list only revokes other clients, and that stays
+ * behind access:write.
  */
 export function clientSessionRowAction(input: {
   readonly isCurrent: boolean;
   readonly canManageAccess: boolean;
-}): "sign-out" | "revoke" | null {
+}): "revoke" | null {
   if (input.isCurrent) {
-    return "sign-out";
+    return null;
   }
   return input.canManageAccess ? "revoke" : null;
+}
+
+/**
+ * Desktop's local backend re-creates an administrative session from the
+ * unbounded bootstrap credential on every load, so Sign out cannot leave the
+ * app signed out. Hide the action there rather than lying. Browsers only get
+ * the action when a primary session is actually authenticated; otherwise the
+ * request 401s and the page reloads in place.
+ */
+export function currentPrimarySignOutMode(input: {
+  readonly isDesktop: boolean;
+  readonly authenticated: boolean;
+}): "sign-out" | "desktop-managed" | "hidden" {
+  if (input.isDesktop) {
+    return "desktop-managed";
+  }
+  return input.authenticated ? "sign-out" : "hidden";
 }
 
 export type QrEndpointOption = {

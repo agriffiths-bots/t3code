@@ -6,11 +6,16 @@
 // environmentCatalog.retryNow before the app navigates off /pair. Without the
 // kick the freshly paired app renders an empty shell (no projects, no
 // websocket) until the user manually reloads the page.
-import { describe, expect, it } from "vite-plus/test";
+import { AuthAdministrativeScopes, AuthStandardClientScopes } from "@t3tools/contracts";
 import type { EnvironmentId } from "@t3tools/contracts";
+import { describe, expect, it } from "vite-plus/test";
 
 import {
+  describeAuthenticatedPairingApply,
   errorMessageFromUnknown,
+  incomingGrantFromPairingLinks,
+  incomingDropsCurrentScopes,
+  isNarrowerAudienceCeiling,
   submitPairingCredentialAndUnblock,
 } from "./PairingRouteSurface.logic";
 
@@ -103,5 +108,123 @@ describe("submitPairingCredentialAndUnblock", () => {
     const error = await submitPairingCredentialAndUnblock(deps, "BADCODE");
 
     expect(error).toBe("Authentication failed.");
+  });
+});
+
+describe("incomingDropsCurrentScopes", () => {
+  it("is true when incoming omits any current scope, even if it also adds scopes", () => {
+    expect(
+      incomingDropsCurrentScopes([...AuthStandardClientScopes], [...AuthAdministrativeScopes]),
+    ).toBe(true);
+    expect(incomingDropsCurrentScopes(["relay:write"], ["access:write"])).toBe(true);
+  });
+
+  it("is false when incoming keeps every current scope", () => {
+    expect(
+      incomingDropsCurrentScopes([...AuthStandardClientScopes], [...AuthStandardClientScopes]),
+    ).toBe(false);
+    expect(
+      incomingDropsCurrentScopes([...AuthAdministrativeScopes], [...AuthStandardClientScopes]),
+    ).toBe(false);
+  });
+});
+
+describe("incomingGrantFromPairingLinks", () => {
+  it("returns the matching grant without consuming it", () => {
+    expect(
+      incomingGrantFromPairingLinks("PAIRME12345", [
+        {
+          credential: "OTHER",
+          scopes: [...AuthAdministrativeScopes],
+          audienceCeiling: "private",
+        },
+        {
+          credential: "PAIRME12345",
+          scopes: [...AuthStandardClientScopes],
+          audienceCeiling: "factory",
+        },
+      ]),
+    ).toEqual({
+      scopes: [...AuthStandardClientScopes],
+      audienceCeiling: "factory",
+    });
+  });
+
+  it("returns null when the credential is not a listed pairing link", () => {
+    expect(incomingGrantFromPairingLinks("PAIRME12345", [])).toBeNull();
+  });
+});
+
+describe("isNarrowerAudienceCeiling", () => {
+  it("treats factory as narrower than private", () => {
+    expect(isNarrowerAudienceCeiling("factory", "private")).toBe(true);
+    expect(isNarrowerAudienceCeiling("private", "private")).toBe(false);
+    expect(isNarrowerAudienceCeiling("factory", "factory")).toBe(false);
+    expect(isNarrowerAudienceCeiling("private", "factory")).toBe(false);
+  });
+});
+
+describe("describeAuthenticatedPairingApply", () => {
+  it("warns plainly when the incoming grant is a strict subset of the current session", () => {
+    const copy = describeAuthenticatedPairingApply({
+      current: { scopes: [...AuthAdministrativeScopes], audienceCeiling: "private" },
+      incoming: { scopes: [...AuthStandardClientScopes], audienceCeiling: "private" },
+    });
+
+    expect(copy.title).toBe("Apply this pairing link?");
+    expect(copy.downgradeWarning).toMatch(/less access/i);
+    expect(copy.downgradeWarning).toMatch(/startup pairing URL/i);
+  });
+
+  it("warns when an incoming grant adds scopes but still drops existing ones", () => {
+    const copy = describeAuthenticatedPairingApply({
+      current: { scopes: ["access:read", "access:write"], audienceCeiling: "private" },
+      incoming: { scopes: ["access:read", "relay:write"], audienceCeiling: "private" },
+    });
+
+    expect(copy.downgradeWarning).toMatch(/less access/i);
+  });
+
+  it("warns when the incoming grant narrows data access even if scopes match", () => {
+    const copy = describeAuthenticatedPairingApply({
+      current: { scopes: [...AuthStandardClientScopes], audienceCeiling: "private" },
+      incoming: { scopes: [...AuthStandardClientScopes], audienceCeiling: "factory" },
+    });
+
+    expect(copy.downgradeWarning).toMatch(/less access/i);
+  });
+
+  it("warns any authenticated session when the incoming grant cannot be inspected", () => {
+    const copy = describeAuthenticatedPairingApply({
+      current: { scopes: [...AuthStandardClientScopes], audienceCeiling: "private" },
+      incoming: null,
+    });
+
+    expect(copy.downgradeWarning).toMatch(/could not confirm/i);
+    expect(copy.downgradeWarning).toMatch(/startup pairing URL/i);
+  });
+
+  it("warns when the current grant cannot be read, including omitted scopes", () => {
+    const copy = describeAuthenticatedPairingApply({
+      current: null,
+      incoming: { scopes: [...AuthStandardClientScopes], audienceCeiling: "factory" },
+    });
+
+    expect(copy.downgradeWarning).toMatch(/could not confirm/i);
+  });
+
+  it("does not warn when both grants are known and the incoming grant is not a downgrade", () => {
+    expect(
+      describeAuthenticatedPairingApply({
+        current: { scopes: [...AuthStandardClientScopes], audienceCeiling: "private" },
+        incoming: { scopes: [...AuthAdministrativeScopes], audienceCeiling: "private" },
+      }).downgradeWarning,
+    ).toBeNull();
+    expect(
+      describeAuthenticatedPairingApply({
+        current: { scopes: [...AuthStandardClientScopes], audienceCeiling: "factory" },
+        incoming: { scopes: [...AuthStandardClientScopes], audienceCeiling: "factory" },
+      }).downgradeWarning,
+    ).toBeNull();
   });
 });
