@@ -760,15 +760,21 @@ export function trackSyncRequests(
 ): TrackedMatrixClient {
   let pending = 0;
   let idle: Deferred.Deferred<void> | null = null;
+  // A sync response is followed, a few microtasks later, by the processing that
+  // writes the cursor and feeds crypto. The response's hold is carried across
+  // that gap so the barrier cannot open inside it.
+  let heldForProcessing = false;
+  let handover = 0;
 
-  const track = <A>(work: Promise<A>): Promise<A> => {
+  const acquire = () => {
     pending += 1;
-    return work.finally(() => {
-      pending -= 1;
-      if (pending > 0 || idle === null) return;
-      Deferred.doneUnsafe(idle, Effect.void);
-      idle = null;
-    });
+  };
+
+  const release = () => {
+    pending -= 1;
+    if (pending > 0 || idle === null) return;
+    Deferred.doneUnsafe(idle, Effect.void);
+    idle = null;
   };
 
   class SyncTrackingMatrixClient extends MatrixClientClass {
@@ -780,7 +786,22 @@ export function trackSyncRequests(
       ...rest: ReadonlyArray<unknown>
     ): Promise<unknown> {
       const call = super.doRequest(method, endpoint, qs, body, ...rest);
-      return endpoint === MATRIX_SYNC_ENDPOINT ? track(call) : call;
+      if (endpoint !== MATRIX_SYNC_ENDPOINT) return call;
+      acquire();
+      return call.finally(() => {
+        heldForProcessing = true;
+        handover += 1;
+        const current = handover;
+        // A macrotask lands after the SDK's own awaits between the response and
+        // `processSync`; this is plain promise plumbing around a callback SDK
+        // rather than Effect-scheduled work.
+        // @effect-diagnostics-next-line globalTimers:off - defers past the SDK's internal awaits.
+        setTimeout(() => {
+          if (handover !== current || !heldForProcessing) return;
+          heldForProcessing = false;
+          release();
+        }, 0);
+      });
     }
 
     /**
@@ -790,13 +811,23 @@ export function trackSyncRequests(
      * the retired loop is still writing to them.
      */
     processSync(raw?: unknown, emitFn?: unknown): Promise<unknown> {
+      if (heldForProcessing) {
+        // Takes over the hold the sync response is still carrying.
+        heldForProcessing = false;
+        handover += 1;
+      } else {
+        acquire();
+      }
       const base = (
         MatrixClientClass.prototype as {
           processSync?: (this: unknown, raw?: unknown, emitFn?: unknown) => Promise<unknown>;
         }
       ).processSync;
-      if (base === undefined) return Promise.resolve(undefined);
-      return track(base.call(this, raw, emitFn));
+      if (base === undefined) {
+        release();
+        return Promise.resolve(undefined);
+      }
+      return base.call(this, raw, emitFn).finally(release);
     }
   }
 
@@ -1342,7 +1373,12 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
           attempt = 0;
           continue;
         }
-        yield* Effect.sleep(reconnectDelayMs(attempt));
+        // An explicit Connect or Disconnect during the backoff is an answer to
+        // the failure, so it is not left waiting out the remaining delay.
+        yield* Effect.raceFirst(
+          Effect.sleep(reconnectDelayMs(attempt)),
+          awaitReconnectSignal(config.cryptoStoreGeneration),
+        );
         attempt += 1;
       }
     });

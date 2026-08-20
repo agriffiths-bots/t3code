@@ -2103,10 +2103,19 @@ const stageMatrixCryptoBindings = Effect.fn("stageMatrixCryptoBindings")(functio
       Effect.mapError(
         (cause) => new MatrixCryptoBindingDownloadError({ url, cause: `${cause._tag}` }),
       ),
+      Effect.option,
     );
-    yield* fs.writeFile(targetPath, bytes);
+    if (Option.isNone(bytes)) {
+      // The packages are optional by design: a build must still produce an
+      // artifact, with the bridge reporting encryption unavailable on it.
+      yield* Effect.logWarning(
+        `[desktop-artifact] Could not download ${target.fileName}; the packaged bridge will report Matrix encryption unavailable for ${target.platform}-${target.arch}.`,
+      );
+      continue;
+    }
+    yield* fs.writeFile(targetPath, bytes.value);
     yield* Effect.log(
-      `[desktop-artifact] Staged Matrix crypto binding ${target.fileName} (${bytes.byteLength} bytes).`,
+      `[desktop-artifact] Staged Matrix crypto binding ${target.fileName} (${bytes.value.byteLength} bytes).`,
     );
   }
 });
