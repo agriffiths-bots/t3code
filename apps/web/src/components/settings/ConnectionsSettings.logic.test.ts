@@ -8,6 +8,7 @@ import {
   EMPTY_MATRIX_BRIDGE_DRAFT,
   matrixBridgeDraftAfterConfigure,
   matrixBridgeDraftFromSavedConfig,
+  matrixBridgeHydration,
   matrixBridgeSectionAccess,
   matrixBridgeStatusLabel,
   parseMatrixBridgeConfigureInput,
@@ -321,6 +322,97 @@ describe("Matrix bridge connection form", () => {
 
   it("leaves the form blank when no bridge is configured", () => {
     expect(matrixBridgeDraftFromSavedConfig(null)).toEqual(EMPTY_MATRIX_BRIDGE_DRAFT);
+  });
+
+  it("repopulates an untouched form, once per saved connection", () => {
+    const saved = {
+      homeserverUrl: "https://matrix.example.test/",
+      allowedUserIds: ["@you:beeper.com"],
+      roomId: "!room:example.test",
+    } as const;
+    const first = matrixBridgeHydration({
+      saved,
+      draft: EMPTY_MATRIX_BRIDGE_DRAFT,
+      hydratedKey: null,
+    });
+    expect(first?.draft).toEqual({
+      homeserverUrl: "https://matrix.example.test/",
+      accessToken: "",
+      allowedUserIds: "@you:beeper.com",
+    });
+
+    // The same answer arriving again must not fight the operator.
+    expect(
+      matrixBridgeHydration({
+        saved,
+        draft: EMPTY_MATRIX_BRIDGE_DRAFT,
+        hydratedKey: first?.key ?? null,
+      }),
+    ).toBeNull();
+  });
+
+  it("repopulates again after a reconfigure, which is what the refetch delivers", () => {
+    const before = matrixBridgeHydration({
+      saved: {
+        homeserverUrl: "https://old.example.test/",
+        allowedUserIds: ["@you:beeper.com"],
+        roomId: null,
+      },
+      draft: EMPTY_MATRIX_BRIDGE_DRAFT,
+      hydratedKey: null,
+    });
+    // Reopening Settings after connecting: the form is blank again, and the
+    // saved connection the server now holds is a different one.
+    const after = matrixBridgeHydration({
+      saved: {
+        homeserverUrl: "https://new.example.test/",
+        allowedUserIds: ["@you:beeper.com", "@phone:beeper.com"],
+        roomId: "!room:example.test",
+      },
+      draft: EMPTY_MATRIX_BRIDGE_DRAFT,
+      hydratedKey: before?.key ?? null,
+    });
+    expect(after?.draft).toEqual({
+      homeserverUrl: "https://new.example.test/",
+      accessToken: "",
+      allowedUserIds: "@you:beeper.com\n@phone:beeper.com",
+    });
+  });
+
+  it("never overwrites what the operator has typed, and waits for an answer", () => {
+    const saved = {
+      homeserverUrl: "https://matrix.example.test/",
+      allowedUserIds: ["@you:beeper.com"],
+      roomId: null,
+    } as const;
+    const whileTyping = matrixBridgeHydration({
+      saved,
+      draft: { ...EMPTY_MATRIX_BRIDGE_DRAFT, homeserverUrl: "https://typing.example" },
+      hydratedKey: null,
+    });
+    expect(whileTyping?.draft).toBeNull();
+    expect(
+      matrixBridgeHydration({
+        saved,
+        draft: { ...EMPTY_MATRIX_BRIDGE_DRAFT, accessToken: "syt_typed" },
+        hydratedKey: null,
+      })?.draft,
+    ).toBeNull();
+
+    // Seen while typing counts as seen: clearing the form afterwards leaves it
+    // clear rather than inviting that connection back on the next refetch.
+    expect(
+      matrixBridgeHydration({
+        saved,
+        draft: EMPTY_MATRIX_BRIDGE_DRAFT,
+        hydratedKey: whileTyping?.key ?? null,
+      }),
+    ).toBeNull();
+
+    // No saved connection to read, or none readable by this session.
+    expect(
+      matrixBridgeHydration({ saved: null, draft: EMPTY_MATRIX_BRIDGE_DRAFT, hydratedKey: null }),
+    ).toBeNull();
   });
 
   it("clears the token after a successful connect and keeps the readable fields", () => {

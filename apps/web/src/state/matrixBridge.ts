@@ -13,8 +13,9 @@ import {
   type MatrixBridgeStatus,
   type ScopedThreadRef,
 } from "@t3tools/contracts";
+import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
-import { AsyncResult, Atom } from "effect/unstable/reactivity";
+import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
 
 import { environmentCatalog } from "../connection/catalog";
 import { connectionAtomRuntime } from "../connection/runtime";
@@ -38,21 +39,6 @@ import { environmentSession } from "./session";
  * subscription needs `orchestration:read`. The bot access token is write-only:
  * it goes out with `configure` and is never returned by any of these calls.
  */
-export const matrixBridgeEnvironment = {
-  configure: createEnvironmentRpcCommand(connectionAtomRuntime, {
-    label: "environment-data:matrix-bridge:configure",
-    tag: WS_METHODS.matrixBridgeConfigure,
-  }),
-  disconnect: createEnvironmentRpcCommand(connectionAtomRuntime, {
-    label: "environment-data:matrix-bridge:disconnect",
-    tag: WS_METHODS.matrixBridgeDisconnect,
-  }),
-  setOwner: createEnvironmentRpcCommand(connectionAtomRuntime, {
-    label: "environment-data:matrix-bridge:set-owner",
-    tag: WS_METHODS.matrixBridgeSetOwner,
-  }),
-};
-
 /**
  * The saved connection, for repopulating the Connections form after a reload.
  * A session without `access:read` simply fails this query and keeps the blank
@@ -64,6 +50,41 @@ export const matrixBridgeSavedConfig = createEnvironmentRpcQueryAtomFamily(conne
   staleTimeMs: 5_000,
   idleTtlMs: 60_000,
 });
+
+/**
+ * Invalidates one environment's saved connection.
+ *
+ * The query is read through `matrixBridgeStatesAtom`, which every bridge
+ * control subscribes to, so it stays mounted for the life of the app and its
+ * cached answer would otherwise outlive the change that made it wrong.
+ */
+const refreshSavedConfig = (
+  environmentId: EnvironmentId,
+  registry: AtomRegistry.AtomRegistry,
+): Effect.Effect<void> =>
+  Effect.sync(() => {
+    registry.refresh(matrixBridgeSavedConfig({ environmentId, input: {} }));
+  });
+
+export const matrixBridgeEnvironment = {
+  // Both writes change what `getConfig` would answer, so both refetch it here
+  // rather than in a caller: a form opened later must not hydrate from the
+  // connection this replaced or removed.
+  configure: createEnvironmentRpcCommand(connectionAtomRuntime, {
+    label: "environment-data:matrix-bridge:configure",
+    tag: WS_METHODS.matrixBridgeConfigure,
+    onSuccess: ({ environmentId }, registry) => refreshSavedConfig(environmentId, registry),
+  }),
+  disconnect: createEnvironmentRpcCommand(connectionAtomRuntime, {
+    label: "environment-data:matrix-bridge:disconnect",
+    tag: WS_METHODS.matrixBridgeDisconnect,
+    onSuccess: ({ environmentId }, registry) => refreshSavedConfig(environmentId, registry),
+  }),
+  setOwner: createEnvironmentRpcCommand(connectionAtomRuntime, {
+    label: "environment-data:matrix-bridge:set-owner",
+    tag: WS_METHODS.matrixBridgeSetOwner,
+  }),
+};
 
 /** The saved connection when one is readable, and nothing otherwise. */
 export function matrixBridgeSavedConfigView(

@@ -53,7 +53,7 @@ import {
   activeMatrixBridgePairingCode,
   applyWslEnableSelection,
   EMPTY_MATRIX_BRIDGE_DRAFT,
-  matrixBridgeDraftFromSavedConfig,
+  matrixBridgeHydration,
   isQrShareableEndpoint,
   matrixBridgeDraftAfterConfigure,
   matrixBridgeConnectionMode,
@@ -1758,21 +1758,28 @@ function MatrixBridgeSection({
   });
   const savedConfig = useMatrixBridgeSavedConfig(environmentId);
   const [draft, setDraft] = useState(EMPTY_MATRIX_BRIDGE_DRAFT);
-  // Repopulated once from what the server has saved, so a reload shows the
-  // connection this environment is on rather than a blank form. Anything the
-  // operator has typed wins: hydration stops at the first edit.
-  const hydratedFrom = useRef<string | null>(null);
+  // Repopulated from what the server has saved, so a reload shows the
+  // connection this environment is on rather than a blank form. Configure and
+  // disconnect refetch that answer, so a reconfigure repopulates too. This
+  // section is keyed by environment, so the marker below starts empty for each
+  // one without being reset here.
+  const hydratedKey = useRef<string | null>(null);
   useEffect(() => {
-    if (savedConfig === null) return;
-    const key = `${environmentId}:${savedConfig.homeserverUrl}:${savedConfig.allowedUserIds.join(",")}`;
-    if (hydratedFrom.current === key) return;
-    hydratedFrom.current = key;
-    setDraft((current) =>
-      current.homeserverUrl === "" && current.allowedUserIds === "" && current.accessToken === ""
-        ? matrixBridgeDraftFromSavedConfig(savedConfig)
-        : current,
-    );
-  }, [environmentId, savedConfig]);
+    // Computed from committed state and applied here, never inside the state
+    // updater: React replays updaters, which would consume the marker below
+    // while discarding the draft it goes with.
+    const hydration = matrixBridgeHydration({
+      saved: savedConfig,
+      draft,
+      hydratedKey: hydratedKey.current,
+    });
+    if (hydration === null) return;
+    // Seen either way: a connection skipped because the operator was typing
+    // must not come back and overwrite a form they have since cleared.
+    hydratedKey.current = hydration.key;
+    if (hydration.draft !== null) setDraft(hydration.draft);
+  }, [draft, savedConfig]);
+
   const [formError, setFormError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [pairingCode, setPairingCode] = useState<MatrixBridgePairingCode | null>(null);
