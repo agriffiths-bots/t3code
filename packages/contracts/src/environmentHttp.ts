@@ -87,6 +87,8 @@ export type EnvironmentOperationForbiddenReason = typeof EnvironmentOperationFor
 export const EnvironmentInternalErrorReason = Schema.Literals([
   "bootstrap_validation_failed",
   "browser_session_issuance_failed",
+  "browser_session_replacement_failed",
+  "browser_session_replacement_reverted",
   "browser_session_cookie_failed",
   "access_token_issuance_failed",
   "websocket_ticket_issuance_failed",
@@ -401,6 +403,13 @@ export class EnvironmentAuthHttpApi extends HttpApiGroup.make("auth")
       success: AuthSessionState,
       error: [EnvironmentInternalError],
     }),
+  )
+  .add(
+    HttpApiEndpoint.post("signOut", "/api/auth/session/sign-out", {
+      headers: OptionalBearerHeaders,
+      success: AuthClientSessionRevokeResult,
+      error: [EnvironmentInternalError],
+    }).middleware(EnvironmentAuthenticatedAuth),
   )
   .add(
     HttpApiEndpoint.post("browserSession", "/api/auth/browser-session", {

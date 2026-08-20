@@ -1,25 +1,31 @@
 import { createFileRoute, redirect, useNavigate } from "@tanstack/react-router";
 
 import {
+  AuthenticatedPairingApplySurface,
+  DesktopLocalPairingSurface,
   HostedPairingRouteSurface,
   PairingPendingSurface,
   PairingRouteSurface,
 } from "../components/auth/PairingRouteSurface";
+import { peekPairingTokenFromUrl } from "../environments/primary";
+import { pairRouteDisposition } from "./pair.logic";
 
 export const Route = createFileRoute("/pair")({
   beforeLoad: async ({ context }) => {
     const { authGateState } = context;
-    if (authGateState.status === "hosted-pairing") {
-      return {
-        authGateState,
-      };
-    }
+    const disposition = pairRouteDisposition({
+      authStatus: authGateState.status,
+      pairingToken: peekPairingTokenFromUrl(),
+      isDesktop: window.desktopBridge !== undefined,
+    });
 
-    if (authGateState.status === "authenticated" || authGateState.status === "hosted-static") {
+    if (disposition === "redirect-home") {
       throw redirect({ to: "/", replace: true });
     }
+
     return {
       authGateState,
+      pairDisposition: disposition,
     };
   },
   component: PairRouteView,
@@ -27,23 +33,44 @@ export const Route = createFileRoute("/pair")({
 });
 
 function PairRouteView() {
-  const { authGateState } = Route.useRouteContext();
+  const { authGateState, pairDisposition } = Route.useRouteContext();
   const navigate = useNavigate();
 
   if (!authGateState) {
     return null;
   }
 
-  if (authGateState.status === "hosted-pairing") {
+  if (pairDisposition === "hosted-pairing" || authGateState.status === "hosted-pairing") {
     return <HostedPairingRouteSurface />;
+  }
+
+  const goHome = () => {
+    void navigate({ to: "/", replace: true });
+  };
+
+  if (pairDisposition === "desktop-local-session") {
+    return <DesktopLocalPairingSurface onContinue={goHome} />;
+  }
+
+  if (pairDisposition === "apply-pairing-credential" || authGateState.status === "authenticated") {
+    return (
+      <AuthenticatedPairingApplySurface
+        onAuthenticated={() => {
+          window.location.replace("/");
+        }}
+        onContinueWithoutApplying={goHome}
+      />
+    );
+  }
+
+  if (authGateState.status !== "requires-auth") {
+    return null;
   }
 
   return (
     <PairingRouteSurface
       auth={authGateState.auth}
-      onAuthenticated={() => {
-        void navigate({ to: "/", replace: true });
-      }}
+      onAuthenticated={goHome}
       {...(authGateState.errorMessage ? { initialErrorMessage: authGateState.errorMessage } : {})}
     />
   );

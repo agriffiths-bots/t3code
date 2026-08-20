@@ -18,7 +18,7 @@ OAuth-style scope strings:
 | `terminal:operate`      | Create, attach, input, resize, clear, restart, and terminate terminals.  |
 | `review:write`          | Read review diff previews used to compose review feedback.               |
 | `access:read`           | Inspect pairing links and client sessions.                               |
-| `access:write`          | Create or revoke pairing links and client sessions.                      |
+| `access:write`          | Create or revoke pairing links and other clients' sessions.              |
 | `relay:read`            | Inspect managed relay connectivity.                                      |
 | `relay:write`           | Link, configure, or unlink managed relay connectivity.                   |
 
@@ -35,7 +35,31 @@ credentials additionally grant `access:read access:write relay:write`.
 `POST /api/auth/browser-session` consumes a one-time bootstrap credential and creates a
 browser session cookie. The cookie is an HTTP transport adapter for the same
 scoped session model; the response never exposes the session secret to browser
-JavaScript.
+JavaScript. Opening a pairing link in a browser that already has a session
+reaches an apply surface that requires an explicit click. After that click, the
+grant's scopes replace that browser's session. Replacement is fail-closed: the
+previous cookie-backed session must be revoked and its live sockets signaled
+before the new cookie is installed. If displacement cannot be confirmed, the
+request fails, the original session stays usable, and nothing is replaced.
+Bearer and DPoP sessions on the same request are left alone. The desktop app
+does not offer pairing replacement against its local backend session: the
+primary transport is the main-process bearer, so applying a cookie would
+consume the link and report success without changing the live session. It is
+not an upgrade-only merge.
+
+`POST /api/auth/session/sign-out` revokes the caller's own session and expires
+the browser session cookie. It does not require `access:write`. Administrative
+revoke of other clients remains on `POST /api/auth/clients/revoke`. Desktop
+does not offer this action for its local backend: the unbounded desktop
+bootstrap credential would recreate an administrative session on the next
+load. Mobile pairing is a saved-environment flow and has no self-sign-out
+yet.
+
+Revoking a session closes every live WebSocket bound to that session. RPC
+authorization also re-reads the live session, so a draining socket cannot keep
+revoked access or previously captured scopes. Pairing replacement uses the same
+path: the previous cookie session is revoked, its sockets are closed, and a
+weaker grant cannot keep serving the old permissions.
 
 ### Bearer Access Token
 

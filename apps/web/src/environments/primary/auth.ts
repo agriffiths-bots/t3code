@@ -33,6 +33,7 @@ const PrimaryEnvironmentRequestOperation = Schema.Literals([
   "list-client-sessions",
   "revoke-client-session",
   "revoke-other-client-sessions",
+  "sign-out-current-session",
 ]);
 type PrimaryEnvironmentRequestOperation = typeof PrimaryEnvironmentRequestOperation.Type;
 
@@ -81,8 +82,54 @@ export class PrimaryEnvironmentPairingCredentialRejectedError extends Schema.Tag
   }
 }
 
+export class PrimaryEnvironmentPairingCredentialConsumedError extends Schema.TaggedErrorClass<PrimaryEnvironmentPairingCredentialConsumedError>()(
+  "PrimaryEnvironmentPairingCredentialConsumedError",
+  {
+    providedLength: Schema.Number,
+    cause: Schema.Defect(),
+  },
+) {
+  override get message(): string {
+    return "That pairing link has already been used. Get a new pairing link and try again.";
+  }
+}
+
+export class PrimaryEnvironmentSessionReplacementError extends Schema.TaggedErrorClass<PrimaryEnvironmentSessionReplacementError>()(
+  "PrimaryEnvironmentSessionReplacementError",
+  {
+    cause: Schema.Defect(),
+  },
+) {
+  override get message(): string {
+    return "Could not replace the existing session, nothing changed.";
+  }
+}
+
+export class PrimaryEnvironmentSessionReplacementRevertedError extends Schema.TaggedErrorClass<PrimaryEnvironmentSessionReplacementRevertedError>()(
+  "PrimaryEnvironmentSessionReplacementRevertedError",
+  {
+    cause: Schema.Defect(),
+  },
+) {
+  override get message(): string {
+    return "Could not replace the existing session. This browser kept its current session, but the pairing link was used up. Get a new pairing link if you still need to replace it.";
+  }
+}
+
+export const isPrimaryEnvironmentSessionReplacementError = Schema.is(
+  PrimaryEnvironmentSessionReplacementError,
+);
+
+export const isPrimaryEnvironmentSessionReplacementRevertedError = Schema.is(
+  PrimaryEnvironmentSessionReplacementRevertedError,
+);
+
 export const isPrimaryEnvironmentPairingCredentialRejectedError = Schema.is(
   PrimaryEnvironmentPairingCredentialRejectedError,
+);
+
+export const isPrimaryEnvironmentPairingCredentialConsumedError = Schema.is(
+  PrimaryEnvironmentPairingCredentialConsumedError,
 );
 
 export class PrimaryEnvironmentAuthSessionTimeoutError extends Schema.TaggedErrorClass<PrimaryEnvironmentAuthSessionTimeoutError>()(
@@ -247,6 +294,34 @@ async function exchangeBootstrapCredential(credential: string): Promise<AuthBrow
       ) {
         throw new PrimaryEnvironmentPairingCredentialRejectedError({
           providedLength: credential.length,
+          cause: error,
+        });
+      }
+      if (
+        isEnvironmentHttpCommonError(error) &&
+        error._tag === "EnvironmentAuthInvalidError" &&
+        error.reason === "consumed_credential"
+      ) {
+        throw new PrimaryEnvironmentPairingCredentialConsumedError({
+          providedLength: credential.length,
+          cause: error,
+        });
+      }
+      if (
+        isEnvironmentHttpCommonError(error) &&
+        error._tag === "EnvironmentInternalError" &&
+        error.reason === "browser_session_replacement_failed"
+      ) {
+        throw new PrimaryEnvironmentSessionReplacementError({
+          cause: error,
+        });
+      }
+      if (
+        isEnvironmentHttpCommonError(error) &&
+        error._tag === "EnvironmentInternalError" &&
+        error.reason === "browser_session_replacement_reverted"
+      ) {
+        throw new PrimaryEnvironmentSessionReplacementRevertedError({
           cause: error,
         });
       }
@@ -512,6 +587,29 @@ export async function revokeOtherServerClientSessions(): Promise<number> {
       cause: error,
     });
   }
+}
+
+export async function signOutCurrentServerSession(): Promise<void> {
+  try {
+    await runPrimaryHttp(
+      PrimaryEnvironmentHttpClient.pipe(
+        Effect.flatMap((client) => client.auth.signOut({ headers: {} })),
+      ),
+    );
+  } catch (error) {
+    const wrapped = isPrimaryEnvironmentRequestError(error)
+      ? error
+      : PrimaryEnvironmentRequestError.fromCause({
+          operation: "sign-out-current-session",
+          cause: error,
+        });
+    if (wrapped.status !== 401) {
+      throw wrapped;
+    }
+  }
+
+  resolvedAuthenticatedGateState = null;
+  bootstrapPromise = null;
 }
 
 export async function resolveInitialServerAuthGateState(): Promise<ServerAuthGateState> {

@@ -8,10 +8,12 @@ import {
   type AuthBrowserSessionResult,
   type AuthCreatePairingCredentialInput,
   type AuthEnvironmentScope,
+  type AuthClientSessionRevokeResult,
   type AuthPairingCredentialResult,
   type AuthSessionState,
   type ExecutionEnvironmentDescriptor,
   type EnvironmentAuthInvalidError,
+  EnvironmentInternalError,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import type * as Context from "effect/Context";
@@ -26,7 +28,10 @@ import { __setPrimaryHttpRunnerForTests } from "../src/lib/runtime";
 
 type BrowserSessionHandler = (
   payload: AuthBrowserSessionRequest,
-) => Effect.Effect<AuthBrowserSessionResult, EnvironmentAuthInvalidError>;
+) => Effect.Effect<
+  AuthBrowserSessionResult,
+  EnvironmentAuthInvalidError | EnvironmentInternalError
+>;
 
 interface EnvironmentHttpTestScenario {
   readonly descriptor?: () => Effect.Effect<ExecutionEnvironmentDescriptor>;
@@ -35,6 +40,7 @@ interface EnvironmentHttpTestScenario {
   readonly pairingCredential?: (
     payload: AuthCreatePairingCredentialInput,
   ) => Effect.Effect<AuthPairingCredentialResult>;
+  readonly signOut?: () => Effect.Effect<AuthClientSessionRevokeResult>;
 }
 
 export interface EnvironmentHttpTestCalls {
@@ -42,6 +48,7 @@ export interface EnvironmentHttpTestCalls {
   session: number;
   browserSession: Array<AuthBrowserSessionRequest>;
   pairingCredential: Array<AuthCreatePairingCredentialInput>;
+  signOut: number;
 }
 
 const unexpectedEndpoint = (endpoint: string) =>
@@ -67,6 +74,7 @@ export async function installEnvironmentHttpTest(scenario: EnvironmentHttpTestSc
     session: 0,
     browserSession: [],
     pairingCredential: [],
+    signOut: 0,
   };
 
   const client = await Effect.runPromise(
@@ -116,7 +124,14 @@ export async function installEnvironmentHttpTest(scenario: EnvironmentHttpTestSc
             .handle("revokePairingLink", () => unexpectedEndpoint("auth.revokePairingLink"))
             .handle("clients", () => unexpectedEndpoint("auth.clients"))
             .handle("revokeClient", () => unexpectedEndpoint("auth.revokeClient"))
-            .handle("revokeOtherClients", () => unexpectedEndpoint("auth.revokeOtherClients")),
+            .handle("revokeOtherClients", () => unexpectedEndpoint("auth.revokeOtherClients"))
+            .handle(
+              "signOut",
+              Effect.fn("test.environment.auth.signOut")(function* () {
+                calls.signOut += 1;
+                return yield* scenario.signOut?.() ?? unexpectedEndpoint("auth.signOut");
+              }),
+            ),
         ),
       ]),
       Effect.provideService(EnvironmentAuthenticatedAuth, authenticatedAuth),

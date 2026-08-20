@@ -68,6 +68,14 @@ describe("searchSettings", () => {
   it("serves anchor props to panels from the catalog", () => {
     expect(searchableSetting("word-wrap")).toEqual({ id: "word-wrap", title: "Word wrap" });
     expect(searchableSetting("archive")).toEqual({ id: "archive", title: "Archived threads" });
+    expect(searchableSetting("sign-out")).toEqual({ id: "sign-out", title: "Sign out" });
+  });
+
+  it("routes sign out to Connections", () => {
+    expect(searchSettings("sign out")[0]).toMatchObject({
+      id: "sign-out",
+      to: "/settings/connections",
+    });
   });
 
   it("routes appearance settings to their current section", () => {

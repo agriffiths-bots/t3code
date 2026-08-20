@@ -6,6 +6,8 @@ import { APP_DISPLAY_NAME } from "../../branding";
 import { environmentCatalog } from "../../connection/catalog";
 import { connectPairing } from "../../connection/onboarding";
 import {
+  fetchSessionState,
+  listServerPairingLinks,
   peekPairingTokenFromUrl,
   stripPairingTokenFromUrl,
   submitServerAuthCredential,
@@ -16,7 +18,12 @@ import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { useAtomCommand } from "../../state/use-atom-command";
 import {
+  describeAuthenticatedPairingApply,
+  describeAuthenticatedPairingFailure,
   errorMessageFromUnknown,
+  incomingGrantFromPairingLinks,
+  type PairingApplyFailureKind,
+  type PairingGrantView,
   submitPairingCredentialAndUnblock,
 } from "./PairingRouteSurface.logic";
 
@@ -39,6 +46,36 @@ export function PairingPendingSurface() {
         <p className="mt-2 text-sm leading-relaxed text-muted-foreground">
           Validating the pairing link and preparing your session.
         </p>
+      </section>
+    </div>
+  );
+}
+
+export function DesktopLocalPairingSurface({ onContinue }: { onContinue: () => void }) {
+  return (
+    <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-background px-4 py-10 text-foreground sm:px-6">
+      <div className="pointer-events-none absolute inset-0 opacity-80">
+        <div className="absolute inset-x-0 top-0 h-44 bg-[radial-gradient(44rem_16rem_at_top,color-mix(in_srgb,var(--color-emerald-500)_14%,transparent),transparent)]" />
+        <div className="absolute inset-y-0 left-0 w-72 bg-[radial-gradient(28rem_18rem_at_left,color-mix(in_srgb,var(--color-sky-500)_10%,transparent),transparent)]" />
+        <div className="absolute inset-0 bg-[linear-gradient(145deg,color-mix(in_srgb,var(--background)_90%,var(--color-black))_0%,var(--background)_55%)]" />
+      </div>
+
+      <section className="relative w-full max-w-xl rounded-2xl border border-border/80 bg-card/90 p-6 shadow-2xl shadow-black/20 backdrop-blur-md sm:p-8">
+        <p className="text-[11px] font-semibold tracking-[0.18em] text-muted-foreground uppercase">
+          {APP_DISPLAY_NAME}
+        </p>
+        <h1 className="mt-3 text-2xl font-semibold tracking-tight sm:text-3xl">
+          This desktop app stays signed in
+        </h1>
+        <p className="mt-2 text-sm leading-relaxed text-muted-foreground">
+          Pairing links are for other devices and browsers. Applying one here would not replace this
+          app's local session, so the link was not used.
+        </p>
+        <div className="mt-6">
+          <Button type="button" onClick={onContinue}>
+            Continue
+          </Button>
+        </div>
       </section>
     </div>
   );
@@ -85,7 +122,7 @@ export function PairingRouteSurface({
       setIsSubmitting(false);
 
       if (submitError) {
-        setErrorMessage(submitError);
+        setErrorMessage(submitError.message);
         return;
       }
 
@@ -176,6 +213,192 @@ export function PairingRouteSurface({
 
         <div className="mt-6 rounded-lg border border-border/70 bg-background/55 px-3 py-3 text-xs leading-relaxed text-muted-foreground">
           {describeSupportedMethods(auth.bootstrapMethods)}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+export function AuthenticatedPairingApplySurface({
+  onAuthenticated,
+  onContinueWithoutApplying,
+}: {
+  onAuthenticated: () => void;
+  onContinueWithoutApplying: () => void;
+}) {
+  const autoPairTokenRef = useRef<string | null>(peekPairingTokenFromUrl());
+  const [credential] = useState(() => autoPairTokenRef.current ?? "");
+  const [currentGrant, setCurrentGrant] = useState<PairingGrantView | null>(null);
+  const [incomingGrant, setIncomingGrant] = useState<PairingGrantView | null>(null);
+  const [scopeProbeReady, setScopeProbeReady] = useState(credential.length === 0);
+  const [errorMessage, setErrorMessage] = useState(() =>
+    credential.length > 0 ? "" : "This pairing link is missing its token.",
+  );
+  const [applyFailure, setApplyFailure] = useState<{
+    readonly kind: PairingApplyFailureKind;
+    readonly stillAuthenticated: boolean;
+  } | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const strippedUrlRef = useRef(false);
+  const primaryEnvironmentId = usePrimaryEnvironmentId();
+  const primaryEnvironmentIdRef = useRef(primaryEnvironmentId);
+  primaryEnvironmentIdRef.current = primaryEnvironmentId;
+  const retryPrimaryEnvironment = useAtomCommand(environmentCatalog.retryNow, {
+    reportFailure: false,
+  });
+  const copy = describeAuthenticatedPairingApply({
+    current: currentGrant,
+    incoming: incomingGrant,
+  });
+  const failureCopy =
+    applyFailure !== null
+      ? describeAuthenticatedPairingFailure(applyFailure)
+      : errorMessage && credential.length === 0
+        ? {
+            title: "Pairing link was not applied",
+            explanation: "This pairing link is missing its token.",
+            retryLabel: null,
+            continueLabel: "Continue with current session",
+          }
+        : null;
+
+  const submitCredential = useCallback(
+    async (nextCredential: string) => {
+      setIsSubmitting(true);
+      setErrorMessage("");
+      setApplyFailure(null);
+
+      const submitError = await submitPairingCredentialAndUnblock(
+        {
+          submitServerAuthCredential,
+          retryPrimaryEnvironment,
+          getPrimaryEnvironmentId: () => primaryEnvironmentIdRef.current,
+          errorMessageFromUnknown,
+        },
+        nextCredential,
+      );
+
+      if (submitError) {
+        let stillAuthenticated = true;
+        try {
+          const session = await fetchSessionState();
+          stillAuthenticated = session.authenticated;
+        } catch {
+          // Pairing errors on this surface keep or restore the original cookie.
+          // A probe failure must not claim the browser was signed out.
+        }
+        setErrorMessage(submitError.message);
+        setApplyFailure({ kind: submitError.kind, stillAuthenticated });
+        setIsSubmitting(false);
+        return;
+      }
+
+      setIsSubmitting(false);
+
+      startTransition(() => {
+        onAuthenticated();
+      });
+    },
+    [onAuthenticated, retryPrimaryEnvironment],
+  );
+
+  useEffect(() => {
+    if (strippedUrlRef.current) {
+      return;
+    }
+    strippedUrlRef.current = true;
+    stripPairingTokenFromUrl();
+  }, []);
+
+  useEffect(() => {
+    if (credential.length === 0) {
+      return;
+    }
+
+    let cancelled = false;
+    void (async () => {
+      const [sessionResult, linksResult] = await Promise.allSettled([
+        fetchSessionState(),
+        listServerPairingLinks(),
+      ]);
+      if (cancelled) {
+        return;
+      }
+      if (
+        sessionResult.status === "fulfilled" &&
+        sessionResult.value.authenticated &&
+        sessionResult.value.scopes !== undefined &&
+        sessionResult.value.audienceCeiling !== undefined
+      ) {
+        setCurrentGrant({
+          scopes: sessionResult.value.scopes,
+          audienceCeiling: sessionResult.value.audienceCeiling,
+        });
+      }
+      if (linksResult.status === "fulfilled") {
+        setIncomingGrant(incomingGrantFromPairingLinks(credential, linksResult.value));
+      }
+      setScopeProbeReady(true);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [credential]);
+
+  return (
+    <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-background px-4 py-10 text-foreground sm:px-6">
+      <div className="pointer-events-none absolute inset-0 opacity-80">
+        <div className="absolute inset-x-0 top-0 h-44 bg-[radial-gradient(44rem_16rem_at_top,color-mix(in_srgb,var(--color-emerald-500)_14%,transparent),transparent)]" />
+        <div className="absolute inset-y-0 left-0 w-72 bg-[radial-gradient(28rem_18rem_at_left,color-mix(in_srgb,var(--color-sky-500)_10%,transparent),transparent)]" />
+        <div className="absolute inset-0 bg-[linear-gradient(145deg,color-mix(in_srgb,var(--background)_90%,var(--color-black))_0%,var(--background)_55%)]" />
+      </div>
+
+      <section className="relative w-full max-w-xl rounded-2xl border border-border/80 bg-card/90 p-6 shadow-2xl shadow-black/20 backdrop-blur-md sm:p-8">
+        <p className="text-[11px] font-semibold tracking-[0.18em] text-muted-foreground uppercase">
+          {APP_DISPLAY_NAME}
+        </p>
+        <h1 className="mt-3 text-2xl font-semibold tracking-tight sm:text-3xl">
+          {failureCopy?.title ?? copy.title}
+        </h1>
+        <p className="mt-2 text-sm leading-relaxed text-muted-foreground">
+          {failureCopy?.explanation ?? copy.explanation}
+        </p>
+
+        {scopeProbeReady && copy.downgradeWarning ? (
+          <div className="mt-5 rounded-lg border border-destructive/30 bg-destructive/6 px-3 py-2 text-sm text-destructive">
+            {copy.downgradeWarning}
+          </div>
+        ) : null}
+
+        {errorMessage ? (
+          <div className="mt-5 rounded-lg border border-destructive/30 bg-destructive/6 px-3 py-2 text-sm text-destructive">
+            {errorMessage}
+          </div>
+        ) : null}
+
+        <div className="mt-6 flex flex-wrap gap-2">
+          {credential.length > 0 && failureCopy?.retryLabel !== null ? (
+            <Button
+              size="sm"
+              disabled={isSubmitting || !scopeProbeReady}
+              onClick={() => void submitCredential(credential)}
+            >
+              {isSubmitting
+                ? "Pairing..."
+                : !scopeProbeReady
+                  ? "Checking permissions..."
+                  : (failureCopy?.retryLabel ?? "Apply this link")}
+            </Button>
+          ) : null}
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={isSubmitting}
+            onClick={onContinueWithoutApplying}
+          >
+            {failureCopy?.continueLabel ?? "Continue with current session"}
+          </Button>
         </div>
       </section>
     </div>

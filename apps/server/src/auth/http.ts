@@ -74,9 +74,8 @@ const appendDpopChallengeOnUnauthorized = (error: EnvironmentAuthInvalidError) =
     return yield* error;
   });
 
-function browserSessionCookieOptions(input: {
+function browserSessionCookieAttributeOptions(input: {
   readonly request: HttpServerRequest.HttpServerRequest;
-  readonly expiresAt: DateTime.Utc;
   readonly hostedOrigins: ReadonlySet<string>;
 }) {
   const hostedOrigin =
@@ -86,12 +85,39 @@ function browserSessionCookieOptions(input: {
       trustedOrigins: input.hostedOrigins,
     });
   return {
-    expires: DateTime.toDate(input.expiresAt),
     httpOnly: true,
     path: "/",
     sameSite: hostedOrigin ? ("none" as const) : ("lax" as const),
     ...(hostedOrigin ? { secure: true } : {}),
   };
+}
+
+function browserSessionCookieOptions(input: {
+  readonly request: HttpServerRequest.HttpServerRequest;
+  readonly expiresAt: DateTime.Utc;
+  readonly hostedOrigins: ReadonlySet<string>;
+}) {
+  return {
+    ...browserSessionCookieAttributeOptions(input),
+    expires: DateTime.toDate(input.expiresAt),
+  };
+}
+
+function expireBrowserSessionCookies(input: {
+  readonly request: HttpServerRequest.HttpServerRequest;
+  readonly cookieNames: ReadonlyArray<string>;
+  readonly hostedOrigins: ReadonlySet<string>;
+}) {
+  return Effect.gen(function* () {
+    const options = browserSessionCookieAttributeOptions(input);
+    let cookies = Cookies.empty;
+    for (const cookieName of input.cookieNames) {
+      cookies = yield* Effect.fromResult(Cookies.expireCookie(cookies, cookieName, options)).pipe(
+        Effect.catch(() => failEnvironmentInternal("client_session_revoke_failed")),
+      );
+    }
+    return cookies;
+  });
 }
 
 export function configuredCookieAuthCsrfOrigins(config: ServerConfig.ServerConfig["Service"]) {
@@ -227,6 +253,100 @@ export function failEnvironmentInternal(reason: EnvironmentInternalErrorReason, 
   });
 }
 
+type CookieDisplacementOutcome =
+  | { readonly _tag: "displaced" }
+  | { readonly _tag: "kept"; readonly error: unknown };
+
+// Pairing replacement consumes the one-time credential first so concurrent
+// applies cannot both revoke live sessions. If displacement then cannot
+// finish, the just-created session is rolled back and the original cookie
+// stays. Persist-ok plus later MCP cleanup failure is still displacement
+// success: the previous session is gone, so the new cookie must be installed.
+const displacePreviousCookieSession = Effect.fn("environment.auth.displacePreviousCookieSession")(
+  function* (input: {
+    readonly sessions: SessionStore.SessionStore["Service"];
+    readonly serverAuth: EnvironmentAuth.EnvironmentAuth["Service"];
+    readonly sessionId: EnvironmentAuth.AuthenticatedSession["sessionId"];
+  }): Effect.fn.Return<CookieDisplacementOutcome> {
+    const interruptError = yield* input.sessions.interruptSockets(input.sessionId).pipe(
+      Effect.as(null),
+      Effect.catchIf(SessionStore.isSessionCredentialInternalError, (error) =>
+        Effect.succeed(error),
+      ),
+    );
+    if (interruptError !== null) {
+      return { _tag: "kept", error: interruptError };
+    }
+
+    const revokeError = yield* input.serverAuth.revokeSession(input.sessionId).pipe(
+      Effect.as(null),
+      Effect.catchIf(EnvironmentAuth.isServerAuthInternalError, (error) => Effect.succeed(error)),
+    );
+    if (revokeError === null) {
+      return { _tag: "displaced" };
+    }
+
+    const previousStillActive = yield* input.sessions.getActive(input.sessionId).pipe(
+      Effect.map(Option.isSome),
+      Effect.catchIf(SessionStore.isSessionCredentialInternalError, (error) =>
+        Effect.logWarning(
+          "Could not confirm whether pairing displacement persisted; keeping the original session",
+        ).pipe(
+          Effect.annotateLogs({
+            sessionId: input.sessionId,
+            cause: error,
+          }),
+          Effect.as(true),
+        ),
+      ),
+    );
+    if (previousStillActive) {
+      return { _tag: "kept", error: revokeError };
+    }
+
+    yield* Effect.logWarning("Pairing displacement persisted; MCP credential cleanup failed").pipe(
+      Effect.annotateLogs({
+        sessionId: input.sessionId,
+        cause: revokeError,
+      }),
+    );
+    return { _tag: "displaced" };
+  },
+);
+
+const rollBackIssuedBrowserSession = Effect.fn("environment.auth.rollBackIssuedBrowserSession")(
+  function* (input: {
+    readonly sessions: SessionStore.SessionStore["Service"];
+    readonly serverAuth: EnvironmentAuth.EnvironmentAuth["Service"];
+    readonly sessionToken: string;
+  }) {
+    const issued = yield* input.sessions
+      .verify(input.sessionToken)
+      .pipe(
+        Effect.catch((error) =>
+          Effect.logWarning("Failed to read a pairing session for rollback").pipe(
+            Effect.annotateLogs({ cause: error }),
+            Effect.as(null),
+          ),
+        ),
+      );
+    if (issued === null) {
+      return;
+    }
+
+    yield* input.serverAuth.revokeSession(issued.sessionId).pipe(
+      Effect.catch((error) =>
+        Effect.logWarning("Failed to roll back a pairing session after displacement failure").pipe(
+          Effect.annotateLogs({
+            sessionId: issued.sessionId,
+            cause: error,
+          }),
+        ),
+      ),
+    );
+  },
+);
+
 export const requireEnvironmentScope = Effect.fn("environment.auth.requireScope")(function* (
   scope: AuthEnvironmentScope,
 ) {
@@ -294,11 +414,50 @@ export const authHttpApiLayer = HttpApiBuilder.group(
         ),
       )
       .handle(
+        "signOut",
+        Effect.fn("environment.auth.signOut")(
+          function* (args) {
+            yield* annotateEnvironmentRequest(args.endpoint.name);
+            const session = yield* EnvironmentAuthenticatedPrincipal;
+            const revoked = yield* serverAuth.revokeSession(session.sessionId);
+            const request = yield* HttpServerRequest.HttpServerRequest;
+            const expiredCookies = yield* expireBrowserSessionCookies({
+              request,
+              cookieNames: sessions.cookieNames,
+              hostedOrigins,
+            });
+            yield* HttpEffect.appendPreResponseHandler((_request, response) =>
+              Effect.succeed(HttpServerResponse.mergeCookies(response, expiredCookies)),
+            );
+            yield* appendCredentialResponseHeaders;
+            return { revoked };
+          },
+          Effect.catchIf(EnvironmentAuth.isServerAuthInternalError, (error) =>
+            failEnvironmentInternal("client_session_revoke_failed", error),
+          ),
+        ),
+      )
+      .handle(
         "browserSession",
         Effect.fn("environment.auth.browserSession")(
           function* (args) {
             yield* annotateEnvironmentRequest(args.endpoint.name);
             const request = yield* HttpServerRequest.HttpServerRequest;
+            // Replacement is a security boundary. Fail closed unless the
+            // previous cookie session is confirmed gone: do not install a cookie
+            // when the existing session cannot be read, its live sockets cannot
+            // be signaled, or it cannot be revoked. Create first so the
+            // one-time credential is the reservation: a concurrent loser never
+            // displaces. If displacement then fails, roll the new session back
+            // so the original cookie stays and no unreachable session remains.
+            const previousSession = yield* serverAuth.authenticateHttpRequest(request).pipe(
+              Effect.catchIf(EnvironmentAuth.isServerAuthCredentialError, () =>
+                Effect.succeed(null),
+              ),
+              Effect.catchIf(EnvironmentAuth.isServerAuthInternalError, (error) =>
+                failEnvironmentInternal("browser_session_replacement_failed", error),
+              ),
+            );
             const result = yield* serverAuth.createBrowserSession(
               args.payload.credential,
               deriveAuthClientMetadata({ request }),
@@ -314,7 +473,33 @@ export const authHttpApiLayer = HttpApiBuilder.group(
                   hostedOrigins,
                 }),
               ),
-            ).pipe(Effect.catch(() => failEnvironmentInternal("browser_session_cookie_failed")));
+            ).pipe(
+              Effect.catch(() =>
+                rollBackIssuedBrowserSession({
+                  sessions,
+                  serverAuth,
+                  sessionToken: result.sessionToken,
+                }).pipe(Effect.andThen(failEnvironmentInternal("browser_session_cookie_failed"))),
+              ),
+            );
+            if (previousSession !== null && previousSession.method === "browser-session-cookie") {
+              const displacement = yield* displacePreviousCookieSession({
+                sessions,
+                serverAuth,
+                sessionId: previousSession.sessionId,
+              });
+              if (displacement._tag === "kept") {
+                yield* rollBackIssuedBrowserSession({
+                  sessions,
+                  serverAuth,
+                  sessionToken: result.sessionToken,
+                });
+                return yield* failEnvironmentInternal(
+                  "browser_session_replacement_reverted",
+                  displacement.error,
+                );
+              }
+            }
 
             yield* HttpEffect.appendPreResponseHandler((_request, response) =>
               Effect.succeed(HttpServerResponse.mergeCookies(response, sessionCookies)),

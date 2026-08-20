@@ -16,6 +16,8 @@ import {
   parseRemotePairingHostChange,
   parseRemotePairingFields,
   showMatrixBridgeDisconnect,
+  clientSessionRowAction,
+  currentPrimarySignOutMode,
 } from "./ConnectionsSettings.logic";
 
 const baseWslState: DesktopWslState = {
@@ -163,6 +165,34 @@ describe("remote pairing field parsing", () => {
         cloudflareAccessClientId: "client-id",
       }),
     ).toThrowError("Enter both Cloudflare Access service token fields.");
+  });
+});
+
+describe("clientSessionRowAction", () => {
+  it("does not duplicate Sign out on the current-device client row", () => {
+    expect(clientSessionRowAction({ isCurrent: true, canManageAccess: false })).toBeNull();
+    expect(clientSessionRowAction({ isCurrent: true, canManageAccess: true })).toBeNull();
+  });
+
+  it("scope-gates revoking other sessions behind access:write", () => {
+    expect(clientSessionRowAction({ isCurrent: false, canManageAccess: true })).toBe("revoke");
+    expect(clientSessionRowAction({ isCurrent: false, canManageAccess: false })).toBeNull();
+  });
+});
+
+describe("currentPrimarySignOutMode", () => {
+  it("hides Sign out on desktop because the local backend would sign back in", () => {
+    expect(currentPrimarySignOutMode({ isDesktop: true, authenticated: true })).toBe(
+      "desktop-managed",
+    );
+    expect(currentPrimarySignOutMode({ isDesktop: true, authenticated: false })).toBe(
+      "desktop-managed",
+    );
+  });
+
+  it("offers Sign out only when a browser session is actually authenticated", () => {
+    expect(currentPrimarySignOutMode({ isDesktop: false, authenticated: true })).toBe("sign-out");
+    expect(currentPrimarySignOutMode({ isDesktop: false, authenticated: false })).toBe("hidden");
   });
 });
 
