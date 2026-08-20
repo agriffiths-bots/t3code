@@ -9,6 +9,10 @@ packages:
 # true = allowed to run build scripts; false mirrors the pnpm 10 behavior
 # where anything outside onlyBuiltDependencies was silently not built.
 allowBuilds:
+  # Downloads the pinned Matrix crypto binding for the host platform. Blocking
+  # it installs the package without its .node, which the bridge can only read
+  # as "encryption unavailable".
+  "@matrix-org/matrix-sdk-crypto-nodejs": true
   browser-tabs-lock: false
   bufferutil: false
   core-js: false
@@ -98,6 +102,10 @@ overrides:
   "@effect/vitest": "catalog:"
   "@effect/vitest>vitest": "-"
   "@expo/metro-config": 56.0.14
+  # The Matrix SDK is bundled for its JavaScript alone; its native binding is a
+  # direct optional dependency of the server instead, so a platform without a
+  # prebuilt binding degrades the bridge rather than failing every install.
+  "matrix-bot-sdk>@matrix-org/matrix-sdk-crypto-nodejs": "-"
   "@pierre/diffs>@shikijs/transformers": ^4.2.0
   "@types/node": "catalog:"
   effect: "catalog:"

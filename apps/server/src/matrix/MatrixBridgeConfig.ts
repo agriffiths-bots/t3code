@@ -182,6 +182,15 @@ function normalizeConfigureInput(input: MatrixBridgeConfigureInput): Effect.Effe
   });
 }
 
+/**
+ * Transport lifecycle reported by the Matrix client adapter. `unavailable`
+ * carries an operator-facing reason only: never a token, room, message body, or
+ * native failure detail.
+ */
+export type MatrixBridgeTransportState =
+  | { readonly state: "ready" }
+  | { readonly state: "unavailable"; readonly reason: string };
+
 export class MatrixBridgeConfig extends Context.Service<
   MatrixBridgeConfig,
   {
@@ -204,6 +213,20 @@ export class MatrixBridgeConfig extends Context.Service<
       readonly ownerThreadId: ThreadId;
       readonly ownershipEpoch: MatrixBridgeConfigV1["ownershipEpoch"];
     }) => Effect.Effect<MatrixBridgeStatus, MatrixBridgeOperationError>;
+    /**
+     * Binds the encrypted room the transport created or verified to the
+     * connection that produced it. A generation mismatch means the connection is
+     * stale, so the caller must abandon the room rather than adopt it.
+     */
+    readonly recordRoomIfMatches: (expected: {
+      readonly cryptoStoreGeneration: MatrixBridgeConfigV1["cryptoStoreGeneration"];
+      readonly roomId: string;
+    }) => Effect.Effect<boolean, MatrixBridgeOperationError>;
+    /** Publishes transport lifecycle for one connection generation. */
+    readonly reportTransportStateIfMatches: (expected: {
+      readonly cryptoStoreGeneration: MatrixBridgeConfigV1["cryptoStoreGeneration"];
+      readonly transport: MatrixBridgeTransportState;
+    }) => Effect.Effect<boolean>;
     readonly initializeDeliveryCheckpointIfMissing: (expected: {
       readonly ownerThreadId: ThreadId;
       readonly ownershipEpoch: MatrixBridgeConfigV1["ownershipEpoch"];
@@ -428,6 +451,75 @@ export const make = Effect.gen(function* () {
       ),
   );
 
+  const recordRoomIfMatches = Effect.fn("MatrixBridgeConfig.recordRoomIfMatches")(
+    (expected: {
+      readonly cryptoStoreGeneration: MatrixBridgeConfigV1["cryptoStoreGeneration"];
+      readonly roomId: string;
+    }) =>
+      mutationSemaphore.withPermits(1)(
+        Effect.gen(function* () {
+          const current = Option.getOrNull(yield* Ref.get(configRef));
+          if (
+            current === null ||
+            current.cryptoStoreGeneration !== expected.cryptoStoreGeneration
+          ) {
+            return false;
+          }
+          // A different room on the same generation means two transports raced
+          // or the stored room was replaced; refuse rather than silently move.
+          if (current.roomId !== null) return current.roomId === expected.roomId;
+
+          const next: MatrixBridgeConfigV1 = { ...current, roomId: expected.roomId };
+          return yield* Effect.uninterruptible(
+            Effect.gen(function* () {
+              yield* persist(next);
+              yield* Ref.set(configRef, Option.some(next));
+              return true;
+            }),
+          );
+        }),
+      ),
+  );
+
+  const reportTransportStateIfMatches = Effect.fn(
+    "MatrixBridgeConfig.reportTransportStateIfMatches",
+  )(
+    (expected: {
+      readonly cryptoStoreGeneration: MatrixBridgeConfigV1["cryptoStoreGeneration"];
+      readonly transport: MatrixBridgeTransportState;
+    }) =>
+      mutationSemaphore.withPermits(1)(
+        Effect.gen(function* () {
+          const current = Option.getOrNull(yield* Ref.get(configRef));
+          if (
+            current === null ||
+            current.cryptoStoreGeneration !== expected.cryptoStoreGeneration
+          ) {
+            return false;
+          }
+
+          // Pairing and inbound activation land in a later change, so a ready
+          // transport is connected and encrypted but not yet usable.
+          const nextStatus: MatrixBridgeStatus =
+            expected.transport.state === "ready"
+              ? {
+                  state: current.pairing.state === "paired" ? "active" : "waiting-for-member",
+                  ownerThreadId: current.ownerThreadId,
+                  encryptionReady: true,
+                  reason: null,
+                }
+              : {
+                  state: "unavailable",
+                  ownerThreadId: current.ownerThreadId,
+                  encryptionReady: false,
+                  reason: expected.transport.reason,
+                };
+          yield* SubscriptionRef.set(statusRef, nextStatus);
+          return true;
+        }),
+      ),
+  );
+
   const initializeDeliveryCheckpointIfMissing = Effect.fn(
     "MatrixBridgeConfig.initializeDeliveryCheckpointIfMissing",
   )(
@@ -555,6 +647,8 @@ export const make = Effect.gen(function* () {
     disconnect,
     setOwner,
     clearOwnerIfMatches,
+    recordRoomIfMatches,
+    reportTransportStateIfMatches,
     initializeDeliveryCheckpointIfMissing,
     markDeliveredIfMatches,
     reportPermanentSendFailureIfMatches,

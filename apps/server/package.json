@@ -48,7 +48,11 @@
     "@types/web-push": "^3.6.4",
     "effect-acp": "workspace:*",
     "effect-codex-app-server": "workspace:*",
+    "matrix-bot-sdk": "0.8.0",
     "vite-plus": "catalog:"
+  },
+  "optionalDependencies": {
+    "@matrix-org/matrix-sdk-crypto-nodejs": "0.4.0"
   },
   "engines": {
     "node": "^22.16 || ^23.11 || >=24.10"

@@ -51,22 +51,6 @@ export class MatrixBridgeClient extends Context.Service<
   }
 >()("t3/matrix/MatrixBridgeClient") {}
 
-/**
- * Production placeholder until the encrypted SDK adapter lands in PR2.
- * It is intentionally not a fake: it never accepts traffic or records data.
- */
-export const unavailableLayer = Layer.succeed(MatrixBridgeClient, {
-  listen: () => Effect.never,
-  sendText: () =>
-    Effect.fail(
-      new MatrixBridgeClientError({
-        operation: "send",
-        reason: "Encrypted Matrix transport is unavailable.",
-        retryability: "permanent",
-      }),
-    ),
-});
-
 export interface FakeMatrixBridgeClient {
   readonly layer: Layer.Layer<MatrixBridgeClient>;
   readonly attempts: Effect.Effect<ReadonlyArray<MatrixBridgeOutboundText>>;

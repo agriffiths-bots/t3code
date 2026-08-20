@@ -37,6 +37,7 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { Command, Flag } from "effect/unstable/cli";
+import { FetchHttpClient, HttpClient, HttpClientResponse } from "effect/unstable/http";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
 const LINUX_ICON_SIZES = [16, 22, 24, 32, 48, 64, 128, 256, 512] as const;
@@ -482,6 +483,30 @@ export class WslNodePtyPrebuildMissingError extends Schema.TaggedErrorClass<WslN
   }
 }
 
+export class MatrixCryptoBindingDownloadError extends Schema.TaggedErrorClass<MatrixCryptoBindingDownloadError>()(
+  "MatrixCryptoBindingDownloadError",
+  {
+    url: Schema.String,
+    cause: Schema.String,
+  },
+) {
+  override get message(): string {
+    return `Could not download the Matrix crypto binding from ${this.url}.`;
+  }
+}
+
+export class MatrixCryptoManifestReadError extends Schema.TaggedErrorClass<MatrixCryptoManifestReadError>()(
+  "MatrixCryptoManifestReadError",
+  {
+    manifestPath: Schema.String,
+    cause: Schema.Defect(),
+  },
+) {
+  override get message(): string {
+    return `Could not read the Matrix crypto package version from ${this.manifestPath}.`;
+  }
+}
+
 export class WslNodePtyManifestReadError extends Schema.TaggedErrorClass<WslNodePtyManifestReadError>()(
   "WslNodePtyManifestReadError",
   {
@@ -671,6 +696,7 @@ interface StagePackageJson {
   readonly main: string;
   readonly build: Record<string, unknown>;
   readonly dependencies: Record<string, unknown>;
+  readonly optionalDependencies: Record<string, unknown>;
   readonly devDependencies: {
     readonly electron: string;
   };
@@ -685,7 +711,23 @@ const FFI_RS_VERSION = "1.3.2";
 export const DESKTOP_AFTER_PACK_HOOK_STAGE_PATH = "desktop-after-pack-prune.mjs";
 export const DESKTOP_ASAR_UNPACK_BASE = ["apps/server/dist/**"] as const;
 export const MOCK_UPDATE_SERVER_HOST = "127.0.0.1";
-export const DESKTOP_UNPACKED_FILE_LIMIT = 250;
+/**
+ * Budget for loose files beside the archive, not a security gate: it exists to
+ * catch a dependency tree being unpacked by accident, which is a four-figure
+ * mistake rather than a handful of files.
+ *
+ * Measured composition of a Windows package, which unpacks its whole
+ * `node_modules` for the WSL backend: playwright-core 107, @ff-labs/fff-node
+ * 26, node-pty 24, @anthropic-ai/claude-agent-sdk 16, @clerk/electron-passkeys
+ * 6, @matrix-org/matrix-sdk-crypto-nodejs 5, ffi-rs and fff-bin binaries 10,
+ * pnpm metadata 2, server bundle 53. That is about 251, of which the Matrix
+ * bridge accounts for six: a binding for the primary backend, a second for the
+ * Linux one WSL runs, the package's loader and manifest, its licence, and the
+ * packed SDK module beside the server bundle. Raised from 250, which the set
+ * above no longer fits, to 300 so the guard keeps its purpose with room for
+ * ordinary growth.
+ */
+export const DESKTOP_UNPACKED_FILE_LIMIT = 300;
 export const DESKTOP_NATIVE_ASAR_UNPACK_PACKAGE_PATTERNS = [
   "@anthropic-ai/claude-agent-sdk-*",
   "@clerk/electron-passkeys",
@@ -695,6 +737,18 @@ export const DESKTOP_NATIVE_ASAR_UNPACK_PACKAGE_PATTERNS = [
   "@msgpackr-extract/*",
   "@yuuang/ffi-rs-*",
   "ffi-rs",
+] as const;
+/**
+ * The binding is dlopen'd, which cannot read an asar, and its small loader goes
+ * with it so the Windows WSL backend, running plain Linux node outside the
+ * archive, can require the package at all. Nothing else from it is unpacked,
+ * and the SDK that requires it is packed into the server bundle rather than
+ * staged as a package.
+ */
+export const DESKTOP_MATRIX_CRYPTO_ASAR_UNPACK_PATTERNS = [
+  "@matrix-org/matrix-sdk-crypto-nodejs/package.json",
+  "@matrix-org/matrix-sdk-crypto-nodejs/index.js",
+  "@matrix-org/matrix-sdk-crypto-nodejs/*.node",
 ] as const;
 export const DESKTOP_NODE_PTY_ASAR_UNPACK_PATTERNS = [
   "node-pty/LICENSE",
@@ -715,6 +769,31 @@ export const DESKTOP_STAGED_RUNTIME_DEPENDENCY_NAMES = [
   "node-pty",
   "playwright-core",
 ] as const;
+/**
+ * Staged as optional so a Matrix crypto download failure degrades the bridge to
+ * unavailable instead of failing the desktop build. The SDK that loads this
+ * binding is not staged: it is packed into the server bundle, because its
+ * dependency tree would otherwise put thousands of loose files into an
+ * artifact that unpacks its whole `node_modules` for the WSL backend.
+ */
+/**
+ * The Matrix crypto package fetches its binding from a postinstall script and
+ * depends on two packages solely for that download. The artifact stages the
+ * bindings itself, so the script is turned off here and those packages are
+ * dropped: a Windows package unpacks its whole `node_modules`, where they would
+ * cost thirty files and load nothing.
+ */
+export const DESKTOP_STAGE_DISABLED_BUILD_SCRIPTS: Record<string, boolean> = {
+  "@matrix-org/matrix-sdk-crypto-nodejs": false,
+};
+export const DESKTOP_STAGE_DROPPED_DEPENDENCIES: Record<string, string> = {
+  "@matrix-org/matrix-sdk-crypto-nodejs>https-proxy-agent": "-",
+  "@matrix-org/matrix-sdk-crypto-nodejs>node-downloader-helper": "-",
+};
+
+export const DESKTOP_STAGED_OPTIONAL_RUNTIME_DEPENDENCY_NAMES = [
+  "@matrix-org/matrix-sdk-crypto-nodejs",
+] as const;
 
 function toAsarUnpackPackagePatterns(packagePattern: string): readonly string[] {
   return [
@@ -731,6 +810,7 @@ export const DESKTOP_ASAR_UNPACK = [
   ...DESKTOP_ASAR_UNPACK_BASE,
   ...DESKTOP_NATIVE_ASAR_UNPACK_PACKAGE_PATTERNS.flatMap(toAsarUnpackPackagePatterns),
   ...DESKTOP_NODE_PTY_ASAR_UNPACK_PATTERNS.flatMap(toAsarUnpackPathPatterns),
+  ...DESKTOP_MATRIX_CRYPTO_ASAR_UNPACK_PATTERNS.flatMap(toAsarUnpackPathPatterns),
 ] as const;
 
 export function createDesktopPackageBuildEnv(
@@ -1747,6 +1827,26 @@ export function resolveStagedRuntimeDependencies(input: {
   return resolveCatalogDependencies(dependencySpecs, input.catalog, "desktop staged runtime");
 }
 
+/** Mirrors the server's optional dependencies into the staged app manifest. */
+export function resolveStagedOptionalRuntimeDependencies(input: {
+  readonly serverOptionalDependencies: Record<string, string> | undefined;
+  readonly catalog: Record<string, string>;
+}): Record<string, string> {
+  const dependencySpecs: Record<string, string> = {};
+  const manifest = input.serverOptionalDependencies ?? {};
+
+  for (const packageName of DESKTOP_STAGED_OPTIONAL_RUNTIME_DEPENDENCY_NAMES) {
+    const dependencySpec = manifest[packageName];
+    if (dependencySpec !== undefined) dependencySpecs[packageName] = dependencySpec;
+  }
+
+  return resolveCatalogDependencies(
+    dependencySpecs,
+    input.catalog,
+    "desktop staged optional runtime",
+  );
+}
+
 export const resolveGitHubPublishConfig = Effect.fn("resolveGitHubPublishConfig")(function* (
   updateChannel: "latest" | "nightly",
 ) {
@@ -1955,6 +2055,114 @@ const assertPlatformBuildResources = Effect.fn("assertPlatformBuildResources")(f
 // checks (arch + node-pty version; the binary is N-API, hence ABI-stable across
 // Node versions). A missing prebuild is a warning, not an error, so local and
 // non-Windows builds still succeed — they just won't ship a working WSL backend.
+export interface MatrixCryptoBindingTarget {
+  readonly platform: "darwin" | "linux" | "win32";
+  readonly arch: "arm64" | "x64";
+  readonly fileName: string;
+}
+
+const MATRIX_CRYPTO_PACKAGE_NAME = "@matrix-org/matrix-sdk-crypto-nodejs";
+const decodeMatrixCryptoManifest = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(Schema.Struct({ version: Schema.String })),
+);
+
+function matrixCryptoBindingFileName(
+  platform: MatrixCryptoBindingTarget["platform"],
+  arch: MatrixCryptoBindingTarget["arch"],
+): string {
+  if (platform === "win32") return `matrix-sdk-crypto.win32-${arch}-msvc.node`;
+  if (platform === "darwin") return `matrix-sdk-crypto.darwin-${arch}.node`;
+  return `matrix-sdk-crypto.linux-${arch}-gnu.node`;
+}
+
+/**
+ * The Matrix crypto package's postinstall downloads the *host* binding, so a
+ * cross-architecture build would ship one the packaged server cannot load.
+ * These are the bindings the artifact must hold instead: the build target, plus
+ * the matching Linux one for Windows, whose WSL backend runs Linux Node.
+ */
+export function resolveMatrixCryptoBindingTargets(
+  platform: typeof BuildPlatform.Type,
+  arch: typeof BuildArch.Type,
+): ReadonlyArray<MatrixCryptoBindingTarget> {
+  const architectures = arch === "universal" ? (["arm64", "x64"] as const) : ([arch] as const);
+  const platforms: ReadonlyArray<MatrixCryptoBindingTarget["platform"]> =
+    platform === "mac" ? ["darwin"] : platform === "win" ? ["win32", "linux"] : ["linux"];
+
+  return platforms.flatMap((targetPlatform) =>
+    architectures.map((targetArch) => ({
+      platform: targetPlatform,
+      arch: targetArch,
+      fileName: matrixCryptoBindingFileName(targetPlatform, targetArch),
+    })),
+  );
+}
+
+export const MATRIX_CRYPTO_RELEASE_BASE_URL =
+  "https://github.com/matrix-org/matrix-rust-sdk-crypto-nodejs/releases/download";
+
+export function matrixCryptoBindingUrl(version: string, fileName: string): string {
+  return `${MATRIX_CRYPTO_RELEASE_BASE_URL}/v${version}/${fileName}`;
+}
+
+/**
+ * Fetches each target's binding from the pinned release.
+ *
+ * The package's own postinstall downloader is not reused for this: it picks the
+ * Linux flavour by inspecting the *running* process, so a Windows host staging
+ * the WSL binding would ask for musl and, on arm64, refuse outright.
+ */
+const stageMatrixCryptoBindings = Effect.fn("stageMatrixCryptoBindings")(function* (input: {
+  readonly stageAppDir: string;
+  readonly platform: typeof BuildPlatform.Type;
+  readonly arch: typeof BuildArch.Type;
+}) {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const httpClient = yield* HttpClient.HttpClient;
+
+  const packageLink = path.join(input.stageAppDir, "node_modules", MATRIX_CRYPTO_PACKAGE_NAME);
+  const packageDir = yield* fs.realPath(packageLink).pipe(Effect.orElseSucceed(() => packageLink));
+  const manifestPath = path.join(packageDir, "package.json");
+  if (!(yield* fs.exists(manifestPath).pipe(Effect.orElseSucceed(() => false)))) {
+    // The package is optional: without it the packaged bridge reports Matrix
+    // encryption unavailable, which is the intended fail-closed behaviour.
+    yield* Effect.logWarning(
+      "[desktop-artifact] Matrix crypto package is not staged; the packaged bridge will report encryption unavailable.",
+    );
+    return;
+  }
+  const manifest = yield* decodeMatrixCryptoManifest(yield* fs.readFileString(manifestPath)).pipe(
+    Effect.mapError((cause) => new MatrixCryptoManifestReadError({ manifestPath, cause })),
+  );
+
+  for (const target of resolveMatrixCryptoBindingTargets(input.platform, input.arch)) {
+    const targetPath = path.join(packageDir, target.fileName);
+    const url = matrixCryptoBindingUrl(manifest.version, target.fileName);
+    const bytes = yield* httpClient.get(url).pipe(
+      Effect.flatMap(HttpClientResponse.filterStatusOk),
+      Effect.flatMap((response) => response.arrayBuffer),
+      Effect.map((buffer) => new Uint8Array(buffer)),
+      Effect.mapError(
+        (cause) => new MatrixCryptoBindingDownloadError({ url, cause: `${cause._tag}` }),
+      ),
+      Effect.option,
+    );
+    if (Option.isNone(bytes)) {
+      // The packages are optional by design: a build must still produce an
+      // artifact, with the bridge reporting encryption unavailable on it.
+      yield* Effect.logWarning(
+        `[desktop-artifact] Could not download ${target.fileName}; the packaged bridge will report Matrix encryption unavailable for ${target.platform}-${target.arch}.`,
+      );
+      continue;
+    }
+    yield* fs.writeFile(targetPath, bytes.value);
+    yield* Effect.log(
+      `[desktop-artifact] Staged Matrix crypto binding ${target.fileName} (${bytes.value.byteLength} bytes).`,
+    );
+  }
+});
+
 const stageWslNodePtyPrebuild = Effect.fn("stageWslNodePtyPrebuild")(function* (input: {
   readonly stageAppDir: string;
   readonly arch: typeof BuildArch.Type;
@@ -2067,6 +2275,20 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
       new DesktopBuildDependencyResolutionError({
         kind: "desktop-runtime",
         manifestPath: "apps/desktop/package.json + apps/server/package.json",
+        cause,
+      }),
+  });
+
+  const resolvedStagedOptionalRuntimeDependencies = yield* Effect.try({
+    try: () =>
+      resolveStagedOptionalRuntimeDependencies({
+        serverOptionalDependencies: serverPackageJson.optionalDependencies,
+        catalog: workspaceCatalog,
+      }),
+    catch: (cause) =>
+      new DesktopBuildDependencyResolutionError({
+        kind: "desktop-runtime",
+        manifestPath: "apps/server/package.json",
         cause,
       }),
   });
@@ -2243,10 +2465,10 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
         }
       : {}),
   };
-  const stagePatchedDependencies = createStagePatchedDependencies(
-    workspacePatchedDependencies,
-    stageDependencies,
-  );
+  const stagePatchedDependencies = createStagePatchedDependencies(workspacePatchedDependencies, {
+    ...stageDependencies,
+    ...resolvedStagedOptionalRuntimeDependencies,
+  });
   const stagePackageJson: StagePackageJson = {
     name: "t3code",
     version: appVersion,
@@ -2273,6 +2495,7 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
       path.join(stageAppDir, DESKTOP_AFTER_PACK_HOOK_STAGE_PATH),
     ),
     dependencies: stageDependencies,
+    optionalDependencies: resolvedStagedOptionalRuntimeDependencies,
     devDependencies: {
       electron: electronVersion,
     },
@@ -2283,9 +2506,9 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
   const stageWorkspaceConfig = createStageWorkspaceConfig({
     platform: options.platform,
     arch: options.arch,
-    allowBuilds: workspaceAllowBuilds,
+    allowBuilds: { ...workspaceAllowBuilds, ...DESKTOP_STAGE_DISABLED_BUILD_SCRIPTS },
     patchedDependencies: stagePatchedDependencies,
-    overrides: resolvedOverrides,
+    overrides: { ...resolvedOverrides, ...DESKTOP_STAGE_DROPPED_DEPENDENCIES },
   });
   const stageWorkspaceConfigString = yield* encodeStageWorkspaceConfig(stageWorkspaceConfig);
   yield* fs.writeFileString(
@@ -2307,6 +2530,11 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
     { label: "vp install --prod", verbose: options.verbose },
   );
   yield* stageClerkPasskeyNativeBinaries(stageAppDir, options.platform, options.arch);
+  yield* stageMatrixCryptoBindings({
+    stageAppDir,
+    platform: options.platform,
+    arch: options.arch,
+  });
 
   // WSL is Windows-only, so only the Windows artifact carries the Linux backend
   // binary; other platforms ignore the prebuild input.
@@ -2480,7 +2708,11 @@ const buildDesktopArtifactCli = Command.make("build-desktop-artifact", {
   Command.withHandler((input) => Effect.flatMap(resolveBuildOptions(input), buildDesktopArtifact)),
 );
 
-const cliRuntimeLayer = Layer.mergeAll(Logger.layer([Logger.consolePretty()]), NodeServices.layer);
+const cliRuntimeLayer = Layer.mergeAll(
+  Logger.layer([Logger.consolePretty()]),
+  NodeServices.layer,
+  FetchHttpClient.layer,
+);
 
 if (import.meta.main) {
   Command.run(buildDesktopArtifactCli, { version: "0.0.0" }).pipe(

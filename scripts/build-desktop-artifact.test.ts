@@ -40,6 +40,12 @@ import {
   resolveMacPasskeySigningConfiguration,
   resolveDesktopRuntimeDependencies,
   resolveStagedRuntimeDependencies,
+  matrixCryptoBindingUrl,
+  DESKTOP_STAGED_OPTIONAL_RUNTIME_DEPENDENCY_NAMES,
+  DESKTOP_STAGE_DISABLED_BUILD_SCRIPTS,
+  DESKTOP_STAGE_DROPPED_DEPENDENCIES,
+  resolveMatrixCryptoBindingTargets,
+  resolveStagedOptionalRuntimeDependencies,
   resolveFfiRsNativeDependencies,
   resolveFffNativeDependencies,
   resolveClaudeAgentNativeDependencies,
@@ -281,6 +287,89 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
     );
   });
 
+  it("stages the optional Matrix bridge packages as optional dependencies", () => {
+    assert.deepStrictEqual(
+      resolveStagedOptionalRuntimeDependencies({
+        serverOptionalDependencies: { "@matrix-org/matrix-sdk-crypto-nodejs": "0.4.0" },
+        catalog: {},
+      }),
+      { "@matrix-org/matrix-sdk-crypto-nodejs": "0.4.0" },
+    );
+    assert.deepStrictEqual(
+      resolveStagedOptionalRuntimeDependencies({
+        serverOptionalDependencies: undefined,
+        catalog: {},
+      }),
+      {},
+    );
+  });
+
+  it("keeps the Matrix crypto package's install-time dependencies out of the stage", () => {
+    // Its postinstall downloads a binding, which the artifact stages itself, so
+    // the script and the two packages it needs are dropped: a Windows package
+    // unpacks its whole node_modules, where they would cost thirty files.
+    assert.deepStrictEqual(DESKTOP_STAGE_DISABLED_BUILD_SCRIPTS, {
+      "@matrix-org/matrix-sdk-crypto-nodejs": false,
+    });
+    assert.deepStrictEqual(DESKTOP_STAGE_DROPPED_DEPENDENCIES, {
+      "@matrix-org/matrix-sdk-crypto-nodejs>https-proxy-agent": "-",
+      "@matrix-org/matrix-sdk-crypto-nodejs>node-downloader-helper": "-",
+    });
+  });
+
+  it("stages the Matrix crypto binding for the build target, not the build host", () => {
+    assert.deepStrictEqual(resolveMatrixCryptoBindingTargets("linux", "arm64"), [
+      { platform: "linux", arch: "arm64", fileName: "matrix-sdk-crypto.linux-arm64-gnu.node" },
+    ]);
+    assert.deepStrictEqual(resolveMatrixCryptoBindingTargets("mac", "x64"), [
+      { platform: "darwin", arch: "x64", fileName: "matrix-sdk-crypto.darwin-x64.node" },
+    ]);
+    // A universal macOS artifact runs on both architectures.
+    assert.deepStrictEqual(resolveMatrixCryptoBindingTargets("mac", "universal"), [
+      { platform: "darwin", arch: "arm64", fileName: "matrix-sdk-crypto.darwin-arm64.node" },
+      { platform: "darwin", arch: "x64", fileName: "matrix-sdk-crypto.darwin-x64.node" },
+    ]);
+    // Windows also carries the Linux binding for its WSL backend, and it is the
+    // glibc build regardless of the host the artifact is produced on.
+    assert.deepStrictEqual(resolveMatrixCryptoBindingTargets("win", "x64"), [
+      { platform: "win32", arch: "x64", fileName: "matrix-sdk-crypto.win32-x64-msvc.node" },
+      { platform: "linux", arch: "x64", fileName: "matrix-sdk-crypto.linux-x64-gnu.node" },
+    ]);
+    assert.deepStrictEqual(resolveMatrixCryptoBindingTargets("win", "arm64"), [
+      { platform: "win32", arch: "arm64", fileName: "matrix-sdk-crypto.win32-arm64-msvc.node" },
+      { platform: "linux", arch: "arm64", fileName: "matrix-sdk-crypto.linux-arm64-gnu.node" },
+    ]);
+  });
+
+  it("downloads each staged binding from the pinned crypto release", () => {
+    assert.equal(
+      matrixCryptoBindingUrl("0.4.0", "matrix-sdk-crypto.linux-x64-gnu.node"),
+      "https://github.com/matrix-org/matrix-rust-sdk-crypto-nodejs/releases/download/v0.4.0/matrix-sdk-crypto.linux-x64-gnu.node",
+    );
+  });
+
+  it("unpacks only the Matrix crypto binding, never a JavaScript tree", () => {
+    // Windows artifacts unpack their whole node_modules for the WSL backend, so
+    // anything staged there lands loose in the package.
+    assert.notInclude(
+      [...DESKTOP_NATIVE_ASAR_UNPACK_PACKAGE_PATTERNS],
+      "@matrix-org/matrix-sdk-crypto-nodejs",
+    );
+    assert.notInclude([...DESKTOP_STAGED_OPTIONAL_RUNTIME_DEPENDENCY_NAMES], "matrix-bot-sdk");
+    for (const pattern of [
+      "node_modules/@matrix-org/matrix-sdk-crypto-nodejs/*.node",
+      "node_modules/@matrix-org/matrix-sdk-crypto-nodejs/index.js",
+      "node_modules/@matrix-org/matrix-sdk-crypto-nodejs/package.json",
+      "node_modules/.pnpm/**/node_modules/@matrix-org/matrix-sdk-crypto-nodejs/*.node",
+    ]) {
+      assert.include([...DESKTOP_ASAR_UNPACK], pattern);
+    }
+    assert.notInclude(
+      [...DESKTOP_ASAR_UNPACK],
+      "node_modules/@matrix-org/matrix-sdk-crypto-nodejs/**",
+    );
+  });
+
   it("carries only staged dependency patch metadata into staged desktop installs", () => {
     assert.deepStrictEqual(
       createStagePatchedDependencies(
@@ -362,7 +451,9 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
     assert.notInclude([...DESKTOP_NODE_PTY_ASAR_UNPACK_PATTERNS], "node-pty/**");
     assert.notInclude([...DESKTOP_ASAR_UNPACK], "node_modules/**");
     assert.notInclude([...DESKTOP_ASAR_UNPACK], "node_modules/node-pty/**");
-    assert.isAtMost(DESKTOP_UNPACKED_FILE_LIMIT, 250);
+    // A budget with headroom, not a security gate: it exists to catch an
+    // accidentally unpacked dependency tree, which is a four-figure mistake.
+    assert.isAtMost(DESKTOP_UNPACKED_FILE_LIMIT, 300);
   });
 
   it("marks artifact builds as compact desktop package builds", () => {

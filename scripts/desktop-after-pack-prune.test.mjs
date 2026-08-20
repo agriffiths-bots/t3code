@@ -5,6 +5,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import afterPack, {
   createPackagedIntegrityManifest,
+  matrixCryptoBindingPrefixes,
   PACKAGED_INTEGRITY_MANIFEST_FILE_NAME,
   resolveAppAsarUnpackedRoots,
 } from "./desktop-after-pack-prune.mjs";
@@ -126,6 +127,135 @@ describe("desktop-after-pack-prune", () => {
     expect(manifest.requiredFiles).not.toContain(
       "node_modules/@ff-labs/fff-bin-linux-x64-musl/libfff_c.so",
     );
+  });
+
+  it("keeps only the target Matrix crypto binding and drops its installer", async () => {
+    const tempDir = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "desktop-prune-matrix-"));
+    const root = NodePath.join(tempDir, "resources", "app.asar.unpacked", "node_modules");
+    const cryptoDir = NodePath.join(root, "@matrix-org", "matrix-sdk-crypto-nodejs");
+
+    await Promise.all([
+      touch(NodePath.join(cryptoDir, "package.json")),
+      touch(NodePath.join(cryptoDir, "index.js")),
+      touch(NodePath.join(cryptoDir, "index.d.ts")),
+      touch(NodePath.join(cryptoDir, "download-lib.js")),
+      touch(NodePath.join(cryptoDir, "README.md")),
+      touch(NodePath.join(cryptoDir, ".node-version")),
+      touch(NodePath.join(cryptoDir, "node_modules/node-downloader-helper/package.json")),
+      touch(NodePath.join(cryptoDir, "matrix-sdk-crypto.linux-x64-gnu.node")),
+      touch(NodePath.join(cryptoDir, "matrix-sdk-crypto.darwin-arm64.node")),
+      touch(NodePath.join(cryptoDir, "matrix-sdk-crypto.win32-x64-msvc.node")),
+    ]);
+
+    await afterPack({
+      appOutDir: tempDir,
+      electronPlatformName: "linux",
+      arch: 1,
+    });
+
+    await expect(
+      exists(NodePath.join(cryptoDir, "matrix-sdk-crypto.linux-x64-gnu.node")),
+    ).resolves.toBe(true);
+    await expect(
+      exists(NodePath.join(cryptoDir, "matrix-sdk-crypto.darwin-arm64.node")),
+    ).resolves.toBe(false);
+    await expect(
+      exists(NodePath.join(cryptoDir, "matrix-sdk-crypto.win32-x64-msvc.node")),
+    ).resolves.toBe(false);
+    await expect(exists(NodePath.join(cryptoDir, "index.js"))).resolves.toBe(true);
+    await expect(exists(NodePath.join(cryptoDir, "package.json"))).resolves.toBe(true);
+    await expect(exists(NodePath.join(cryptoDir, "download-lib.js"))).resolves.toBe(false);
+    await expect(exists(NodePath.join(cryptoDir, "index.d.ts"))).resolves.toBe(false);
+    await expect(exists(NodePath.join(cryptoDir, "README.md"))).resolves.toBe(false);
+    await expect(exists(NodePath.join(cryptoDir, ".node-version"))).resolves.toBe(false);
+    await expect(exists(NodePath.join(cryptoDir, "node_modules"))).resolves.toBe(false);
+
+    const manifestPath = NodePath.join(tempDir, "resources", PACKAGED_INTEGRITY_MANIFEST_FILE_NAME);
+    const manifest = JSON.parse(await NodeFSP.readFile(manifestPath, "utf8"));
+    expect(manifest.requiredFiles).toContain(
+      "node_modules/@matrix-org/matrix-sdk-crypto-nodejs/matrix-sdk-crypto.linux-x64-gnu.node",
+    );
+  });
+
+  it("names the Matrix crypto bindings each packaged target can load", () => {
+    expect(matrixCryptoBindingPrefixes("linux", "x64")).toEqual(["matrix-sdk-crypto.linux-x64"]);
+    expect(matrixCryptoBindingPrefixes("linux", "arm64")).toEqual([
+      "matrix-sdk-crypto.linux-arm64",
+    ]);
+    expect(matrixCryptoBindingPrefixes("darwin", "arm64")).toEqual([
+      "matrix-sdk-crypto.darwin-universal",
+      "matrix-sdk-crypto.darwin-arm64",
+    ]);
+    expect(matrixCryptoBindingPrefixes("darwin", "universal")).toEqual([
+      "matrix-sdk-crypto.darwin-universal",
+      "matrix-sdk-crypto.darwin-arm64",
+      "matrix-sdk-crypto.darwin-x64",
+    ]);
+    // Windows keeps the Linux binding its WSL backend loads.
+    expect(matrixCryptoBindingPrefixes("win32", "x64")).toEqual([
+      "matrix-sdk-crypto.win32-x64",
+      "matrix-sdk-crypto.linux-x64",
+    ]);
+    expect(matrixCryptoBindingPrefixes("linux", "ia32")).toEqual([]);
+  });
+
+  it("keeps the WSL Linux crypto binding inside Windows packages", async () => {
+    const tempDir = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "desktop-prune-wsl-"));
+    const root = NodePath.join(tempDir, "resources", "app.asar.unpacked", "node_modules");
+    const cryptoDir = NodePath.join(root, "@matrix-org", "matrix-sdk-crypto-nodejs");
+
+    await Promise.all([
+      touch(NodePath.join(cryptoDir, "package.json")),
+      touch(NodePath.join(cryptoDir, "index.js")),
+      touch(NodePath.join(cryptoDir, "matrix-sdk-crypto.win32-x64-msvc.node")),
+      touch(NodePath.join(cryptoDir, "matrix-sdk-crypto.linux-x64-gnu.node")),
+      touch(NodePath.join(cryptoDir, "matrix-sdk-crypto.linux-arm64-gnu.node")),
+      touch(NodePath.join(cryptoDir, "matrix-sdk-crypto.darwin-arm64.node")),
+    ]);
+
+    await afterPack({ appOutDir: tempDir, electronPlatformName: "win32", arch: 1 });
+
+    await expect(
+      exists(NodePath.join(cryptoDir, "matrix-sdk-crypto.win32-x64-msvc.node")),
+    ).resolves.toBe(true);
+    await expect(
+      exists(NodePath.join(cryptoDir, "matrix-sdk-crypto.linux-x64-gnu.node")),
+    ).resolves.toBe(true);
+    await expect(
+      exists(NodePath.join(cryptoDir, "matrix-sdk-crypto.linux-arm64-gnu.node")),
+    ).resolves.toBe(false);
+    await expect(
+      exists(NodePath.join(cryptoDir, "matrix-sdk-crypto.darwin-arm64.node")),
+    ).resolves.toBe(false);
+  });
+
+  it("keeps both architecture bindings in a universal macOS package", async () => {
+    const tempDir = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "desktop-prune-univ-"));
+    const root = NodePath.join(tempDir, "resources", "app.asar.unpacked", "node_modules");
+    const cryptoDir = NodePath.join(root, "@matrix-org", "matrix-sdk-crypto-nodejs");
+
+    await Promise.all([
+      touch(NodePath.join(cryptoDir, "package.json")),
+      touch(NodePath.join(cryptoDir, "index.js")),
+      touch(NodePath.join(cryptoDir, "download-lib.js")),
+      touch(NodePath.join(cryptoDir, "matrix-sdk-crypto.darwin-arm64.node")),
+      touch(NodePath.join(cryptoDir, "matrix-sdk-crypto.darwin-x64.node")),
+      touch(NodePath.join(cryptoDir, "matrix-sdk-crypto.linux-x64-gnu.node")),
+    ]);
+
+    // electron-builder reports the universal architecture on its final hook.
+    await afterPack({ appOutDir: tempDir, electronPlatformName: "darwin", arch: 4 });
+
+    await expect(
+      exists(NodePath.join(cryptoDir, "matrix-sdk-crypto.darwin-arm64.node")),
+    ).resolves.toBe(true);
+    await expect(
+      exists(NodePath.join(cryptoDir, "matrix-sdk-crypto.darwin-x64.node")),
+    ).resolves.toBe(true);
+    await expect(
+      exists(NodePath.join(cryptoDir, "matrix-sdk-crypto.linux-x64-gnu.node")),
+    ).resolves.toBe(false);
+    await expect(exists(NodePath.join(cryptoDir, "download-lib.js"))).resolves.toBe(false);
   });
 
   it("breaks directory symlink cycles while collecting manifest entries", async () => {

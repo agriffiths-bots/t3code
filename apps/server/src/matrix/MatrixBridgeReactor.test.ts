@@ -464,6 +464,8 @@ function withHarness<A, E>(
           disconnect: unsupported(),
           setOwner,
           clearOwnerIfMatches,
+          recordRoomIfMatches: () => unsupported(),
+          reportTransportStateIfMatches: () => unsupported(),
           initializeDeliveryCheckpointIfMissing,
           markDeliveredIfMatches,
           reportPermanentSendFailureIfMatches: () => Effect.succeed(true),
