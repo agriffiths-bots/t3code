@@ -11,6 +11,7 @@ import {
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -408,6 +409,9 @@ export class SessionStore extends Context.Service<
     readonly isActive: (
       sessionId: AuthSessionId,
     ) => Effect.Effect<boolean, SessionCredentialInternalError>;
+    readonly getActive: (
+      sessionId: AuthSessionId,
+    ) => Effect.Effect<Option.Option<AuthClientSession>, SessionCredentialInternalError>;
     readonly streamChanges: Stream.Stream<SessionCredentialChange>;
     readonly revoke: (
       sessionId: AuthSessionId,
@@ -417,6 +421,7 @@ export class SessionStore extends Context.Service<
     ) => Effect.Effect<number, SessionCredentialInternalError>;
     readonly markConnected: (sessionId: AuthSessionId) => Effect.Effect<void, never>;
     readonly markDisconnected: (sessionId: AuthSessionId) => Effect.Effect<void, never>;
+    readonly awaitRevocation: (sessionId: AuthSessionId) => Effect.Effect<void, never>;
   }
 >()("t3/auth/SessionStore") {}
 
@@ -490,6 +495,7 @@ export const make = Effect.gen(function* () {
   const authSessions = yield* AuthSessions.AuthSessionRepository;
   const signingSecret = yield* secretStore.getOrCreateRandom(SIGNING_SECRET_NAME, 32);
   const connectedSessionsRef = yield* Ref.make(new Map<string, number>());
+  const revocationWaitersRef = yield* Ref.make(new Map<string, Set<Deferred.Deferred<void>>>());
   const changesPubSub = yield* PubSub.unbounded<SessionCredentialChange>();
   const cookieNames = resolveSessionCookieNames({
     mode: serverConfig.mode,
@@ -511,6 +517,24 @@ export const make = Effect.gen(function* () {
       type: "clientRemoved",
       sessionId,
     }).pipe(Effect.asVoid);
+
+  const signalRevoked = (sessionId: AuthSessionId) =>
+    Ref.modify(revocationWaitersRef, (current) => {
+      const waiters = current.get(sessionId);
+      if (waiters === undefined || waiters.size === 0) {
+        return [[], current] as const;
+      }
+      const next = new Map(current);
+      next.delete(sessionId);
+      return [[...waiters], next] as const;
+    }).pipe(
+      Effect.flatMap((waiters) =>
+        Effect.forEach(waiters, (deferred) => Deferred.succeed(deferred, undefined), {
+          concurrency: "unbounded",
+          discard: true,
+        }),
+      ),
+    );
 
   const loadActiveSession = (sessionId: AuthSessionId) =>
     Effect.gen(function* () {
@@ -923,24 +947,82 @@ export const make = Effect.gen(function* () {
     },
   );
 
+  const getActive: SessionStore["Service"]["getActive"] = Effect.fn("SessionStore.getActive")(
+    function* (sessionId) {
+      const now = yield* DateTime.now;
+      const session = yield* loadActiveSession(sessionId).pipe(
+        Effect.mapError((cause) => new SessionCredentialVerificationError({ sessionId, cause })),
+      );
+      if (
+        Option.isNone(session) ||
+        session.value.expiresAt.epochMilliseconds <= now.epochMilliseconds
+      ) {
+        return Option.none();
+      }
+      return session;
+    },
+  );
+
+  const removeRevocationWaiter = (sessionId: AuthSessionId, deferred: Deferred.Deferred<void>) =>
+    Ref.update(revocationWaitersRef, (current) => {
+      const waiters = current.get(sessionId);
+      if (waiters === undefined) {
+        return current;
+      }
+      const nextWaiters = new Set(waiters);
+      nextWaiters.delete(deferred);
+      const next = new Map(current);
+      if (nextWaiters.size === 0) {
+        next.delete(sessionId);
+      } else {
+        next.set(sessionId, nextWaiters);
+      }
+      return next;
+    });
+
+  const awaitRevocation: SessionStore["Service"]["awaitRevocation"] = Effect.fn(
+    "SessionStore.awaitRevocation",
+  )(function* (sessionId) {
+    const deferred = yield* Deferred.make<void>();
+    yield* Effect.gen(function* () {
+      yield* Ref.update(revocationWaitersRef, (current) => {
+        const next = new Map(current);
+        const waiters = new Set(next.get(sessionId) ?? []);
+        waiters.add(deferred);
+        next.set(sessionId, waiters);
+        return next;
+      });
+      const active = yield* isActive(sessionId).pipe(Effect.orElseSucceed(() => false));
+      if (!active) {
+        yield* Deferred.succeed(deferred, undefined);
+      }
+      yield* Deferred.await(deferred);
+    }).pipe(Effect.ensuring(removeRevocationWaiter(sessionId, deferred)));
+  });
+
   const revoke: SessionStore["Service"]["revoke"] = Effect.fn("SessionStore.revoke")(
     function* (sessionId) {
       const revokedAt = yield* DateTime.now;
-      const revoked = yield* authSessions
-        .revoke({
-          sessionId,
-          revokedAt,
-        })
-        .pipe(Effect.mapError((cause) => new SessionRevocationError({ sessionId, cause })));
-      if (revoked) {
-        yield* Ref.update(connectedSessionsRef, (current) => {
-          const next = new Map(current);
-          next.delete(sessionId);
-          return next;
-        });
-        yield* emitRemoved(sessionId);
-      }
-      return revoked;
+      return yield* Effect.uninterruptible(
+        Effect.gen(function* () {
+          const revoked = yield* authSessions
+            .revoke({
+              sessionId,
+              revokedAt,
+            })
+            .pipe(Effect.mapError((cause) => new SessionRevocationError({ sessionId, cause })));
+          if (revoked) {
+            yield* Ref.update(connectedSessionsRef, (current) => {
+              const next = new Map(current);
+              next.delete(sessionId);
+              return next;
+            });
+            yield* signalRevoked(sessionId);
+            yield* emitRemoved(sessionId);
+          }
+          return revoked;
+        }),
+      );
     },
   );
 
@@ -948,34 +1030,42 @@ export const make = Effect.gen(function* () {
     "SessionStore.revokeAllExcept",
   )(function* (sessionId) {
     const revokedAt = yield* DateTime.now;
-    const revokedSessionIds = yield* authSessions
-      .revokeAllExcept({
-        currentSessionId: sessionId,
-        revokedAt,
-      })
-      .pipe(
-        Effect.mapError(
-          (cause) => new OtherSessionsRevocationError({ currentSessionId: sessionId, cause }),
-        ),
-      );
-    if (revokedSessionIds.length > 0) {
-      yield* Ref.update(connectedSessionsRef, (current) => {
-        const next = new Map(current);
-        for (const revokedSessionId of revokedSessionIds) {
-          next.delete(revokedSessionId);
+    return yield* Effect.uninterruptible(
+      Effect.gen(function* () {
+        const revokedSessionIds = yield* authSessions
+          .revokeAllExcept({
+            currentSessionId: sessionId,
+            revokedAt,
+          })
+          .pipe(
+            Effect.mapError(
+              (cause) => new OtherSessionsRevocationError({ currentSessionId: sessionId, cause }),
+            ),
+          );
+        if (revokedSessionIds.length > 0) {
+          yield* Ref.update(connectedSessionsRef, (current) => {
+            const next = new Map(current);
+            for (const revokedSessionId of revokedSessionIds) {
+              next.delete(revokedSessionId);
+            }
+            return next;
+          });
+          yield* Effect.forEach(revokedSessionIds, signalRevoked, {
+            concurrency: "unbounded",
+            discard: true,
+          });
+          yield* Effect.forEach(
+            revokedSessionIds,
+            (revokedSessionId) => emitRemoved(revokedSessionId),
+            {
+              concurrency: "unbounded",
+              discard: true,
+            },
+          );
         }
-        return next;
-      });
-      yield* Effect.forEach(
-        revokedSessionIds,
-        (revokedSessionId) => emitRemoved(revokedSessionId),
-        {
-          concurrency: "unbounded",
-          discard: true,
-        },
-      );
-    }
-    return revokedSessionIds.length;
+        return revokedSessionIds.length;
+      }),
+    );
   });
 
   return SessionStore.of({
@@ -987,6 +1077,7 @@ export const make = Effect.gen(function* () {
     verifyWebSocketToken,
     listActive,
     isActive,
+    getActive,
     get streamChanges() {
       return Stream.fromPubSub(changesPubSub);
     },
@@ -994,6 +1085,7 @@ export const make = Effect.gen(function* () {
     revokeAllExcept,
     markConnected,
     markDisconnected,
+    awaitRevocation,
   });
 });
 

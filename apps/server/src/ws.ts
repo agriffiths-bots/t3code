@@ -67,7 +67,12 @@ import {
 } from "@t3tools/contracts";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { resolveServerBackgroundActivitySettings } from "@t3tools/shared/backgroundActivitySettings";
-import { HttpRouter, HttpServerRequest, HttpServerRespondable } from "effect/unstable/http";
+import {
+  HttpRouter,
+  HttpServerRequest,
+  HttpServerRespondable,
+  HttpServerResponse,
+} from "effect/unstable/http";
 import { RpcSerialization, RpcServer } from "effect/unstable/rpc";
 
 import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
@@ -127,6 +132,7 @@ import { requiredScopeForRpcMethod } from "./auth/RpcAuthorization.ts";
 import {
   isAudienceScopedReadRpcMethod,
   isRpcMethodAllowedForAudienceCeiling,
+  restrictScopesForAudienceCeiling,
 } from "./auth/audienceScopePolicy.ts";
 import * as ProcessDiagnostics from "./diagnostics/ProcessDiagnostics.ts";
 import * as HeapDiagnostics from "./diagnostics/HeapDiagnostics.ts";
@@ -516,31 +522,55 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
           }
         }
       });
-      const authorizationError = (requiredScope: AuthEnvironmentScope, method: string) =>
+      const authorizationError = (
+        requiredScope: AuthEnvironmentScope,
+        method: string,
+        scopes: ReadonlyArray<AuthEnvironmentScope>,
+      ) =>
         new EnvironmentAuthorizationError({
-          message: currentSession.scopes.includes(requiredScope)
+          message: scopes.includes(requiredScope)
             ? `RPC method ${method} is unavailable for the authenticated audience ceiling.`
             : `The authenticated token is missing required scope: ${requiredScope}.`,
           requiredScope,
         });
+      const sessionInactiveError = (requiredScope: AuthEnvironmentScope, method: string) =>
+        new EnvironmentAuthorizationError({
+          message: `RPC method ${method} is unavailable because the authenticated session is no longer active.`,
+          requiredScope,
+        });
+      const authorizeLiveSession = (method: string, requiredScope: AuthEnvironmentScope) =>
+        sessions.getActive(currentSessionId).pipe(
+          Effect.orElseSucceed(() => Option.none()),
+          Effect.flatMap((liveSession) => {
+            if (Option.isNone(liveSession)) {
+              return Effect.fail(sessionInactiveError(requiredScope, method));
+            }
+            const audienceCeiling =
+              currentSession.audienceCeiling === "factory"
+                ? ("factory" as const)
+                : liveSession.value.audienceCeiling;
+            const scopes = restrictScopesForAudienceCeiling(
+              liveSession.value.scopes,
+              audienceCeiling,
+            );
+            return scopes.includes(requiredScope) &&
+              isRpcMethodAllowedForAudienceCeiling(method, requiredScope, audienceCeiling)
+              ? Effect.void
+              : Effect.fail(authorizationError(requiredScope, method, scopes));
+          }),
+        );
       const authorizeEffect = <A, E, R>(
         method: string,
         requiredScope: AuthEnvironmentScope,
         effect: Effect.Effect<A, E, R>,
       ): Effect.Effect<A, E | EnvironmentAuthorizationError, R> =>
-        currentSession.scopes.includes(requiredScope) &&
-        isRpcMethodAllowedForAudienceCeiling(method, requiredScope, currentSession.audienceCeiling)
-          ? effect
-          : Effect.fail(authorizationError(requiredScope, method));
+        authorizeLiveSession(method, requiredScope).pipe(Effect.andThen(effect));
       const authorizeStream = <A, E, R>(
         method: string,
         requiredScope: AuthEnvironmentScope,
         stream: Stream.Stream<A, E, R>,
       ): Stream.Stream<A, E | EnvironmentAuthorizationError, R> =>
-        currentSession.scopes.includes(requiredScope) &&
-        isRpcMethodAllowedForAudienceCeiling(method, requiredScope, currentSession.audienceCeiling)
-          ? stream
-          : Stream.fail(authorizationError(requiredScope, method));
+        Stream.unwrap(authorizeLiveSession(method, requiredScope).pipe(Effect.as(stream)));
       const requiredScopeForMethod = (method: string): AuthEnvironmentScope =>
         requiredScopeForRpcMethod(method);
       const observeRpcEffect = <A, E, R>(
@@ -2809,7 +2839,12 @@ export const websocketRpcRouteLayer = HttpRouter.add(
     );
     return yield* Effect.acquireUseRelease(
       sessions.markConnected(session.sessionId),
-      () => rpcWebSocketHttpEffect,
+      () =>
+        rpcWebSocketHttpEffect.pipe(
+          Effect.raceFirst(
+            sessions.awaitRevocation(session.sessionId).pipe(Effect.as(HttpServerResponse.empty())),
+          ),
+        ),
       () => sessions.markDisconnected(session.sessionId),
     );
   }).pipe(

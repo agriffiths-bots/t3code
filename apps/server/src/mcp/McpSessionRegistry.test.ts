@@ -36,6 +36,7 @@ const makeFakeSessionStore = (
     verifyWebSocketToken: () => Effect.die("unused"),
     listActive: () => Effect.die("unused"),
     isActive,
+    getActive: () => Effect.die("unused"),
     get streamChanges() {
       return Stream.empty;
     },
@@ -43,6 +44,7 @@ const makeFakeSessionStore = (
     revokeAllExcept: () => Effect.die("unused"),
     markConnected: () => Effect.die("unused"),
     markDisconnected: () => Effect.die("unused"),
+    awaitRevocation: () => Effect.die("unused"),
   });
 const PersistedPeerTokenStoreFixture = Schema.Struct({
   version: Schema.Literal(1),

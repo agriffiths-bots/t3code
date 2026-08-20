@@ -4418,6 +4418,119 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("closes live websockets when the current session signs out", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest();
+
+      const { response: bootstrapResponse, cookie } = yield* bootstrapBrowserSession();
+      assert.equal(bootstrapResponse.status, 200);
+      assert.isDefined(cookie);
+      const cookieHeader = cookie?.split(";")[0] ?? "";
+      const wsUrl = appendSessionCookieToWsUrl(
+        yield* getWsServerUrl("/ws", { authenticated: false }),
+        cookieHeader,
+      );
+
+      yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          Effect.gen(function* () {
+            const before = yield* client[WS_METHODS.serverGetConfig]({});
+            assert.equal(before.environment.environmentId, testEnvironmentDescriptor.environmentId);
+
+            const signOutResponse = yield* HttpClient.post("/api/auth/session/sign-out", {
+              headers: { cookie: cookieHeader },
+            });
+            assert.equal(signOutResponse.status, 200);
+
+            const after = yield* client[WS_METHODS.serverGetConfig]({}).pipe(Effect.result);
+            assertTrue(after._tag === "Failure");
+          }),
+        ),
+      );
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("closes live websockets when pairing replaces the browser session", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest();
+
+      const cookieHeader = yield* getAuthenticatedSessionCookieHeader();
+      const wsUrl = appendSessionCookieToWsUrl(
+        yield* getWsServerUrl("/ws", { authenticated: false }),
+        cookieHeader,
+      );
+      const credentialResponse = yield* HttpClient.post("/api/auth/pairing-token", {
+        headers: { cookie: cookieHeader },
+        body: yield* HttpBody.json({ audienceCeiling: "private" }),
+      });
+      const credential = (yield* credentialResponse.json) as { readonly credential: string };
+      assert.equal(credentialResponse.status, 200);
+
+      yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          Effect.gen(function* () {
+            const before = yield* client[WS_METHODS.serverGetConfig]({});
+            assert.equal(before.environment.environmentId, testEnvironmentDescriptor.environmentId);
+
+            const replacement = yield* bootstrapBrowserSession(credential.credential, {
+              headers: { cookie: cookieHeader },
+            });
+            assert.equal(replacement.response.status, 200);
+
+            const after = yield* client[WS_METHODS.serverGetConfig]({}).pipe(Effect.result);
+            assertTrue(after._tag === "Failure");
+          }),
+        ),
+      );
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("does not keep privileged websocket scopes after a weaker pairing grant", () =>
+    Effect.gen(function* () {
+      const snapshotPath = "/test/userdata/diagnostics/heap-snapshots/displaced.heapsnapshot";
+      yield* buildAppUnderTest({
+        layers: {
+          heapDiagnostics: {
+            writeSnapshot: () => Effect.succeed({ path: snapshotPath }),
+          },
+        },
+      });
+
+      const cookieHeader = yield* getAuthenticatedSessionCookieHeader();
+      const wsUrl = appendSessionCookieToWsUrl(
+        yield* getWsServerUrl("/ws", { authenticated: false }),
+        cookieHeader,
+      );
+      const credentialResponse = yield* HttpClient.post("/api/auth/pairing-token", {
+        headers: { cookie: cookieHeader },
+        body: yield* HttpBody.json({ audienceCeiling: "private" }),
+      });
+      const credential = (yield* credentialResponse.json) as { readonly credential: string };
+      assert.equal(credentialResponse.status, 200);
+
+      yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          Effect.gen(function* () {
+            const privileged = yield* client[WS_METHODS.serverWriteHeapSnapshot]({
+              filename: "displaced.heapsnapshot",
+            });
+            assert.equal(privileged.path, snapshotPath);
+
+            const replacement = yield* bootstrapBrowserSession(credential.credential, {
+              headers: { cookie: cookieHeader },
+            });
+            assert.equal(replacement.response.status, 200);
+
+            const after = yield* client[WS_METHODS.serverWriteHeapSnapshot]({
+              filename: "displaced-after.heapsnapshot",
+            }).pipe(Effect.result);
+            assertTrue(after._tag === "Failure");
+          }),
+        ),
+      );
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("restricts heap snapshot RPCs to access-write sessions", () =>
     Effect.gen(function* () {
       const snapshotPath = "/test/userdata/diagnostics/heap-snapshots/admin.heapsnapshot";

@@ -4,7 +4,9 @@ import { expect, it } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -434,5 +436,91 @@ it.layer(NodeServices.layer)("SessionStore.layer", (it) => {
       expect(afterReconnect[0]?.lastConnectedAt).not.toBeNull();
       expect(afterReconnect[0]?.lastConnectedAt?.toString()).not.toBe(firstConnectedAt?.toString());
     }).pipe(Effect.provide(Layer.merge(makeSessionStoreLayer(), TestClock.layer()))),
+  );
+
+  it.effect("reads current persisted scopes for an active session", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const sql = yield* SqlClient.SqlClient;
+      const issued = yield* sessions.issue({
+        audienceCeiling: "private",
+        method: "bearer-access-token",
+        subject: "scope-downgrade",
+        scopes: ["orchestration:read", "access:write"],
+      });
+
+      yield* sql`
+        UPDATE auth_sessions
+        SET scopes = ${encodeEnvironmentScopes(["orchestration:read"])}
+        WHERE session_id = ${issued.sessionId}
+      `;
+
+      const live = yield* sessions.getActive(issued.sessionId);
+      expect(Option.isSome(live)).toBe(true);
+      if (Option.isSome(live)) {
+        expect(live.value.scopes).toEqual(["orchestration:read"]);
+      }
+    }).pipe(Effect.provide(makeSessionStoreLayer())),
+  );
+
+  it.effect("removes revocation waiters when the waiter is interrupted", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const issued = yield* sessions.issue({
+        audienceCeiling: "private",
+        subject: "interrupted-waiter",
+        method: "bearer-access-token",
+      });
+      const waiting = yield* sessions.awaitRevocation(issued.sessionId).pipe(Effect.forkChild);
+      yield* Fiber.interrupt(waiting);
+      yield* sessions.revoke(issued.sessionId);
+      yield* sessions.awaitRevocation(issued.sessionId);
+    }).pipe(Effect.provide(makeSessionStoreLayer())),
+  );
+
+  it.effect("unblocks revocation waiters when a session is revoked", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const issued = yield* sessions.issue({
+        audienceCeiling: "private",
+        subject: "revoke-waiter",
+        method: "bearer-access-token",
+      });
+      const waiting = yield* sessions.awaitRevocation(issued.sessionId).pipe(Effect.forkChild);
+      const stillActive = yield* sessions.getActive(issued.sessionId);
+
+      yield* sessions.revoke(issued.sessionId);
+      yield* Fiber.join(waiting);
+      const afterRevoke = yield* sessions.getActive(issued.sessionId);
+      yield* sessions.awaitRevocation(issued.sessionId);
+
+      expect(Option.isSome(stillActive)).toBe(true);
+      expect(Option.isNone(afterRevoke)).toBe(true);
+    }).pipe(Effect.provide(makeSessionStoreLayer())),
+  );
+
+  it.effect("unblocks revocation waiters when other sessions are revoked", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const kept = yield* sessions.issue({
+        audienceCeiling: "private",
+        subject: "kept-session",
+        method: "bearer-access-token",
+      });
+      const revoked = yield* sessions.issue({
+        audienceCeiling: "private",
+        subject: "revoked-session",
+        method: "bearer-access-token",
+      });
+      const waiting = yield* sessions.awaitRevocation(revoked.sessionId).pipe(Effect.forkChild);
+
+      yield* sessions.revokeAllExcept(kept.sessionId);
+      yield* Fiber.join(waiting);
+      const keptActive = yield* sessions.getActive(kept.sessionId);
+      const revokedActive = yield* sessions.getActive(revoked.sessionId);
+
+      expect(Option.isSome(keptActive)).toBe(true);
+      expect(Option.isNone(revokedActive)).toBe(true);
+    }).pipe(Effect.provide(makeSessionStoreLayer())),
   );
 });

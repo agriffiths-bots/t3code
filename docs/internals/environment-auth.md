@@ -51,6 +51,12 @@ bootstrap credential would recreate an administrative session on the next
 load. Mobile pairing is a saved-environment flow and has no self-sign-out
 yet.
 
+Revoking a session closes every live WebSocket bound to that session. RPC
+authorization also re-reads the live session, so a draining socket cannot keep
+revoked access or previously captured scopes. Pairing replacement uses the same
+path: the previous cookie session is revoked, its sockets are closed, and a
+weaker grant cannot keep serving the old permissions.
+
 ### Bearer Access Token
 
 Non-browser clients use `POST /oauth/token` with an
