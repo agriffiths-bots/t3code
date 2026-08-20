@@ -8,13 +8,14 @@ import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 
+import type { MatrixTextContent } from "./matrixFormattedBody.ts";
+
+export type { MatrixTextContent } from "./matrixFormattedBody.ts";
+
 export interface MatrixBridgeOutboundText {
   readonly roomId: string;
   readonly transactionId: string;
-  readonly content: {
-    readonly msgtype: "m.text";
-    readonly body: string;
-  };
+  readonly content: MatrixTextContent;
   /**
    * The bridge ownership epoch this message belongs to, checked again against
    * the live configuration immediately before the send. Gate messages are not

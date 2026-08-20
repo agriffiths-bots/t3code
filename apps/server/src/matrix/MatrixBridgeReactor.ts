@@ -42,6 +42,7 @@ import {
   type MatrixBridgeRoomMembership,
 } from "./MatrixBridgeClient.ts";
 import { MatrixBridgeConfig, type MatrixBridgeConfigV1 } from "./MatrixBridgeConfig.ts";
+import { matrixTextContent } from "./matrixFormattedBody.ts";
 
 export const MATRIX_BRIDGE_OUTBOUND_CAPACITY = 64;
 /** Reserved separately so a full model-output queue cannot hide the gate. */
@@ -520,7 +521,7 @@ export const make = Effect.gen(function* () {
             client.sendText({
               roomId: job.roomId,
               transactionId: job.transactionId,
-              content: { msgtype: "m.text", body: job.body },
+              content: matrixTextContent(job.body),
               ownershipEpoch: job.ownershipEpoch,
             }),
           );
@@ -610,7 +611,7 @@ export const make = Effect.gen(function* () {
           client.sendText({
             roomId: job.roomId,
             transactionId: job.transactionId,
-            content: { msgtype: "m.text", body: job.body },
+            content: matrixTextContent(job.body),
             // A gate message answers the room, not a bridged thread.
             ownershipEpoch: null,
           }),

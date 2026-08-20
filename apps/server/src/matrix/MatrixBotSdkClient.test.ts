@@ -1673,6 +1673,40 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
     }).pipe(Effect.provide(testLayer)),
   );
 
+  it.effect("encrypts formatted_body with the original markdown fallback", () =>
+    Effect.gen(function* () {
+      const sdk = makeFakeSdk({
+        joinedMembers: [BOT_USER_ID, ALLOWED_USER_ID],
+      });
+      const configService = yield* configureBridge();
+      const client = yield* startAdapter(sdk);
+      yield* awaitStatusState(configService, "waiting-for-member");
+
+      const content = {
+        msgtype: "m.text" as const,
+        body: "**hello**",
+        format: "org.matrix.custom.html" as const,
+        formatted_body: "<p><strong>hello</strong></p>",
+      };
+      yield* client.sendText({
+        roomId: ROOM_ID,
+        transactionId: "t3-formatted-body",
+        content,
+        ownershipEpoch: null,
+      });
+
+      assert.lengthOf(sdk.encryptions, 1);
+      const encrypted = sdk.encryptions[0];
+      assert.isTrue(encrypted !== null && typeof encrypted === "object");
+      assert.deepEqual(
+        encrypted !== null && typeof encrypted === "object" && "content" in encrypted
+          ? encrypted.content
+          : undefined,
+        content,
+      );
+    }).pipe(Effect.provide(testLayer)),
+  );
+
   it.effect("refuses to send after the connection has been replaced", () =>
     Effect.gen(function* () {
       const sdk = makeFakeSdk();

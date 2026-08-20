@@ -62,6 +62,7 @@ import {
   makeBoundedDrainableWorker,
 } from "./MatrixBridgeReactor.ts";
 import { MatrixBridgeConfig, type MatrixBridgeConfigV1 } from "./MatrixBridgeConfig.ts";
+import { matrixTextContent } from "./matrixFormattedBody.ts";
 
 const projectId = ProjectId.make("matrix-project");
 const threadA = ThreadId.make("matrix-thread-a");
@@ -1813,9 +1814,47 @@ it.effect("uses projected text and dedupes repeated terminal events after the te
 
       const sent = yield* harness.fake.sent;
       expect(sent).toHaveLength(1);
-      expect(sent[0]?.content).toEqual({
-        msgtype: "m.text",
-        body: "Projected body, not event text.",
+      expect(sent[0]?.content).toEqual(matrixTextContent("Projected body, not event text."));
+    }),
+  ),
+);
+
+it.effect("sends sanitized HTML alongside the original markdown", () =>
+  withHarness((harness) =>
+    Effect.gen(function* () {
+      const turnId = TurnId.make("turn-markdown");
+      const markdown = "## Done\n\n- **bold** item\n- `code`\n\n[link](https://example.com)";
+      const final = message({
+        id: "message-markdown-final",
+        role: "assistant",
+        text: markdown,
+        turnId,
+        at: "2026-08-19T10:00:09.000Z",
+      });
+      yield* harness.setThread(
+        thread({
+          turnId,
+          state: "completed",
+          messages: [final],
+          terminalAt: "2026-08-19T10:00:10.000Z",
+        }),
+      );
+      yield* harness.publish(
+        assistantEvent({
+          turnId,
+          messageId: "message-markdown-final",
+          at: final.updatedAt,
+        }),
+      );
+
+      const sent = yield* harness.fake.sent;
+      expect(sent).toHaveLength(1);
+      expect(sent[0]?.content).toEqual(matrixTextContent(markdown));
+      expect(sent[0]?.content.body).toBe(markdown);
+      expect(sent[0]?.content).toMatchObject({
+        format: "org.matrix.custom.html",
+        formatted_body:
+          '<h2>Done</h2><ul><li><strong>bold</strong> item</li><li><code>code</code></li></ul><p><a href="https://example.com">link</a></p>',
       });
     }),
   ),
