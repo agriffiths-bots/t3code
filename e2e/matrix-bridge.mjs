@@ -1011,6 +1011,74 @@ async function waitStatus(getStatus, predicate, timeoutMs, label) {
   throw new Error(`${label} timed out after ${timeoutMs}ms (last ${JSON.stringify(last)})`);
 }
 
+/** The live bridge owns exactly one disposable Matrix SDK sync store. */
+function bridgeSyncStorePath() {
+  assert(tempRoot !== null, "the Matrix bridge sync store was requested before bring-up");
+  const bridgeDir = NodePath.join(tempRoot, "t3-home", "userdata", "secrets", "matrix-bridge");
+  const stores = NodeFS.readdirSync(bridgeDir, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => NodePath.join(bridgeDir, entry.name, "sync.json"))
+    .filter((entry) => NodeFS.existsSync(entry));
+  assert(stores.length === 1, `expected one Matrix bridge sync store, found ${stores.length}`);
+  return stores[0];
+}
+
+function readBridgeSyncToken(storePath) {
+  try {
+    const json = JSON.parse(NodeFS.readFileSync(storePath, "utf8"));
+    return typeof json.syncToken === "string" ? json.syncToken : null;
+  } catch {
+    // The SDK writes synchronously, but a poll may still catch the file between
+    // truncate and write. A later poll reads the complete token.
+    return null;
+  }
+}
+
+async function waitBridgeConsumedEvent(
+  storePath,
+  homeserver,
+  accessToken,
+  roomId,
+  eventId,
+  timeoutMs,
+  label,
+) {
+  const deadline = Date.now() + timeoutMs;
+  let checkedToken = null;
+  let lastError = "no persisted sync token";
+  while (Date.now() < deadline) {
+    const token = readBridgeSyncToken(storePath);
+    if (token !== null && token !== checkedToken) {
+      const url = new URL(
+        `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/messages`,
+        homeserver,
+      );
+      url.searchParams.set("from", token);
+      url.searchParams.set("dir", "b");
+      url.searchParams.set("limit", "20");
+      try {
+        const response = await fetch(url, {
+          headers: { authorization: `Bearer ${accessToken}` },
+          signal: AbortSignal.timeout(Math.min(5_000, Math.max(1, deadline - Date.now()))),
+        });
+        if (!response.ok) {
+          lastError = `room history returned HTTP ${response.status}`;
+        } else {
+          const body = await response.json();
+          const events = Array.isArray(body?.chunk) ? body.chunk : [];
+          if (events.some((event) => event?.event_id === eventId)) return;
+          checkedToken = token;
+          lastError = "the persisted cursor does not cover the probe";
+        }
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : String(error);
+      }
+    }
+    await sleep(100);
+  }
+  throw new Error(`${label} timed out after ${timeoutMs}ms (${lastError})`);
+}
+
 /**
  * The projected final for a turn. A turn can carry several non-streaming
  * assistant messages (mid-turn segments), and only the last one is the final
@@ -1923,8 +1991,20 @@ async function runReleaseGate(ctx) {
   const assertInboundSilent = async (silentThreadId, marker, label) => {
     const probe = `${marker}_INBOUND_${NodeCrypto.randomBytes(4).toString("hex")}`;
     const before = (await threadSnapshot(t3, silentThreadId)).thread;
-    await activeCli.request({ op: "send", roomId, body: probe });
-    await bridgeWitness(threadA, `${marker}_IN`, null);
+    const syncStore = bridgeSyncStorePath();
+    const sent = await activeCli.request({ op: "send", roomId, body: probe });
+    // A persisted sync token covers only batches whose handlers released the
+    // bridge's fence. Seeing this exact event behind that token is therefore a
+    // receipt for the probe, unlike counting unrelated cursor-file writes.
+    await waitBridgeConsumedEvent(
+      syncStore,
+      ctx.homeserver,
+      ctx.bot.accessToken,
+      roomId,
+      sent.eventId,
+      RECOVERY_MS,
+      `${label} inbound drain`,
+    );
     const after = (await threadSnapshot(t3, silentThreadId)).thread;
     assert(
       !userMessages(after).some((message) => message.text === probe),
@@ -1934,14 +2014,7 @@ async function runReleaseGate(ctx) {
       after.turns.length === before.turns.length,
       `a Matrix message started a T3 turn on the ${label} thread`,
     );
-    // The probe preceded the witness bridging, so a bot that deferred it
-    // across the ownership change would land it on the control thread instead
-    // of dropping it. That is a failure here rather than an invisible pass.
-    const control = (await threadSnapshot(t3, threadA)).thread;
-    assert(
-      !userMessages(control).some((message) => message.text === probe),
-      `a ${label} Matrix message was dispatched once ownership was restored`,
-    );
+    return probe;
   };
 
   /**
@@ -1949,7 +2022,13 @@ async function runReleaseGate(ctx) {
    * the suppression to mean anything, so a rejected dispatch there is a gate
    * failure; only an archived thread may refuse the turn outright.
    */
-  const assertOutboundSilent = async (silentThreadId, marker, label, prompt, { requireFinal }) => {
+  const assertOutboundSilent = async (
+    silentThreadId,
+    marker,
+    label,
+    prompt,
+    { requireFinal, inboundProbe },
+  ) => {
     const before = (await threadSnapshot(t3, silentThreadId)).thread;
     const probeMarker = turnMarker(before);
     const botBefore = (await activeCli.request({ op: "messages", roomId, from: botMxid })).texts
@@ -1997,17 +2076,25 @@ async function runReleaseGate(ctx) {
       texts.length === botBefore + 1 && texts.at(-1).body === witness.final,
       `the bot posted something other than the witness while ${label}`,
     );
+    // The inbound probe was drained while ownerless before this witness moved
+    // ownership. It must still be absent after that move, so delayed delivery
+    // cannot hide behind the silent thread's unchanged projection.
+    const control = (await threadSnapshot(t3, threadA)).thread;
+    assert(
+      !userMessages(control).some((message) => message.text === inboundProbe),
+      `a ${label} Matrix message was dispatched once ownership was restored`,
+    );
   };
 
   heartbeat("13", "unbridge is silent in both directions");
   await setOwner(null, "owner cleared");
-  await assertInboundSilent(threadB, "UNBRIDGED", "unbridged");
+  const unbridgedInboundProbe = await assertInboundSilent(threadB, "UNBRIDGED", "unbridged");
   await assertOutboundSilent(
     threadB,
     "UNBRIDGED",
     "unbridged",
     "Reply with the exact word SILENCE_SHOULD_NOT_ARRIVE and nothing else.",
-    { requireFinal: true },
+    { requireFinal: true, inboundProbe: unbridgedInboundProbe },
   );
 
   // Ownership has to be observed as thread B before the archive, or the null
@@ -2025,14 +2112,14 @@ async function runReleaseGate(ctx) {
     10_000,
     "archive unset the owner",
   );
-  await assertInboundSilent(threadB, "ARCHIVED", "archived");
+  const archivedInboundProbe = await assertInboundSilent(threadB, "ARCHIVED", "archived");
   await assertOutboundSilent(
     threadB,
     "ARCHIVED",
     "archived",
     "Reply with the exact word ARCHIVED_SHOULD_NOT_BRIDGE and nothing else.",
     // An archived thread is allowed to refuse the turn outright.
-    { requireFinal: false },
+    { requireFinal: false, inboundProbe: archivedInboundProbe },
   );
 
   heartbeat("14", "close clients");
