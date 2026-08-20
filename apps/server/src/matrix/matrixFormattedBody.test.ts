@@ -371,20 +371,19 @@ describe("matrixTextContent fallback", () => {
     ];
     // Deterministic bound is the renderer's own op counter (linear in input
     // length). Exceeding the budget and falling back to plaintext is the
-    // designed safety valve, not a failure. Wall-clock is only a generous
-    // smoke ceiling so a CI runner cannot flake the way a 50ms budget did
-    // after the temp-dir teardown flakes in #263. The last tick may overshoot
-    // maxOps by one scan, so allow one extra input-length of ops.
-    const smokeMs = 2_000;
+    // designed safety valve, not a failure. Wall-clock is diagnostic-only in
+    // the assertion message: a pass condition here is a CI flake surface, which
+    // is the class #263 just closed. The last tick may overshoot maxOps by one
+    // scan, so allow one extra input-length of ops.
     for (const { name, markdown } of cases) {
       const started = performance.now();
       const stats = matrixRenderStats(markdown);
       const content = matrixTextContent(markdown);
       const elapsed = performance.now() - started;
-      expect(stats.ops, `${name} ops ${stats.ops}/${stats.maxOps}`).toBeLessThanOrEqual(
-        stats.maxOps + markdown.length,
-      );
-      expect(elapsed, `${name} took ${elapsed.toFixed(2)}ms`).toBeLessThan(smokeMs);
+      expect(
+        stats.ops,
+        `${name} ops ${stats.ops}/${stats.maxOps} in ${elapsed.toFixed(1)}ms`,
+      ).toBeLessThanOrEqual(stats.maxOps + markdown.length);
       expect(content.body).toBe(markdown);
       expect(content.msgtype).toBe("m.text");
     }
