@@ -525,6 +525,7 @@ const decryptedTextEvent = (input: {
   event_id: input.eventId,
   sender: input.sender,
   content: { msgtype: "m.text", body: input.body },
+  ownershipEpoch: null,
 });
 
 const testLayer = matrixBridgeConfigLayer.pipe(
@@ -1431,6 +1432,7 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
           roomId: ROOM_ID,
           transactionId: "t3-transaction",
           content: { msgtype: "m.text", body: "should never leave" },
+          ownershipEpoch: null,
         }),
       );
       assert.equal(result._tag, "Failure");
@@ -1641,6 +1643,7 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
         roomId: ROOM_ID,
         transactionId: "t3-environment-thread-turn",
         content: { msgtype: "m.text", body: "final answer" },
+        ownershipEpoch: null,
       } as const;
       const firstAttempt = yield* Effect.result(client.sendText(message));
       assert.equal(firstAttempt._tag, "Failure");
@@ -1682,6 +1685,7 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
           roomId: ROOM_ID,
           transactionId: "t3-stale-connection",
           content: { msgtype: "m.text", body: "must not be delivered" },
+          ownershipEpoch: null,
         }),
       );
       // Refused either as a retired connection or as no connection at all,
@@ -1846,6 +1850,7 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
         roomId: ROOM_ID,
         transactionId: "t3-guarded-send",
         content: { msgtype: "m.text", body: "private final" },
+        ownershipEpoch: null,
       } as const;
       yield* client.sendText(message);
       assert.lengthOf(sdk.encryptions, 1);
@@ -1891,6 +1896,7 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
           roomId: ROOM_ID,
           transactionId: "t3-unseen-member",
           content: { msgtype: "m.text", body: "private final" },
+          ownershipEpoch: null,
         }),
       );
 
@@ -1915,6 +1921,7 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
           roomId: ROOM_ID,
           transactionId: "t3-no-reader",
           content: { msgtype: "m.text", body: "private final" },
+          ownershipEpoch: null,
         }),
       );
 
@@ -1948,6 +1955,7 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
           roomId: ROOM_ID,
           transactionId: "t3-racing-leave",
           content: { msgtype: "m.text", body: "private final" },
+          ownershipEpoch: null,
         }),
       );
 
@@ -1980,6 +1988,7 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
           roomId: ROOM_ID,
           transactionId: "t3-reader-swap",
           content: { msgtype: "m.text", body: "private final" },
+          ownershipEpoch: null,
         }),
       );
 
@@ -1997,6 +2006,7 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
         roomId: ROOM_ID,
         transactionId: "t3-reader-swap",
         content: { msgtype: "m.text", body: "private final" },
+        ownershipEpoch: null,
       });
       assert.lengthOf(sdk.encryptions, 2);
     }).pipe(Effect.provide(testLayer)),
@@ -2016,6 +2026,7 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
         roomId: ROOM_ID,
         transactionId: "t3-membership-retry",
         content: { msgtype: "m.text", body: "final answer" },
+        ownershipEpoch: null,
       } as const;
       const firstAttempt = yield* Effect.result(client.sendText(message));
       assert.equal(firstAttempt._tag, "Failure");
@@ -2301,6 +2312,7 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
           roomId: ROOM_ID,
           transactionId: "t3-gappy-join",
           content: { msgtype: "m.text", body: "private final" },
+          ownershipEpoch: null,
         }),
       );
 
@@ -2335,6 +2347,38 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
 
       const connected = yield* Queue.take(memberships);
       assert.deepEqual([...connected.joined], [ALLOWED_USER_ID, BOT_USER_ID]);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("refuses a send once the bridge has moved to another thread", () =>
+    Effect.gen(function* () {
+      const sdk = makeFakeSdk({ joinedMembers: [BOT_USER_ID, ALLOWED_USER_ID] });
+      const configService = yield* configureBridge();
+      const client = yield* startAdapter(sdk);
+      yield* awaitStatusState(configService, "waiting-for-member");
+
+      // Neither the generation nor the room changes when ownership moves, so
+      // the epoch is what tells this send it belongs to the previous owner.
+      const blocked = yield* Effect.result(
+        client.sendText({
+          roomId: ROOM_ID,
+          transactionId: "t3-former-owner",
+          content: { msgtype: "m.text", body: "former owner's final" },
+          ownershipEpoch: 7,
+        }),
+      );
+
+      assert.equal(blocked._tag, "Failure");
+      if (blocked._tag === "Failure") {
+        assert.include(blocked.failure.reason, "moved to another thread");
+        // Transient, so the bridge drops the job on its next owner check rather
+        // than reporting a delivery fault.
+        assert.equal(blocked.failure.retryability, "transient");
+      }
+      assert.lengthOf(
+        sdk.requests.filter((request) => request.endpoint.includes("t3-former-owner")),
+        0,
+      );
     }).pipe(Effect.provide(testLayer)),
   );
 
@@ -2401,6 +2445,7 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
           roomId: ROOM_ID,
           transactionId: "t3-transaction",
           content: { msgtype: "m.text", body: "unreachable" },
+          ownershipEpoch: null,
         }),
       );
       assert.equal(result._tag, "Failure");

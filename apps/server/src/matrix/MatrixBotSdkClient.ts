@@ -1958,6 +1958,17 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
         "permanent",
       );
     }
+    // Ownership can move while the reads and the encryption above are running,
+    // and neither the generation nor the room changes when it does. Transient,
+    // not permanent: the bridge drops the job on its next look at the owner,
+    // and this is a normal move rather than a delivery fault to report.
+    if (message.ownershipEpoch !== null && stored.ownershipEpoch !== message.ownershipEpoch) {
+      return yield* clientError(
+        "send",
+        "The Matrix bridge moved to another thread before the message could be sent.",
+        "transient",
+      );
+    }
 
     // The transaction ID makes the send idempotent across retries: the
     // homeserver returns the original event for a repeated PUT. From here on

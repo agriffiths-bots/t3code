@@ -15,6 +15,12 @@ export interface MatrixBridgeOutboundText {
     readonly msgtype: "m.text";
     readonly body: string;
   };
+  /**
+   * The bridge ownership epoch this message belongs to, checked again against
+   * the live configuration immediately before the send. Gate messages are not
+   * owner-scoped and carry null.
+   */
+  readonly ownershipEpoch: number | null;
 }
 
 /** Decrypted timeline text from the bridged room. */

@@ -121,18 +121,23 @@ export const MATRIX_BRIDGE_INBOUND_OVERFLOW_REASON =
 export const MATRIX_BRIDGE_INBOUND_UNVERIFIED_REASON =
   "Matrix room membership could not be verified, so some messages were not started.";
 
+export const MATRIX_BRIDGE_INBOUND_FAILED_REASON =
+  "Some Matrix messages could not be started. Check the server log for the failure.";
+
 /** Sanitized operator-facing reasons; never a body, token, or room id. */
 export const MATRIX_BRIDGE_DEGRADED_REASONS = {
   "pairing-persist-failure": MATRIX_BRIDGE_PAIRING_PERSIST_FAILURE_REASON,
   "inbound-overflow": MATRIX_BRIDGE_INBOUND_OVERFLOW_REASON,
   "permanent-send-failure": MATRIX_BRIDGE_PERMANENT_SEND_FAILURE_REASON,
   "inbound-unverified": MATRIX_BRIDGE_INBOUND_UNVERIFIED_REASON,
+  "inbound-failed": MATRIX_BRIDGE_INBOUND_FAILED_REASON,
 } as const;
 export type MatrixBridgeDegradedCause = keyof typeof MATRIX_BRIDGE_DEGRADED_REASONS;
 
 /** Reported in this order when more than one fault stands. */
 const MATRIX_BRIDGE_DEGRADED_CAUSE_ORDER = [
   "pairing-persist-failure",
+  "inbound-failed",
   "inbound-unverified",
   "inbound-overflow",
   "permanent-send-failure",

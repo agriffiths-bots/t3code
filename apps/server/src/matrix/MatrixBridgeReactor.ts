@@ -21,6 +21,7 @@ import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as TxQueue from "effect/TxQueue";
@@ -55,6 +56,8 @@ const MATRIX_BRIDGE_SEEN_TURN_CAPACITY = 1_024;
 const MATRIX_BRIDGE_DISPATCH_TIMEOUT_SECONDS = 30;
 /** A transient engine failure must not silently swallow a Matrix command. */
 const MATRIX_BRIDGE_DISPATCH_ATTEMPTS = 3;
+/** Nor may a dependency the handler needs before it can even dispatch. */
+const MATRIX_BRIDGE_INBOUND_ATTEMPTS = 3;
 /**
  * What a paired Matrix account can do through the bridge: read a private
  * thread's output and start turns in it. Pairing therefore accepts only a
@@ -110,6 +113,16 @@ interface PairingJob {
   readonly validWhile: MatrixBridgeConfigV1["pairing"]["state"];
   readonly enqueuedAt: number;
 }
+
+/**
+ * An inbound message the bridge could not turn into work. It fails rather than
+ * returning, so the retry above it runs and the transport keeps its hold on the
+ * sync cursor until the message is handled or reported.
+ */
+export class MatrixBridgeInboundNotHandledError extends Schema.TaggedErrorClass<MatrixBridgeInboundNotHandledError>()(
+  "MatrixBridgeInboundNotHandledError",
+  { eventId: Schema.String },
+) {}
 
 /** Joined membership of the bridged room for one connection generation. */
 interface RoomMembershipState {
@@ -508,6 +521,7 @@ export const make = Effect.gen(function* () {
               roomId: job.roomId,
               transactionId: job.transactionId,
               content: { msgtype: "m.text", body: job.body },
+              ownershipEpoch: job.ownershipEpoch,
             }),
           );
       if (result._tag === "Success") {
@@ -597,6 +611,8 @@ export const make = Effect.gen(function* () {
             roomId: job.roomId,
             transactionId: job.transactionId,
             content: { msgtype: "m.text", body: job.body },
+            // A gate message answers the room, not a bridged thread.
+            ownershipEpoch: null,
           }),
         );
         if (result._tag === "Success") return;
@@ -961,9 +977,11 @@ export const make = Effect.gen(function* () {
       }
     }
 
-    // Out of attempts: forget the event so a redelivery of it can try again,
-    // which the deterministic command id makes safe.
-    forgetEventId(seenEventIds, seenEventOrder, event.eventId);
+    // Out of attempts: fail into the inbound retry above rather than reporting
+    // the message as handled, which would release the transport's hold on the
+    // sync cursor and lose the command. The deterministic command id is what
+    // makes every one of those attempts the same turn.
+    return yield* new MatrixBridgeInboundNotHandledError({ eventId: event.eventId });
   });
 
   const attemptPairing = Effect.fn("MatrixBridgeReactor.attemptPairing")(function* (
@@ -1160,12 +1178,46 @@ export const make = Effect.gen(function* () {
     });
   });
 
+  /**
+   * A message the bridge could not handle is retried rather than swallowed:
+   * the transport releases its hold on the sync cursor once this returns, so a
+   * failure that looks like success here loses the command for good. A
+   * dependency that stays down is reported instead of disappearing.
+   */
+  const handleInboundTextWithRetry = Effect.fn("MatrixBridgeReactor.handleInboundTextWithRetry")(
+    function* (event: MatrixBridgeInboundText) {
+      // Captured before the attempts: a failure belongs to the connection that
+      // received the message, and `reportDegradedIfMatches` drops it if that
+      // connection has since been replaced rather than marking a fresh one.
+      const received = Option.getOrNull(yield* configService.currentConfig);
+      for (let attempt = 0; attempt < MATRIX_BRIDGE_INBOUND_ATTEMPTS; attempt += 1) {
+        const handled = yield* Effect.result(handleInboundText(event));
+        if (handled._tag === "Success") return;
+        yield* Effect.logWarning("Matrix bridge could not handle an inbound message", {
+          attempt: attempt + 1,
+        });
+        // The dedupe entry is what a retry would trip over, so it is released
+        // with the attempt that recorded it.
+        forgetEventId(seenEventIds, seenEventOrder, event.eventId);
+        if (attempt + 1 < MATRIX_BRIDGE_INBOUND_ATTEMPTS) {
+          yield* Effect.sleep(retryDelayMs(attempt));
+        }
+      }
+
+      if (received === null) return;
+      yield* configService.reportDegradedIfMatches({
+        cryptoStoreGeneration: received.cryptoStoreGeneration,
+        cause: "inbound-failed",
+      });
+    },
+  );
+
   const handleInboundEvent = (event: MatrixBridgeInboundEvent): Effect.Effect<void> =>
     (event.kind === "membership"
       ? handleRoomMembership(event)
       : event.kind === "overflow"
         ? handleInboundOverflow(event)
-        : handleInboundText(event)
+        : handleInboundTextWithRetry(event)
     ).pipe(
       Effect.catchCause((cause) =>
         Cause.hasInterruptsOnly(cause)

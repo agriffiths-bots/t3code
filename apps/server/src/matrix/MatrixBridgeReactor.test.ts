@@ -30,6 +30,7 @@ import * as SubscriptionRef from "effect/SubscriptionRef";
 import { TestClock } from "effect/testing";
 
 import { EnvironmentAuth, ServerAuthInvalidCredentialError } from "../auth/EnvironmentAuth.ts";
+import { PersistenceSqlError } from "../persistence/Errors.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import { ServerActivation } from "../serverActivation.ts";
 import { BootstrapTurnStartDispatcher } from "../orchestration/Services/BootstrapTurnStartDispatcher.ts";
@@ -360,6 +361,7 @@ interface ReactorHarness {
   readonly dispatchAttempts: Effect.Effect<ReadonlyArray<DispatchedTurn>>;
   readonly awaitDispatchAttempt: Effect.Effect<void>;
   readonly failNextDispatches: (count: number) => Effect.Effect<void>;
+  readonly failThreadShellReads: (count: number) => Effect.Effect<void>;
   readonly consumedCodes: Effect.Effect<ReadonlyArray<string>>;
   readonly requestedProofs: Effect.Effect<
     ReadonlyArray<{ readonly audienceCeiling: string; readonly scopes: ReadonlyArray<string> }>
@@ -468,6 +470,7 @@ function withHarness<A, E>(
       const dispatchAttemptsRef = yield* Ref.make<ReadonlyArray<DispatchedTurn>>([]);
       const observedDispatchAttempts = yield* Queue.unbounded<void>();
       const failDispatchesRef = yield* Ref.make(0);
+      const failShellReadsRef = yield* Ref.make(0);
       const consumedRef = yield* Ref.make<ReadonlyArray<string>>([]);
       // Only these strings are redeemable; anything else is unknown, expired,
       // revoked, or already spent, which the gate answers identically.
@@ -767,7 +770,19 @@ function withHarness<A, E>(
               Option.map(detail, (thread) => ({ snapshotSequence, thread })),
             ),
           ),
-        getThreadShellByIdIncludingArchived: () => Ref.get(shellRef),
+        getThreadShellByIdIncludingArchived: (threadId) =>
+          Effect.gen(function* () {
+            const failing = yield* Ref.getAndUpdate(failShellReadsRef, (count) =>
+              Math.max(0, count - 1),
+            );
+            if (failing > 0) {
+              return yield* new PersistenceSqlError({
+                operation: "getThreadShellByIdIncludingArchived",
+                detail: `Injected projection failure for ${threadId}.`,
+              });
+            }
+            return yield* Ref.get(shellRef);
+          }),
       });
       const environmentLayer = Layer.mock(ServerEnvironment.ServerEnvironment)({
         getEnvironmentId: Effect.succeed(EnvironmentId.make("matrix-env")),
@@ -835,6 +850,7 @@ function withHarness<A, E>(
           dispatchAttempts: Ref.get(dispatchAttemptsRef),
           awaitDispatchAttempt: Queue.take(observedDispatchAttempts),
           failNextDispatches: (count) => Ref.set(failDispatchesRef, count),
+          failThreadShellReads: (count) => Ref.set(failShellReadsRef, count),
           consumedCodes: Ref.get(consumedRef),
           requestedProofs: Ref.get(requestedProofsRef),
           livePairingCodes: Ref.get(liveCodesRef),
@@ -2794,7 +2810,7 @@ it.effect("prompts again after an undeliverable prompt expires", () =>
   ),
 );
 
-it.effect("retries a failed dispatch under one command id and keeps the message replayable", () =>
+it.effect("retries a failed dispatch under one command id until it lands", () =>
   withHarness((harness) =>
     Effect.gen(function* () {
       yield* harness.fake.awaitListening;
@@ -2803,20 +2819,19 @@ it.effect("retries a failed dispatch under one command id and keeps the message 
       const emitting = yield* harness.fake
         .emitInbound(inboundText({ eventId: "$turn", body: "Do the thing" }))
         .pipe(Effect.forkChild);
+      // Three failures exhaust one round of dispatch attempts; the inbound
+      // retry then starts another rather than dropping the command.
       yield* TestClock.adjust("1 second");
       yield* TestClock.adjust("2 seconds");
+      yield* TestClock.adjust("1 second");
       yield* Fiber.join(emitting);
       yield* harness.reactor.drain;
 
       const attempts = yield* harness.dispatchAttempts;
-      expect(attempts).toHaveLength(3);
-      // One command id across retries, so the engine treats them as one turn.
+      expect(attempts.length).toBeGreaterThan(3);
+      // One command id across every attempt, so the engine treats them as one
+      // turn however many times the bridge had to ask.
       expect(new Set(attempts.map((entry) => entry.commandId)).size).toBe(1);
-      expect(yield* harness.dispatched).toEqual([]);
-
-      // The event was not marked as handled, so a redelivery can still land.
-      yield* harness.fake.emitInbound(inboundText({ eventId: "$turn", body: "Do the thing" }));
-      yield* harness.reactor.drain;
       const dispatched = yield* harness.dispatched;
       expect(dispatched.map((entry) => entry.text)).toEqual(["Do the thing"]);
       expect(dispatched[0]?.commandId).toBe(attempts[0]?.commandId);
@@ -2954,6 +2969,51 @@ it.effect("drops an inbound message stamped for a bridge that has since moved", 
 
       expect(yield* harness.dispatchAttempts).toEqual([]);
       expect(yield* harness.dispatched).toEqual([]);
+    }),
+  ),
+);
+
+it.effect("retries an inbound message whose dependencies fail, then reports it", () =>
+  withHarness((harness) =>
+    Effect.gen(function* () {
+      yield* harness.fake.awaitListening;
+      yield* harness.failThreadShellReads(2);
+
+      // The projection read the handler needs fails before any dispatch, which
+      // used to look like success and let the transport drop the message.
+      const emitting = yield* harness.fake
+        .emitInbound(inboundText({ eventId: "$flaky", body: "Do the thing" }))
+        .pipe(Effect.forkChild);
+      yield* TestClock.adjust("1 second");
+      yield* TestClock.adjust("2 seconds");
+      yield* Fiber.join(emitting);
+      yield* harness.reactor.drain;
+
+      // Third attempt succeeds, so the message still becomes its turn.
+      expect((yield* harness.dispatched).map((entry) => entry.text)).toEqual(["Do the thing"]);
+      expect(yield* harness.statusState).not.toBe("degraded");
+    }),
+  ),
+);
+
+it.effect("reports an inbound message it never managed to handle", () =>
+  withHarness((harness) =>
+    Effect.gen(function* () {
+      yield* harness.fake.awaitListening;
+      yield* harness.failThreadShellReads(99);
+
+      const emitting = yield* harness.fake
+        .emitInbound(inboundText({ eventId: "$doomed", body: "Do the thing" }))
+        .pipe(Effect.forkChild);
+      yield* TestClock.adjust("1 second");
+      yield* TestClock.adjust("2 seconds");
+      yield* Fiber.join(emitting);
+      yield* harness.reactor.drain;
+
+      // Nothing was dispatched and the operator is told, rather than the
+      // message disappearing between the transport and the engine.
+      expect(yield* harness.dispatched).toEqual([]);
+      expect(yield* harness.statusState).toBe("degraded");
     }),
   ),
 );
