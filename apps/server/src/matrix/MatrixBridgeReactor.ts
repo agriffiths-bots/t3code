@@ -906,6 +906,23 @@ export const make = Effect.gen(function* () {
     ),
   );
 
+  /** The bridge this message was taken off the queue for is still the bridge. */
+  const inboundOwnerUnchanged = (
+    config: MatrixBridgeConfigV1,
+    event: MatrixBridgeInboundText,
+    ownerThreadId: ThreadId,
+  ): Effect.Effect<boolean> =>
+    Effect.map(configService.currentConfig, (current) => {
+      const live = Option.getOrNull(current);
+      return (
+        live !== null &&
+        live.cryptoStoreGeneration === config.cryptoStoreGeneration &&
+        live.pairing.state === "paired" &&
+        live.ownershipEpoch === event.ownershipEpoch &&
+        live.ownerThreadId === ownerThreadId
+      );
+    });
+
   const dispatchInboundText = Effect.fn("MatrixBridgeReactor.dispatchInboundText")(function* (
     config: MatrixBridgeConfigV1,
     event: MatrixBridgeInboundText,
@@ -919,14 +936,7 @@ export const make = Effect.gen(function* () {
       // in the thread that is bridged now, or nowhere. Moving the bridge while
       // this waits means the message belongs to the thread it was typed for,
       // which is no longer bridged, so it is dropped rather than redirected.
-      const current = Option.getOrNull(yield* configService.currentConfig);
-      if (
-        current === null ||
-        current.cryptoStoreGeneration !== config.cryptoStoreGeneration ||
-        current.pairing.state !== "paired" ||
-        current.ownershipEpoch !== event.ownershipEpoch ||
-        current.ownerThreadId !== ownerThreadId
-      ) {
+      if (!(yield* inboundOwnerUnchanged(config, event, ownerThreadId))) {
         yield* Effect.logDebug("Matrix bridge dropped an inbound message for a former owner");
         return;
       }
@@ -934,6 +944,13 @@ export const make = Effect.gen(function* () {
       const shell = yield* projection.getThreadShellByIdIncludingArchived(ownerThreadId);
       if (Option.isNone(shell) || shell.value.archivedAt !== null) {
         yield* clearInactiveOwner(ownerThreadId);
+        return;
+      }
+
+      // Read again on the far side of that lookup: it is asynchronous, and the
+      // dispatch below is the irreversible step.
+      if (!(yield* inboundOwnerUnchanged(config, event, ownerThreadId))) {
+        yield* Effect.logDebug("Matrix bridge dropped an inbound message for a former owner");
         return;
       }
 
@@ -1055,12 +1072,17 @@ export const make = Effect.gen(function* () {
     if (config === null || roomId === null || roomId !== event.roomId) return;
 
     const allowed = new Set<string>(config.allowedUserIds);
-    const members = event.joined.filter((userId) => userId !== event.botUserId);
+    const joined = event.joined.filter((userId) => userId !== event.botUserId);
+    const active = [...joined, ...event.invited].filter((userId) => userId !== event.botUserId);
     const next: RoomMembershipState = {
       cryptoStoreGeneration: config.cryptoStoreGeneration,
       botUserId: event.botUserId,
-      allowedMemberPresent: members.some((userId) => allowed.has(userId)),
-      unexpectedMemberPresent: members.some((userId) => !allowed.has(userId)),
+      // Only a joined account can read what is sent now, so only a joined one
+      // is worth prompting or delivering for.
+      allowedMemberPresent: joined.some((userId) => allowed.has(userId)),
+      // An outstanding invitation to an outsider is as unsafe as their
+      // presence: the room starts their view at the invitation.
+      unexpectedMemberPresent: active.some((userId) => !allowed.has(userId)),
     };
     membership = next;
     yield* configService.reportRoomMembershipIfMatches({

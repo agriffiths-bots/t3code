@@ -169,7 +169,6 @@ export interface MatrixSdkCryptoClient {
 export interface MatrixSdkClient {
   readonly crypto?: MatrixSdkCryptoClient | undefined;
   getJoinedRooms(): Promise<ReadonlyArray<string>>;
-  getJoinedRoomMembers(roomId: string): Promise<ReadonlyArray<string>>;
   getRoomState(roomId: string): Promise<ReadonlyArray<unknown>>;
   createRoom(options: MatrixCreateRoomOptions): Promise<string>;
   inviteUser(userId: string, roomId: string): Promise<unknown>;
@@ -336,12 +335,17 @@ function toInboundText(
   };
 }
 
-/** A membership transition for one account in the bridged room. */
+/**
+ * A membership transition for one account in the bridged room. An invitation
+ * counts as active, exactly as the startup verifier counts it: the room starts
+ * a member's view at their invitation, so an invited account will be able to
+ * read whatever is sent from that moment once it joins.
+ */
 function toMembershipChange(
   event: unknown,
   eventRoomId: string,
   roomId: string,
-): { readonly userId: string; readonly joined: boolean } | null {
+): { readonly userId: string; readonly membership: "join" | "invite" | null } | null {
   if (eventRoomId !== roomId) return null;
   const record = readRecord(event);
   if (record === null || record.type !== "m.room.member") return null;
@@ -349,7 +353,8 @@ function toMembershipChange(
   if (userId === null) return null;
   const membership = readString(record.content, "membership");
   if (membership === null) return null;
-  return { userId, joined: membership === "join" };
+  if (membership !== "join" && membership !== "invite") return { userId, membership: null };
+  return { userId, membership };
 }
 
 /** Older stable room versions allow integer strings in power-level content. */
@@ -541,13 +546,20 @@ function readRoomCreation(
 
 /** Joined members and outstanding invitations: both can read what comes next. */
 function activeMembers(state: ReadonlyArray<MatrixRoomStateEvent>): ReadonlyArray<string> {
-  return state
-    .filter((event) => {
-      if (event.type !== "m.room.member") return false;
-      const membership = readString(event.content, "membership");
-      return membership === "join" || membership === "invite";
-    })
-    .map((event) => event.stateKey);
+  return [...activeMemberships(state).keys()];
+}
+
+/** The same, keeping which state each account is in. */
+function activeMemberships(
+  state: ReadonlyArray<MatrixRoomStateEvent>,
+): ReadonlyMap<string, "join" | "invite"> {
+  const members = new Map<string, "join" | "invite">();
+  for (const event of state) {
+    if (event.type !== "m.room.member") continue;
+    const membership = readString(event.content, "membership");
+    if (membership === "join" || membership === "invite") members.set(event.stateKey, membership);
+  }
+  return members;
 }
 
 function membershipOf(state: ReadonlyArray<MatrixRoomStateEvent>, userId: string): string | null {
@@ -1020,11 +1032,13 @@ interface MatrixConnection {
   readonly botUserId: string;
   readonly allowedUserIds: ReadonlySet<string>;
   /**
-   * Joined members, mutated synchronously by the timeline handler. Sending
-   * reads it at the last moment, so a join cannot slip in between a bridge
-   * decision and the encryption that follows it.
+   * Active membership by account, joined or invited, mutated synchronously by
+   * the timeline handler. Sending reads it at the last moment, so an arrival
+   * cannot slip in between a bridge decision and the encryption that follows
+   * it. The two states are kept apart because only a joined account can read
+   * what is sent now, while an invited one still makes the room unsafe.
    */
-  readonly joined: Set<string>;
+  readonly members: Map<string, "join" | "invite">;
   /** Incremented whenever the room's joined membership changes. */
   readonly membershipRevision: { value: number };
   /** Publishes the current membership when it differs from the last snapshot. */
@@ -1053,12 +1067,36 @@ function roomSendState(
   connection: MatrixConnection,
 ): "safe" | "unexpected-member" | "no-allowed-member" {
   let allowedReader = false;
-  for (const userId of connection.joined) {
+  for (const [userId, membership] of connection.members) {
     if (userId === connection.botUserId) continue;
+    // An outstanding invitation to an outsider is as unsafe as their presence.
     if (!connection.allowedUserIds.has(userId)) return "unexpected-member";
-    allowedReader = true;
+    // Only a joined account holds the keys for what is sent now.
+    if (membership === "join") allowedReader = true;
   }
   return allowedReader ? "safe" : "no-allowed-member";
+}
+
+/** Both states of the membership, for the bridge to weigh separately. */
+function membershipLists(members: ReadonlyMap<string, "join" | "invite">): {
+  readonly joined: ReadonlyArray<string>;
+  readonly invited: ReadonlyArray<string>;
+} {
+  const joined: Array<string> = [];
+  const invited: Array<string> = [];
+  for (const [userId, membership] of members) {
+    if (membership === "join") joined.push(userId);
+    else invited.push(userId);
+  }
+  return { joined: joined.toSorted(), invited: invited.toSorted() };
+}
+
+/** Compares the whole membership, so invite-to-join counts as a change. */
+function membershipKey(members: ReadonlyMap<string, "join" | "invite">): string {
+  return [...members]
+    .map(([userId, membership]) => `${userId}:${membership}`)
+    .toSorted()
+    .join("\u0000");
 }
 
 const ROOM_SEND_STATE_REASONS = {
@@ -1080,16 +1118,17 @@ const refreshRoomMembership = Effect.fn("MatrixBotSdkClient.refreshRoomMembershi
 ) {
   for (let attempt = 0; attempt < MATRIX_MEMBERSHIP_READ_ATTEMPTS; attempt += 1) {
     const revisionBeforeRead = connection.membershipRevision.value;
-    const joinedNow = yield* request(
+    const stateNow = yield* request(
       operation,
       "The bridged Matrix room members could not be read.",
-      () => connection.client.getJoinedRoomMembers(connection.roomId),
+      () => connection.client.getRoomState(connection.roomId),
     );
+    const activeNow = activeMemberships(readRoomState(stateNow));
     if (connection.membershipRevision.value !== revisionBeforeRead) continue;
-    const before = [...connection.joined].toSorted().join("\u0000");
-    connection.joined.clear();
-    for (const userId of joinedNow) connection.joined.add(userId);
-    if ([...connection.joined].toSorted().join("\u0000") !== before) {
+    const before = membershipKey(connection.members);
+    connection.members.clear();
+    for (const [userId, membership] of activeNow) connection.members.set(userId, membership);
+    if (membershipKey(connection.members) !== before) {
       // An authoritative change counts like a timeline one: it moves the
       // revision and retires ciphertext encrypted for the previous devices,
       // except where a send under that transaction may already have landed.
@@ -1558,7 +1597,7 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
     yield* Effect.logDebug("Matrix bridge waiting for its first sync response");
     yield* fence.awaitSyncBoundary;
 
-    const joined = new Set<string>();
+    const members = new Map<string, "join" | "invite">();
     const membershipRevision = { value: 0 };
     const membershipQueue = yield* Queue.sliding<MatrixBridgeRoomMembership>(1);
     const encryptedPayloads = new Map<string, unknown>();
@@ -1589,7 +1628,7 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
       kind: "membership",
       roomId,
       botUserId,
-      joined: [...joined].toSorted(),
+      ...membershipLists(members),
     });
     // Registered before the first read, so a change during it bumps the
     // revision and forces the read again rather than being missed until the
@@ -1599,9 +1638,11 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
         const timelineHandler: MatrixSdkEventHandler = (eventRoomId, event) => {
           const change = toMembershipChange(event, eventRoomId, roomId);
           if (change === null) return;
-          const changed = joined.has(change.userId) !== change.joined;
-          if (change.joined) joined.add(change.userId);
-          else joined.delete(change.userId);
+          // Invite to join is a change too: it is what makes an allowed
+          // account a reader, and what retires ciphertext built without them.
+          const changed = (members.get(change.userId) ?? null) !== change.membership;
+          if (change.membership === null) members.delete(change.userId);
+          else members.set(change.userId, change.membership);
           if (!changed) return;
           membershipRevision.value += 1;
           // A held retry must not present a session the current members may not
@@ -1626,11 +1667,13 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
       const seeded = yield* request(
         "listen",
         "The bridged Matrix room members could not be read.",
-        () => client.getJoinedRoomMembers(roomId),
+        () => client.getRoomState(roomId),
       );
       if (membershipRevision.value !== revisionBeforeRead) continue;
-      joined.clear();
-      for (const userId of seeded) joined.add(userId);
+      members.clear();
+      for (const [userId, membership] of activeMemberships(readRoomState(seeded))) {
+        members.set(userId, membership);
+      }
       break;
     }
 
@@ -1640,11 +1683,11 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
       client,
       botUserId,
       allowedUserIds: new Set(config.allowedUserIds),
-      joined,
+      members,
       membershipRevision,
       publishMembership: Effect.suspend(() => {
         const snapshot = membershipEvent();
-        const key = snapshot.joined.join("\u0000");
+        const key = `${snapshot.joined.join("\u0000")}|${snapshot.invited.join("\u0000")}`;
         if (key === lastPublishedMembers) return Effect.void;
         lastPublishedMembers = key;
         return Queue.offer(membershipQueue, snapshot).pipe(Effect.asVoid);
@@ -1683,7 +1726,7 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
     // it, so a reconnect never delivers under the previous connection's
     // membership and the first published status already reflects the room.
     const initialMembership = membershipEvent();
-    lastPublishedMembers = initialMembership.joined.join("\u0000");
+    lastPublishedMembers = `${initialMembership.joined.join("\u0000")}|${initialMembership.invited.join("\u0000")}`;
     yield* onInboundText(initialMembership);
 
     yield* Effect.acquireRelease(Ref.set(connectionRef, Option.some(connection)), () =>

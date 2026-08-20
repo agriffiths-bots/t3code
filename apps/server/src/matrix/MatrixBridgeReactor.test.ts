@@ -344,8 +344,11 @@ function inboundText(input: {
   };
 }
 
-function inboundMembership(joined: ReadonlyArray<string>): MatrixBridgeRoomMembership {
-  return { kind: "membership", roomId, botUserId, joined };
+function inboundMembership(
+  joined: ReadonlyArray<string>,
+  invited: ReadonlyArray<string> = [],
+): MatrixBridgeRoomMembership {
+  return { kind: "membership", roomId, botUserId, joined, invited };
 }
 
 interface DispatchedTurn {
@@ -2245,6 +2248,49 @@ it.effect(
         ),
       ),
     ),
+);
+
+it.effect("waits for the allowed account to join, not merely to be invited", () =>
+  withHarness(
+    (harness) =>
+      Effect.gen(function* () {
+        yield* harness.fake.awaitListening;
+
+        // An invitation is not a reader: their devices hold no key for a
+        // prompt sent now, and the room is theirs to enter later.
+        yield* harness.fake.emitInbound(inboundMembership([botUserId], [allowedUserId]));
+        yield* harness.reactor.drain;
+        expect(yield* harness.fake.sent).toEqual([]);
+        expect(yield* harness.statusState).toBe("waiting-for-member");
+
+        yield* harness.fake.emitInbound(inboundMembership([botUserId, allowedUserId]));
+        yield* harness.reactor.drain;
+        expect((yield* harness.fake.sent).map((entry) => entry.content.body)).toEqual([
+          MATRIX_BRIDGE_PAIRING_PROMPT,
+        ]);
+      }),
+    {
+      pairing: { state: "unpaired" },
+      initialStatusState: "waiting-for-member",
+      initialMembers: null,
+    },
+  ),
+);
+
+it.effect("treats an invitation to an outside account as unsafe", () =>
+  withHarness((harness) =>
+    Effect.gen(function* () {
+      yield* harness.fake.awaitListening;
+      yield* harness.fake.emitInbound(
+        inboundMembership([botUserId, allowedUserId], ["@stranger:example"]),
+      );
+      yield* harness.reactor.drain;
+
+      // The room starts a member's view at their invitation, so output pauses
+      // before they can accept it rather than after.
+      expect(yield* harness.statusState).toBe("degraded");
+    }),
+  ),
 );
 
 it.effect("prompts once an allowed member joins and never before", () =>

@@ -56,7 +56,7 @@ interface RecordedRequest {
 interface FakeSdkOptions {
   readonly roomState?: Record<string, unknown>;
   readonly joinedRooms?: ReadonlyArray<string>;
-  /** The homeserver's own view of who is joined to the bridged room. */
+  /** Accounts joined to the bridged room, on top of the bot itself. */
   readonly joinedMembers?: ReadonlyArray<string>;
   readonly syncToken?: string | null;
   readonly storedFilter?: MatrixSdkFilterInfo | null;
@@ -146,6 +146,8 @@ interface FakeSdk {
   readonly emitTimeline: (roomId: string, event: unknown) => void;
   /** Joins an account the way a gappy sync does: no room event is emitted. */
   readonly joinSilently: (userId: string) => void;
+  /** The same for an invitation nobody announced. */
+  readonly inviteSilently: (userId: string) => void;
   /** The same for a leave the client never hears about. */
   readonly leaveSilently: (userId: string) => void;
   /** Runs once, inside the next membership read, to race a change against it. */
@@ -161,9 +163,6 @@ interface FakeSdk {
 
 const makeFakeSdk = (options: FakeSdkOptions = {}): FakeSdk => {
   const createdRooms: Array<MatrixCreateRoomOptions> = [];
-  // The homeserver's own view of the room, which a membership event updates
-  // before any client hears about it.
-  const joinedMembers = new Set(options.joinedMembers ?? [BOT_USER_ID]);
   let membersReadHook: (() => void) | null = null;
   let everyMembersReadHook: (() => void) | null = null;
   let encryptHook: (() => void) | null = null;
@@ -179,8 +178,11 @@ const makeFakeSdk = (options: FakeSdkOptions = {}): FakeSdk => {
   const handlers = new Map<string, Set<MatrixSdkEventHandler>>();
   const knownRoomKeys = new Set<string>();
   const invitations: Array<{ readonly userId: string; readonly roomId: string }> = [];
+  // The homeserver's own view of the room, which a membership event updates
+  // before any client hears about it.
   const roomMembership = new Map<string, string>([
     [BOT_USER_ID, "join"],
+    ...(options.joinedMembers ?? []).map((userId) => [userId, "join"] as const),
     ...Object.entries(options.roomMembership ?? {}),
   ]);
   const started = Deferred.makeUnsafe<void>();
@@ -321,22 +323,11 @@ const makeFakeSdk = (options: FakeSdkOptions = {}): FakeSdk => {
       return Promise.resolve(options.joinedRooms ?? [ROOM_ID]);
     }
 
-    getJoinedRoomMembers(_roomId: string): Promise<ReadonlyArray<string>> {
+    getRoomState(_roomId: string): Promise<ReadonlyArray<unknown>> {
       if (failingMemberReads > 0) {
         failingMemberReads -= 1;
         return Promise.reject(httpError(502));
       }
-      // Deliberately the pre-hook snapshot: a homeserver answers what it knew
-      // when the request arrived.
-      const snapshot = [...joinedMembers];
-      const hook = membersReadHook;
-      membersReadHook = null;
-      hook?.();
-      everyMembersReadHook?.();
-      return Promise.resolve(snapshot);
-    }
-
-    getRoomState(_roomId: string): Promise<ReadonlyArray<unknown>> {
       const events: Array<unknown> = [
         {
           type: "m.room.create",
@@ -358,12 +349,22 @@ const makeFakeSdk = (options: FakeSdkOptions = {}): FakeSdk => {
           content: { membership },
         })),
       ];
+      // Deliberately the pre-hook snapshot: a homeserver answers what it knew
+      // when the request arrived.
+      const hook = membersReadHook;
+      membersReadHook = null;
+      hook?.();
+      everyMembersReadHook?.();
       return Promise.resolve(events);
     }
 
     createRoom(createOptions: MatrixCreateRoomOptions): Promise<string> {
       createdRooms.push(createOptions);
-      for (const userId of createOptions.invite) roomMembership.set(userId, "invite");
+      // Inviting an account that is already in the room is a no-op, as it is
+      // on a homeserver.
+      for (const userId of createOptions.invite) {
+        if (!roomMembership.has(userId)) roomMembership.set(userId, "invite");
+      }
       const roomId = (options.roomIds ?? [])[createdRooms.length - 1] ?? ROOM_ID;
       return Promise.resolve(roomId);
     }
@@ -489,16 +490,23 @@ const makeFakeSdk = (options: FakeSdkOptions = {}): FakeSdk => {
         content?: { membership?: string };
       };
       if (record.type === "m.room.member" && typeof record.state_key === "string") {
-        if (record.content?.membership === "join") joinedMembers.add(record.state_key);
-        else joinedMembers.delete(record.state_key);
+        const membership = record.content?.membership;
+        if (membership === undefined || membership === "leave") {
+          roomMembership.delete(record.state_key);
+        } else {
+          roomMembership.set(record.state_key, membership);
+        }
       }
       for (const handler of handlers.get("room.event") ?? []) handler(roomId, event);
     },
     joinSilently: (userId) => {
-      joinedMembers.add(userId);
+      roomMembership.set(userId, "join");
+    },
+    inviteSilently: (userId) => {
+      roomMembership.set(userId, "invite");
     },
     leaveSilently: (userId) => {
-      joinedMembers.delete(userId);
+      roomMembership.delete(userId);
     },
     onMembersRead: (hook) => {
       membersReadHook = hook;
@@ -2087,7 +2095,7 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
 
   it.effect("reconciles a membership change the timeline never reported", () =>
     Effect.gen(function* () {
-      const sdk = makeFakeSdk({ joinedMembers: [BOT_USER_ID] });
+      const sdk = makeFakeSdk();
       const memberships = yield* Queue.unbounded<MatrixBridgeRoomMembership>();
       const configService = yield* configureBridge();
       yield* startAdapter(sdk, (event) =>
@@ -2095,20 +2103,26 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
           ? Queue.offer(memberships, event).pipe(Effect.asVoid)
           : Effect.void,
       );
+      // Nothing reports membership back to the config service in this test, so
+      // readiness is all the status shows.
       yield* awaitStatusState(configService, "waiting-for-member");
       const connected = yield* Queue.take(memberships);
+      // Creating the room invites the allowed account: not a reader yet, but
+      // already an active membership.
       assert.deepEqual([...connected.joined], [BOT_USER_ID]);
+      assert.deepEqual([...connected.invited], [ALLOWED_USER_ID]);
 
-      // The reader joined during a sync gap, so no room event ever arrives and
-      // nothing else would prompt them.
-      sdk.joinSilently(ALLOWED_USER_ID);
+      // Another account joined during a sync gap, so no room event arrives and
+      // only the interval will notice.
+      sdk.joinSilently("@late:example.test");
       const ticker = yield* Effect.forkChild(
         Effect.forever(TestClock.adjust("60 seconds").pipe(Effect.andThen(Effect.yieldNow))),
       );
       const reconciled = yield* Queue.take(memberships);
       yield* Fiber.interrupt(ticker);
 
-      assert.deepEqual([...reconciled.joined], [ALLOWED_USER_ID, BOT_USER_ID]);
+      assert.deepEqual([...reconciled.joined], ["@late:example.test", BOT_USER_ID]);
+      assert.deepEqual([...reconciled.invited], [ALLOWED_USER_ID]);
     }).pipe(Effect.provide(testLayer)),
   );
 
@@ -2377,6 +2391,59 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
       }
       assert.lengthOf(
         sdk.requests.filter((request) => request.endpoint.includes("t3-former-owner")),
+        0,
+      );
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("treats an invitation to an outside account as unsafe, announced or not", () =>
+    Effect.gen(function* () {
+      const sdk = makeFakeSdk({ joinedMembers: [ALLOWED_USER_ID] });
+      const configService = yield* configureBridge();
+      const client = yield* startAdapter(sdk);
+      yield* awaitStatusState(configService, "waiting-for-member");
+
+      const message = {
+        roomId: ROOM_ID,
+        transactionId: "t3-invited-outsider",
+        content: { msgtype: "m.text", body: "private final" },
+        ownershipEpoch: null,
+      } as const;
+      yield* client.sendText(message);
+      assert.lengthOf(sdk.encryptions, 1);
+
+      // The room starts a member's view at their invitation, so an outside
+      // account holding one will read whatever is sent from now on once it
+      // joins. Announced on the timeline:
+      sdk.emitTimeline(
+        ROOM_ID,
+        membershipEvent({ userId: "@invited:example.test", membership: "invite" }),
+      );
+      const announced = yield* Effect.result(
+        client.sendText({ ...message, transactionId: "t3-invited-outsider-2" }),
+      );
+      assert.equal(announced._tag, "Failure");
+      if (announced._tag === "Failure") {
+        assert.include(announced.failure.reason, "outside the allowed list");
+      }
+
+      sdk.emitTimeline(
+        ROOM_ID,
+        membershipEvent({ userId: "@invited:example.test", membership: "leave" }),
+      );
+      yield* client.sendText({ ...message, transactionId: "t3-invited-outsider-3" });
+
+      // And through a sync gap, where only the homeserver knows:
+      sdk.inviteSilently("@quiet:example.test");
+      const unannounced = yield* Effect.result(
+        client.sendText({ ...message, transactionId: "t3-invited-outsider-4" }),
+      );
+      assert.equal(unannounced._tag, "Failure");
+      if (unannounced._tag === "Failure") {
+        assert.include(unannounced.failure.reason, "outside the allowed list");
+      }
+      assert.lengthOf(
+        sdk.requests.filter((request) => request.endpoint.includes("t3-invited-outsider-4")),
         0,
       );
     }).pipe(Effect.provide(testLayer)),

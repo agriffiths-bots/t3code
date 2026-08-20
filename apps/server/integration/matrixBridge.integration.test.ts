@@ -66,6 +66,7 @@ const applyRoomMembership = (fake: FakeMatrixBridgeClient) =>
         roomId,
         botUserId,
         joined: [botUserId, allowedUserId],
+        invited: [],
       }),
     ),
     Effect.asVoid,

@@ -47,15 +47,23 @@ export interface MatrixBridgeInboundText {
 }
 
 /**
- * Joined membership of the bridged room, published once per connection and
- * again on every membership change. The bridge compares it against the allowed
- * list to decide whether it may prompt for pairing or keep sending.
+ * Active membership of the bridged room, joined and invited alike, published
+ * once per connection and again on every change. The bridge compares it
+ * against the allowed list to decide whether it may prompt for pairing or keep
+ * sending; an invitation counts because the room starts a member's view at
+ * their invitation.
  */
 export interface MatrixBridgeRoomMembership {
   readonly kind: "membership";
   readonly roomId: string;
   readonly botUserId: string;
+  /** Accounts in the room now. Only a joined account can read what is sent. */
   readonly joined: ReadonlyArray<string>;
+  /**
+   * Accounts holding an outstanding invitation. They cannot read yet, but the
+   * room starts their view at the invitation, so they will once they join.
+   */
+  readonly invited: ReadonlyArray<string>;
 }
 
 /**

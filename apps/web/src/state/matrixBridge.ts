@@ -49,6 +49,10 @@ export const matrixBridgeSavedConfig = createEnvironmentRpcQueryAtomFamily(conne
   tag: WS_METHODS.matrixBridgeGetConfig,
   staleTimeMs: 5_000,
   idleTtlMs: 60_000,
+  // Another client can reconfigure or disconnect this bridge, and the status
+  // stream carries no saved connection to notice it by, so the answer is
+  // re-asked on an interval rather than trusted for the life of the app.
+  refreshIntervalMs: 60_000,
 });
 
 /**
