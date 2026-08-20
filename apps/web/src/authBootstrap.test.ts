@@ -1,6 +1,8 @@
 import {
   EnvironmentAuthInvalidError,
+  EnvironmentInternalError,
   type AuthBrowserSessionResult,
+  type AuthClientSessionRevokeResult,
   type AuthCreatePairingCredentialInput,
   type AuthSessionState,
   type DesktopBridge,
@@ -99,7 +101,10 @@ async function installAuthApi(input: {
   readonly session?: () => AuthSessionState;
   readonly browserSession?: (
     credential: string,
-  ) => Effect.Effect<AuthBrowserSessionResult, EnvironmentAuthInvalidError>;
+  ) => Effect.Effect<
+    AuthBrowserSessionResult,
+    EnvironmentAuthInvalidError | EnvironmentInternalError
+  >;
   readonly pairingCredential?: (payload: AuthCreatePairingCredentialInput) => Effect.Effect<{
     readonly id: string;
     readonly credential: string;
@@ -107,6 +112,7 @@ async function installAuthApi(input: {
     readonly label?: string;
     readonly expiresAt: DateTime.Utc;
   }>;
+  readonly signOut?: () => Effect.Effect<AuthClientSessionRevokeResult>;
 }) {
   const testApi = await installEnvironmentHttpTest({
     ...(input.session ? { session: () => Effect.succeed(input.session!()) } : {}),
@@ -116,6 +122,7 @@ async function installAuthApi(input: {
     ...(input.pairingCredential
       ? { pairingCredential: (payload) => input.pairingCredential!(payload) }
       : {}),
+    ...(input.signOut ? { signOut: input.signOut } : {}),
   });
   disposeHttpTest = testApi.dispose;
   return testApi;
@@ -365,6 +372,40 @@ describe("resolveInitialServerAuthGateState", () => {
     expect(testApi.calls.browserSession).toEqual([{ credential: "bad-token" }]);
   });
 
+  it("surfaces a replacement failure without treating it as a consumed pairing token", async () => {
+    const cause = new EnvironmentInternalError({
+      code: "internal_error",
+      reason: "browser_session_replacement_failed",
+      traceId: "trace-replacement-failed",
+    });
+    const testApi = await installAuthApi({
+      browserSession: () => Effect.fail(cause),
+    });
+
+    const { isPrimaryEnvironmentSessionReplacementError, submitServerAuthCredential } =
+      await import("./environments/primary");
+
+    const error = await submitServerAuthCredential("replace-token").then(
+      () => null,
+      (failure: unknown) => failure,
+    );
+    expect(error).toMatchObject({
+      _tag: "PrimaryEnvironmentSessionReplacementError",
+      message: "Could not replace the existing session, nothing changed.",
+    });
+    expect(isPrimaryEnvironmentSessionReplacementError(error)).toBe(true);
+    if (!isPrimaryEnvironmentSessionReplacementError(error)) {
+      throw new Error("Expected a structured session replacement error.");
+    }
+    expect(error.cause).toMatchObject({
+      _tag: "EnvironmentInternalError",
+      code: "internal_error",
+      reason: "browser_session_replacement_failed",
+      traceId: "trace-replacement-failed",
+    });
+    expect(testApi.calls.browserSession).toEqual([{ credential: "replace-token" }]);
+  });
+
   it("derives primary request messages from structural request context", async () => {
     const cause = new Error("private transport detail");
     const { PrimaryEnvironmentRequestError } = await import("./environments/primary");
@@ -483,5 +524,31 @@ describe("resolveInitialServerAuthGateState", () => {
         scopes: ["orchestration:read"],
       },
     ]);
+  });
+
+  it("redeems a pairing credential after the browser is already authenticated", async () => {
+    const testApi = await installAuthApi({
+      session: () => authenticatedSession(LOOPBACK_AUTH),
+      browserSession: () => Effect.succeed(browserSession(["orchestration:read", "access:write"])),
+    });
+    const { resolveInitialServerAuthGateState, submitServerAuthCredential } =
+      await import("./environments/primary");
+
+    await expect(resolveInitialServerAuthGateState()).resolves.toEqual({
+      status: "authenticated",
+    });
+    await expect(submitServerAuthCredential("upgrade-token")).resolves.toBeUndefined();
+    expect(testApi.calls.browserSession).toEqual([{ credential: "upgrade-token" }]);
+  });
+
+  it("lets a standard-scope session sign itself out without access:write", async () => {
+    const testApi = await installAuthApi({
+      session: () => authenticatedSession(LOOPBACK_AUTH),
+      signOut: () => Effect.succeed({ revoked: true }),
+    });
+    const { signOutCurrentServerSession } = await import("./environments/primary");
+
+    await expect(signOutCurrentServerSession()).resolves.toBeUndefined();
+    expect(testApi.calls.signOut).toBe(1);
   });
 });

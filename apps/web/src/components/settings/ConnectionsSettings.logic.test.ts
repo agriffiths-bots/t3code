@@ -16,6 +16,7 @@ import {
   parseRemotePairingHostChange,
   parseRemotePairingFields,
   showMatrixBridgeDisconnect,
+  clientSessionRowAction,
 } from "./ConnectionsSettings.logic";
 
 const baseWslState: DesktopWslState = {
@@ -163,6 +164,21 @@ describe("remote pairing field parsing", () => {
         cloudflareAccessClientId: "client-id",
       }),
     ).toThrowError("Enter both Cloudflare Access service token fields.");
+  });
+});
+
+describe("clientSessionRowAction", () => {
+  it("lets a session without access:write sign itself out", () => {
+    expect(clientSessionRowAction({ isCurrent: true, canManageAccess: false })).toBe("sign-out");
+  });
+
+  it("lets an administrative session sign itself out", () => {
+    expect(clientSessionRowAction({ isCurrent: true, canManageAccess: true })).toBe("sign-out");
+  });
+
+  it("scope-gates revoking other sessions behind access:write", () => {
+    expect(clientSessionRowAction({ isCurrent: false, canManageAccess: true })).toBe("revoke");
+    expect(clientSessionRowAction({ isCurrent: false, canManageAccess: false })).toBeNull();
   });
 });
 

@@ -182,6 +182,112 @@ export function PairingRouteSurface({
   );
 }
 
+export function AuthenticatedPairingApplySurface({
+  onAuthenticated,
+  onContinueWithoutApplying,
+}: {
+  onAuthenticated: () => void;
+  onContinueWithoutApplying: () => void;
+}) {
+  const autoPairTokenRef = useRef<string | null>(peekPairingTokenFromUrl());
+  const [errorMessage, setErrorMessage] = useState("");
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const autoSubmitAttemptedRef = useRef(false);
+  const primaryEnvironmentId = usePrimaryEnvironmentId();
+  const primaryEnvironmentIdRef = useRef(primaryEnvironmentId);
+  primaryEnvironmentIdRef.current = primaryEnvironmentId;
+  const retryPrimaryEnvironment = useAtomCommand(environmentCatalog.retryNow, {
+    reportFailure: false,
+  });
+
+  const submitCredential = useCallback(
+    async (nextCredential: string) => {
+      setIsSubmitting(true);
+      setErrorMessage("");
+
+      const submitError = await submitPairingCredentialAndUnblock(
+        {
+          submitServerAuthCredential,
+          retryPrimaryEnvironment,
+          getPrimaryEnvironmentId: () => primaryEnvironmentIdRef.current,
+          errorMessageFromUnknown,
+        },
+        nextCredential,
+      );
+
+      setIsSubmitting(false);
+
+      if (submitError) {
+        setErrorMessage(submitError);
+        return;
+      }
+
+      startTransition(() => {
+        onAuthenticated();
+      });
+    },
+    [onAuthenticated, retryPrimaryEnvironment],
+  );
+
+  useEffect(() => {
+    if (autoSubmitAttemptedRef.current) {
+      return;
+    }
+    autoSubmitAttemptedRef.current = true;
+
+    const token = autoPairTokenRef.current;
+    if (!token) {
+      setErrorMessage("This pairing link is missing its token.");
+      return;
+    }
+
+    stripPairingTokenFromUrl();
+    void submitCredential(token);
+  }, [submitCredential]);
+
+  return (
+    <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-background px-4 py-10 text-foreground sm:px-6">
+      <div className="pointer-events-none absolute inset-0 opacity-80">
+        <div className="absolute inset-x-0 top-0 h-44 bg-[radial-gradient(44rem_16rem_at_top,color-mix(in_srgb,var(--color-emerald-500)_14%,transparent),transparent)]" />
+        <div className="absolute inset-y-0 left-0 w-72 bg-[radial-gradient(28rem_18rem_at_left,color-mix(in_srgb,var(--color-sky-500)_10%,transparent),transparent)]" />
+        <div className="absolute inset-0 bg-[linear-gradient(145deg,color-mix(in_srgb,var(--background)_90%,var(--color-black))_0%,var(--background)_55%)]" />
+      </div>
+
+      <section className="relative w-full max-w-xl rounded-2xl border border-border/80 bg-card/90 p-6 shadow-2xl shadow-black/20 backdrop-blur-md sm:p-8">
+        <p className="text-[11px] font-semibold tracking-[0.18em] text-muted-foreground uppercase">
+          {APP_DISPLAY_NAME}
+        </p>
+        <h1 className="mt-3 text-2xl font-semibold tracking-tight sm:text-3xl">
+          {errorMessage ? "Pairing link was not applied" : "Applying pairing link"}
+        </h1>
+        <p className="mt-2 text-sm leading-relaxed text-muted-foreground">
+          {errorMessage
+            ? "This browser kept its current session. Request a new pairing link if you still need to change permissions."
+            : "This one-time link replaces the session on this browser with the permissions it grants."}
+        </p>
+
+        {errorMessage ? (
+          <div className="mt-5 rounded-lg border border-destructive/30 bg-destructive/6 px-3 py-2 text-sm text-destructive">
+            {errorMessage}
+          </div>
+        ) : null}
+
+        <div className="mt-6 flex flex-wrap gap-2">
+          {isSubmitting && !errorMessage ? (
+            <Button disabled size="sm">
+              Pairing...
+            </Button>
+          ) : (
+            <Button size="sm" variant="outline" onClick={onContinueWithoutApplying}>
+              Continue with current session
+            </Button>
+          )}
+        </div>
+      </section>
+    </div>
+  );
+}
+
 export function HostedPairingRouteSurface() {
   const connectPairingEnvironment = useAtomCommand(connectPairing, {
     reportFailure: false,

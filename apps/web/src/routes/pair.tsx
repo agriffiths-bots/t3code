@@ -1,23 +1,26 @@
 import { createFileRoute, redirect, useNavigate } from "@tanstack/react-router";
 
 import {
+  AuthenticatedPairingApplySurface,
   HostedPairingRouteSurface,
   PairingPendingSurface,
   PairingRouteSurface,
 } from "../components/auth/PairingRouteSurface";
+import { peekPairingTokenFromUrl } from "../environments/primary";
+import { pairRouteDisposition } from "./pair.logic";
 
 export const Route = createFileRoute("/pair")({
   beforeLoad: async ({ context }) => {
     const { authGateState } = context;
-    if (authGateState.status === "hosted-pairing") {
-      return {
-        authGateState,
-      };
-    }
+    const disposition = pairRouteDisposition({
+      authStatus: authGateState.status,
+      pairingToken: peekPairingTokenFromUrl(),
+    });
 
-    if (authGateState.status === "authenticated" || authGateState.status === "hosted-static") {
+    if (disposition === "redirect-home") {
       throw redirect({ to: "/", replace: true });
     }
+
     return {
       authGateState,
     };
@@ -38,12 +41,29 @@ function PairRouteView() {
     return <HostedPairingRouteSurface />;
   }
 
+  const goHome = () => {
+    void navigate({ to: "/", replace: true });
+  };
+
+  if (authGateState.status === "authenticated") {
+    return (
+      <AuthenticatedPairingApplySurface
+        onAuthenticated={() => {
+          window.location.replace("/");
+        }}
+        onContinueWithoutApplying={goHome}
+      />
+    );
+  }
+
+  if (authGateState.status !== "requires-auth") {
+    return null;
+  }
+
   return (
     <PairingRouteSurface
       auth={authGateState.auth}
-      onAuthenticated={() => {
-        void navigate({ to: "/", replace: true });
-      }}
+      onAuthenticated={goHome}
       {...(authGateState.errorMessage ? { initialErrorMessage: authGateState.errorMessage } : {})}
     />
   );

@@ -137,6 +137,32 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
     }).pipe(Effect.provide(makeEnvironmentAuthLayer())),
   );
 
+  it.effect("revokes a standard-scope browser session without requiring access:write", () =>
+    Effect.gen(function* () {
+      const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+      const sessions = yield* SessionStore.SessionStore;
+      const pairingCredential = yield* serverAuth.issuePairingCredential({
+        audienceCeiling: "private",
+      });
+      const exchanged = yield* serverAuth.createBrowserSession(
+        pairingCredential.credential,
+        requestMetadata,
+      );
+      const verified = yield* serverAuth.authenticateHttpRequest(
+        makeCookieRequest(sessions.cookieName, exchanged.sessionToken),
+      );
+
+      expect(verified.scopes.includes("access:write")).toBe(false);
+      const revoked = yield* serverAuth.revokeSession(verified.sessionId);
+      const error = yield* serverAuth
+        .authenticateHttpRequest(makeCookieRequest(sessions.cookieName, exchanged.sessionToken))
+        .pipe(Effect.flip);
+
+      expect(revoked).toBe(true);
+      expect(error._tag).toBe("ServerAuthInvalidCredentialError");
+    }).pipe(Effect.provide(makeEnvironmentAuthLayer())),
+  );
+
   it.effect("accepts the legacy hosted cookie during production loopback upgrades", () =>
     Effect.gen(function* () {
       const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;

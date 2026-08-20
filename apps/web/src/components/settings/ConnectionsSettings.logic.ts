@@ -15,6 +15,20 @@ export function isQrShareableEndpoint(endpoint: AdvertisedEndpoint): boolean {
   return endpoint.status !== "unavailable" && endpoint.reachability !== "loopback";
 }
 
+/**
+ * Current-device sign-out is self-service. Administrative revoke of other
+ * clients stays behind access:write.
+ */
+export function clientSessionRowAction(input: {
+  readonly isCurrent: boolean;
+  readonly canManageAccess: boolean;
+}): "sign-out" | "revoke" | null {
+  if (input.isCurrent) {
+    return "sign-out";
+  }
+  return input.canManageAccess ? "revoke" : null;
+}
+
 export type QrEndpointOption = {
   readonly id: string;
   readonly preferenceKey: string;

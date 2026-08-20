@@ -317,11 +317,26 @@ const browserOtlpTracingLayer = Layer.mergeAll(
   Layer.succeed(HttpClient.TracerDisabledWhen, () => true),
 );
 
-const makeAuthTestLayer = () =>
-  EnvironmentAuth.layer.pipe(
+const makeAuthTestLayer = (
+  wrap?: (
+    inner: EnvironmentAuth.EnvironmentAuth["Service"],
+  ) => EnvironmentAuth.EnvironmentAuth["Service"],
+) => {
+  const base = EnvironmentAuth.layer.pipe(
     Layer.provide(SqlitePersistenceMemory),
     Layer.provide(ServerSecretStore.layer),
   );
+  if (wrap === undefined) {
+    return base;
+  }
+  return Layer.effect(
+    EnvironmentAuth.EnvironmentAuth,
+    Effect.gen(function* () {
+      const inner = yield* EnvironmentAuth.EnvironmentAuth;
+      return wrap(inner);
+    }),
+  ).pipe(Layer.provideMerge(base));
+};
 
 const makeBrowserOtlpPayload = (spanName: string) =>
   Effect.gen(function* () {
@@ -424,6 +439,9 @@ const makeBrowserOtlpPayload = (spanName: string) =>
 
 const buildAppUnderTest = (options?: {
   config?: Partial<ServerConfig.ServerConfig["Service"]>;
+  wrapEnvironmentAuth?: (
+    inner: EnvironmentAuth.EnvironmentAuth["Service"],
+  ) => EnvironmentAuth.EnvironmentAuth["Service"];
   layers?: {
     keybindings?: Partial<Keybindings.Keybindings["Service"]>;
     providerRegistry?: Partial<ProviderRegistry.ProviderRegistry["Service"]>;
@@ -1138,7 +1156,7 @@ const buildAppUnderTest = (options?: {
           ...options?.layers?.cloudCliTokenManager,
         }),
       ),
-      Layer.provideMerge(makeAuthTestLayer()),
+      Layer.provideMerge(makeAuthTestLayer(options?.wrapEnvironmentAuth)),
       Layer.provideMerge(MatrixBridgeConfig.layer.pipe(Layer.provide(ServerSecretStore.layer))),
       Layer.provideMerge(ServerSecretStore.layer),
       Layer.provide(workspaceAndProjectServicesLayer),
@@ -1801,6 +1819,141 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       assert.equal(sessionBody.authenticated, true);
       assert.equal(sessionBody.sessionMethod, "browser-session-cookie");
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect(
+    "revokes the previous browser session after a pairing credential is redeemed on the same cookie",
+    () =>
+      Effect.gen(function* () {
+        yield* buildAppUnderTest();
+
+        const ownerCookie = yield* getAuthenticatedSessionCookieHeader();
+        const credentialResponse = yield* HttpClient.post("/api/auth/pairing-token", {
+          headers: { cookie: ownerCookie },
+          body: yield* HttpBody.json({ audienceCeiling: "private" }),
+        });
+        const credential = (yield* credentialResponse.json) as { readonly credential: string };
+        const replacement = yield* bootstrapBrowserSession(credential.credential, {
+          headers: { cookie: ownerCookie },
+        });
+        const replacementCookie = replacement.cookie?.split(";")[0] ?? "";
+
+        const sessionUrl = yield* getHttpServerUrl("/api/auth/session");
+        const displacedResponse = yield* fetchEffect(sessionUrl, {
+          headers: { cookie: ownerCookie },
+        });
+        const displacedBody = yield* responseJsonEffect<{ readonly authenticated: boolean }>(
+          displacedResponse,
+        );
+        const nextResponse = yield* fetchEffect(sessionUrl, {
+          headers: { cookie: replacementCookie },
+        });
+        const nextBody = yield* responseJsonEffect<{
+          readonly authenticated: boolean;
+          readonly scopes?: ReadonlyArray<string>;
+        }>(nextResponse);
+
+        assert.equal(credentialResponse.status, 200);
+        assert.equal(replacement.response.status, 200);
+        assert.equal(displacedBody.authenticated, false);
+        assert.equal(nextBody.authenticated, true);
+        assert.equal(nextBody.scopes?.includes("access:write"), false);
+      }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect(
+    "does not replace the browser session when reading the existing cookie session fails",
+    () =>
+      Effect.gen(function* () {
+        let failSessionRead = false;
+        yield* buildAppUnderTest({
+          wrapEnvironmentAuth: (inner) => ({
+            ...inner,
+            authenticateHttpRequest: (request) =>
+              failSessionRead
+                ? Effect.fail(
+                    new EnvironmentAuth.ServerAuthSessionCredentialValidationError({
+                      cause: new Error("session lookup unavailable"),
+                    }),
+                  )
+                : inner.authenticateHttpRequest(request),
+          }),
+        });
+
+        const ownerCookie = yield* getAuthenticatedSessionCookieHeader();
+        const credentialResponse = yield* HttpClient.post("/api/auth/pairing-token", {
+          headers: { cookie: ownerCookie },
+          body: yield* HttpBody.json({ audienceCeiling: "private" }),
+        });
+        const credential = (yield* credentialResponse.json) as { readonly credential: string };
+        failSessionRead = true;
+        const replacement = yield* bootstrapBrowserSession(credential.credential, {
+          headers: { cookie: ownerCookie },
+        });
+        failSessionRead = false;
+        const replacementBody = yield* responseJsonEffect<{
+          readonly reason?: string;
+        }>(replacement.response);
+
+        const sessionUrl = yield* getHttpServerUrl("/api/auth/session");
+        const originalResponse = yield* fetchEffect(sessionUrl, {
+          headers: { cookie: ownerCookie },
+        });
+        const originalBody = yield* responseJsonEffect<{ readonly authenticated: boolean }>(
+          originalResponse,
+        );
+
+        assert.equal(credentialResponse.status, 200);
+        assert.equal(replacement.response.status, 500);
+        assert.equal(replacementBody.reason, "browser_session_replacement_failed");
+        assert.isUndefined(replacement.cookie);
+        assert.equal(originalBody.authenticated, true);
+      }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect(
+    "does not replace the browser session when revoking the existing cookie session fails",
+    () =>
+      Effect.gen(function* () {
+        yield* buildAppUnderTest({
+          wrapEnvironmentAuth: (inner) => ({
+            ...inner,
+            revokeSession: () =>
+              Effect.fail(
+                new EnvironmentAuth.ServerAuthSessionRevocationError({
+                  cause: new Error("session revoke unavailable"),
+                }),
+              ),
+          }),
+        });
+
+        const ownerCookie = yield* getAuthenticatedSessionCookieHeader();
+        const credentialResponse = yield* HttpClient.post("/api/auth/pairing-token", {
+          headers: { cookie: ownerCookie },
+          body: yield* HttpBody.json({ audienceCeiling: "private" }),
+        });
+        const credential = (yield* credentialResponse.json) as { readonly credential: string };
+        const replacement = yield* bootstrapBrowserSession(credential.credential, {
+          headers: { cookie: ownerCookie },
+        });
+        const replacementBody = yield* responseJsonEffect<{
+          readonly reason?: string;
+        }>(replacement.response);
+
+        const sessionUrl = yield* getHttpServerUrl("/api/auth/session");
+        const originalResponse = yield* fetchEffect(sessionUrl, {
+          headers: { cookie: ownerCookie },
+        });
+        const originalBody = yield* responseJsonEffect<{ readonly authenticated: boolean }>(
+          originalResponse,
+        );
+
+        assert.equal(credentialResponse.status, 200);
+        assert.equal(replacement.response.status, 500);
+        assert.equal(replacementBody.reason, "browser_session_replacement_failed");
+        assert.isUndefined(replacement.cookie);
+        assert.equal(originalBody.authenticated, true);
+      }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
   it.effect("exchanges a bootstrap grant for a scoped bearer access token", () =>

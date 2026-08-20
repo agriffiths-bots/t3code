@@ -18,7 +18,7 @@ OAuth-style scope strings:
 | `terminal:operate`      | Create, attach, input, resize, clear, restart, and terminate terminals.  |
 | `review:write`          | Read review diff previews used to compose review feedback.               |
 | `access:read`           | Inspect pairing links and client sessions.                               |
-| `access:write`          | Create or revoke pairing links and client sessions.                      |
+| `access:write`          | Create or revoke pairing links and other clients' sessions.              |
 | `relay:read`            | Inspect managed relay connectivity.                                      |
 | `relay:write`           | Link, configure, or unlink managed relay connectivity.                   |
 
@@ -35,7 +35,16 @@ credentials additionally grant `access:read access:write relay:write`.
 `POST /api/auth/browser-session` consumes a one-time bootstrap credential and creates a
 browser session cookie. The cookie is an HTTP transport adapter for the same
 scoped session model; the response never exposes the session secret to browser
-JavaScript.
+JavaScript. Opening a pairing link in a browser that already has a session
+redeems the credential the same way: the grant's scopes replace that browser's
+session. Replacement is fail-closed. The previous session must be revoked
+before the new cookie is installed. If that displacement cannot be confirmed,
+the request fails, the original session stays usable, and nothing is replaced.
+It is not an upgrade-only merge.
+
+`POST /api/auth/session/sign-out` revokes the caller's own session and expires
+the browser session cookie. It does not require `access:write`. Administrative
+revoke of other clients remains on `POST /api/auth/clients/revoke`.
 
 ### Bearer Access Token
 

@@ -74,9 +74,8 @@ const appendDpopChallengeOnUnauthorized = (error: EnvironmentAuthInvalidError) =
     return yield* error;
   });
 
-function browserSessionCookieOptions(input: {
+function browserSessionCookieAttributeOptions(input: {
   readonly request: HttpServerRequest.HttpServerRequest;
-  readonly expiresAt: DateTime.Utc;
   readonly hostedOrigins: ReadonlySet<string>;
 }) {
   const hostedOrigin =
@@ -86,12 +85,39 @@ function browserSessionCookieOptions(input: {
       trustedOrigins: input.hostedOrigins,
     });
   return {
-    expires: DateTime.toDate(input.expiresAt),
     httpOnly: true,
     path: "/",
     sameSite: hostedOrigin ? ("none" as const) : ("lax" as const),
     ...(hostedOrigin ? { secure: true } : {}),
   };
+}
+
+function browserSessionCookieOptions(input: {
+  readonly request: HttpServerRequest.HttpServerRequest;
+  readonly expiresAt: DateTime.Utc;
+  readonly hostedOrigins: ReadonlySet<string>;
+}) {
+  return {
+    ...browserSessionCookieAttributeOptions(input),
+    expires: DateTime.toDate(input.expiresAt),
+  };
+}
+
+function expireBrowserSessionCookies(input: {
+  readonly request: HttpServerRequest.HttpServerRequest;
+  readonly cookieNames: ReadonlyArray<string>;
+  readonly hostedOrigins: ReadonlySet<string>;
+}) {
+  return Effect.gen(function* () {
+    const options = browserSessionCookieAttributeOptions(input);
+    let cookies = Cookies.empty;
+    for (const cookieName of input.cookieNames) {
+      cookies = yield* Effect.fromResult(Cookies.expireCookie(cookies, cookieName, options)).pipe(
+        Effect.catch(() => failEnvironmentInternal("client_session_revoke_failed")),
+      );
+    }
+    return cookies;
+  });
 }
 
 export function configuredCookieAuthCsrfOrigins(config: ServerConfig.ServerConfig["Service"]) {
@@ -294,11 +320,46 @@ export const authHttpApiLayer = HttpApiBuilder.group(
         ),
       )
       .handle(
+        "signOut",
+        Effect.fn("environment.auth.signOut")(
+          function* (args) {
+            yield* annotateEnvironmentRequest(args.endpoint.name);
+            const session = yield* EnvironmentAuthenticatedPrincipal;
+            const revoked = yield* serverAuth.revokeSession(session.sessionId);
+            const request = yield* HttpServerRequest.HttpServerRequest;
+            const expiredCookies = yield* expireBrowserSessionCookies({
+              request,
+              cookieNames: sessions.cookieNames,
+              hostedOrigins,
+            });
+            yield* HttpEffect.appendPreResponseHandler((_request, response) =>
+              Effect.succeed(HttpServerResponse.mergeCookies(response, expiredCookies)),
+            );
+            yield* appendCredentialResponseHeaders;
+            return { revoked };
+          },
+          Effect.catchIf(EnvironmentAuth.isServerAuthInternalError, (error) =>
+            failEnvironmentInternal("client_session_revoke_failed", error),
+          ),
+        ),
+      )
+      .handle(
         "browserSession",
         Effect.fn("environment.auth.browserSession")(
           function* (args) {
             yield* annotateEnvironmentRequest(args.endpoint.name);
             const request = yield* HttpServerRequest.HttpServerRequest;
+            // Replacement is a security boundary. Fail closed unless the
+            // previous session is confirmed gone: do not install a cookie when
+            // the existing session cannot be read or revoked.
+            const previousSession = yield* serverAuth.authenticateHttpRequest(request).pipe(
+              Effect.catchIf(EnvironmentAuth.isServerAuthCredentialError, () =>
+                Effect.succeed(null),
+              ),
+              Effect.catchIf(EnvironmentAuth.isServerAuthInternalError, (error) =>
+                failEnvironmentInternal("browser_session_replacement_failed", error),
+              ),
+            );
             const result = yield* serverAuth.createBrowserSession(
               args.payload.credential,
               deriveAuthClientMetadata({ request }),
@@ -315,6 +376,15 @@ export const authHttpApiLayer = HttpApiBuilder.group(
                 }),
               ),
             ).pipe(Effect.catch(() => failEnvironmentInternal("browser_session_cookie_failed")));
+            if (previousSession !== null) {
+              yield* serverAuth
+                .revokeSession(previousSession.sessionId)
+                .pipe(
+                  Effect.catchIf(EnvironmentAuth.isServerAuthInternalError, (error) =>
+                    failEnvironmentInternal("browser_session_replacement_failed", error),
+                  ),
+                );
+            }
 
             yield* HttpEffect.appendPreResponseHandler((_request, response) =>
               Effect.succeed(HttpServerResponse.mergeCookies(response, sessionCookies)),
