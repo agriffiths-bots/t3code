@@ -64,8 +64,8 @@ function writeLine(payload, onFlush) {
   process.stdout.write(`${JSON.stringify(payload)}\n`, onFlush);
 }
 
-function fail(id, error) {
-  writeLine({ id, ok: false, error: error instanceof Error ? error.message : String(error) });
+function fail(id, op, error) {
+  writeLine({ id, ok: false, op, error: error instanceof Error ? error.message : String(error) });
 }
 
 /**
@@ -378,10 +378,10 @@ rl.on("line", (line) => {
   try {
     command = JSON.parse(line);
   } catch (error) {
-    fail(undefined, error);
+    fail(undefined, undefined, error);
     return;
   }
-  handle(command).catch((error) => fail(command.id, error));
+  handle(command).catch((error) => fail(command.id, command.op, error));
 });
 rl.on("close", () => {
   session.stop();

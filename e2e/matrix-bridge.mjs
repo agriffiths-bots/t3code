@@ -1550,7 +1550,7 @@ async function runReleaseGate(ctx) {
     body: JSON.stringify({
       audienceCeiling: "private",
       label: "Matrix bridge",
-      scopes: ["orchestration:read"],
+      scopes: ["orchestration:read", "orchestration:operate"],
     }),
   });
   rememberSecret(pairing.credential);
