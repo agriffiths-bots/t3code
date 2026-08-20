@@ -3,6 +3,12 @@
  * rendering succeeds, `formatted_body` is HTML restricted to the Client-Server
  * spec's suggested m.room.message subset (spec v1.19,
  * https://spec.matrix.org/v1.19/client-server-api/#mroommessage-msgtypes).
+ *
+ * Supported CommonMark: ATX headings, paragraphs, lists, fenced and inline
+ * code, links, images, blockquotes, emphasis, strikethrough, thematic breaks.
+ * GFM tables and setext headings are not rendered here; a table stays a
+ * paragraph of pipe rows joined by `<br>`. That is no worse than the previous
+ * plaintext body. Table and setext support is a follow-up.
  */
 export const MATRIX_HTML_FORMAT = "org.matrix.custom.html";
 /** UTF-8 cap on `formatted_body` itself. Oversize falls back to plain `body`. */
@@ -14,9 +20,14 @@ export const MATRIX_FORMATTED_BODY_MAX_BYTES = 32 * 1024;
  * plaintext `body` only, which is what the bridge sent before this change.
  */
 export const MATRIX_FORMATTED_CONTENT_MAX_JSON_BYTES = 24 * 1024;
-const MATRIX_HTML_MAX_NESTING = 100;
+/** Emitted nesting cap for the sanitizer. Extra opens may still be pushed, emit=false. */
+export const MATRIX_HTML_MAX_NESTING = 100;
+/** Hard stack bound so unmatched closes stay linear. Opens beyond this are dropped. */
+const MATRIX_HTML_MAX_STACK = MATRIX_HTML_MAX_NESTING * 2;
+/** Recursion cap for `>`; leftover markers are flattened and charged. */
+export const MATRIX_MAX_BLOCKQUOTE_DEPTH = 32;
 /** Operation cap as a multiple of input length; overage falls back to plaintext. */
-const RENDER_OPS_PER_CHAR = 32;
+export const MATRIX_RENDER_OPS_PER_CHAR = 32;
 const HTML_VOID_TAGS = new Set([
   "area",
   "base",
@@ -155,11 +166,27 @@ const HEX_COLOR = /^#[0-9A-Fa-f]{6}$/;
 const INTEGER = /^-?\d+$/;
 const TAG_NAME = /^[A-Za-z][A-Za-z0-9:-]*$/;
 
+/**
+ * Allowlist sanitizer for Matrix HTML. Emitted nesting is capped at
+ * `MATRIX_HTML_MAX_NESTING`; additional opens are still pushed emit=false up
+ * to a hard stack bound so their closes cannot pop an outer ancestor.
+ * Unmatched closes are therefore linear in input length. Over-budget input
+ * stops early and closes whatever is still open. Never throws.
+ */
 export function sanitizeMatrixHtml(html: string): string {
   let out = "";
   const stack: Array<{ readonly name: string; readonly emit: boolean }> = [];
+  let ops = 0;
+  const maxOps = Math.max(4096, html.length * MATRIX_RENDER_OPS_PER_CHAR);
   let i = 0;
+
+  const tick = (n = 1): boolean => {
+    ops += n;
+    return ops <= maxOps;
+  };
+
   while (i < html.length) {
+    if (!tick()) break;
     if (html[i] !== "<") {
       const next = html.indexOf("<", i);
       out += html.slice(i, next === -1 ? html.length : next);
@@ -213,7 +240,9 @@ export function sanitizeMatrixHtml(html: string): string {
       // HTML ignores the self-closing slash on non-void elements, so
       // `<script/>...` still runs to the matching `</script>`.
       if (!HTML_VOID_TAGS.has(name)) {
-        i = skipDroppedElement(html, name, i);
+        const skipped = skipDroppedElement(html, name, i);
+        tick(Math.max(1, skipped - i));
+        i = skipped;
       }
       continue;
     }
@@ -229,6 +258,7 @@ export function sanitizeMatrixHtml(html: string): string {
       }
       continue;
     }
+    if (stack.length >= MATRIX_HTML_MAX_STACK) continue;
     stack.push({ name, emit });
     if (emit) out += `<${name}${attrs}>`;
   }
@@ -422,21 +452,42 @@ function escapeAttr(value: string): string {
 
 /** Hard cap on parser work. Every re-enterable scan step must call tick. */
 class RenderBudget {
-  private ops = 0;
-  private readonly maxOps: number;
+  private used = 0;
+  readonly maxOps: number;
   constructor(chars: number) {
-    this.maxOps = Math.max(4096, chars * RENDER_OPS_PER_CHAR);
+    this.maxOps = Math.max(4096, chars * MATRIX_RENDER_OPS_PER_CHAR);
+  }
+  get ops(): number {
+    return this.used;
   }
   tick(n = 1): void {
-    this.ops += n;
-    if (this.ops > this.maxOps) throw new Error("matrix render op budget exceeded");
+    this.used += n;
+    if (this.used > this.maxOps) throw new Error("matrix render op budget exceeded");
+  }
+}
+
+export type MatrixRenderStats = {
+  readonly ops: number;
+  readonly maxOps: number;
+  readonly exceeded: boolean;
+};
+
+/** Test helper: measure renderer work without the plaintext fallback wrapper. */
+export function matrixRenderStats(markdown: string): MatrixRenderStats {
+  const budget = new RenderBudget(markdown.length);
+  try {
+    const lines = markdown.replace(/\r\n/g, "\n").split("\n");
+    renderLines(lines, 0, lines.length, 0, budget, 0);
+    return { ops: budget.ops, maxOps: budget.maxOps, exceeded: false };
+  } catch {
+    return { ops: budget.ops, maxOps: budget.maxOps, exceeded: true };
   }
 }
 
 function renderMarkdownToHtml(markdown: string): string {
   const budget = new RenderBudget(markdown.length);
   const lines = markdown.replace(/\r\n/g, "\n").split("\n");
-  return renderLines(lines, 0, lines.length, 0, budget).html;
+  return renderLines(lines, 0, lines.length, 0, budget, 0).html;
 }
 
 function renderLines(
@@ -445,6 +496,7 @@ function renderLines(
   to: number,
   minIndent: number,
   budget: RenderBudget,
+  quoteDepth: number,
 ): { html: string; next: number } {
   let html = "";
   let i = from;
@@ -480,15 +532,19 @@ function renderLines(
     }
 
     if (/^[ \t]*>/.test(line)) {
-      const quote = parseBlockquote(lines, i, to, budget);
-      html += quote.html;
-      i = quote.next;
-      continue;
+      if (quoteDepth >= MATRIX_MAX_BLOCKQUOTE_DEPTH) {
+        budget.tick(Math.max(1, countLeadingQuoteMarkers(line)));
+      } else {
+        const quote = parseBlockquote(lines, i, to, budget, quoteDepth);
+        html += quote.html;
+        i = quote.next;
+        continue;
+      }
     }
 
     const list = listMarker(line);
     if (list !== null && list.indent >= minIndent) {
-      const parsed = parseList(lines, i, to, list, budget);
+      const parsed = parseList(lines, i, to, list, budget, quoteDepth);
       html += parsed.html;
       i = parsed.next;
       continue;
@@ -559,10 +615,12 @@ function parseBlockquote(
   from: number,
   to: number,
   budget: RenderBudget,
+  quoteDepth: number,
 ): { html: string; next: number } {
   const inner: string[] = [];
   let i = from;
   while (i < to) {
+    budget.tick();
     const line = lines[i] ?? "";
     if (line.trim() === "") {
       inner.push("");
@@ -574,10 +632,25 @@ function parseBlockquote(
     i += 1;
   }
   while (inner.length > 0 && inner[inner.length - 1] === "") inner.pop();
+  const nextDepth = quoteDepth + 1;
+  const body = renderLines(inner, 0, inner.length, 0, budget, nextDepth).html;
   return {
-    html: `<blockquote>${renderLines(inner, 0, inner.length, 0, budget).html}</blockquote>`,
+    html: `<blockquote>${body}</blockquote>`,
     next: i,
   };
+}
+
+function countLeadingQuoteMarkers(line: string): number {
+  let i = 0;
+  let n = 0;
+  while (i < line.length) {
+    while (line[i] === " " || line[i] === "\t") i += 1;
+    if (line[i] !== ">") break;
+    i += 1;
+    if (line[i] === " " || line[i] === "\t") i += 1;
+    n += 1;
+  }
+  return n;
 }
 
 function parseList(
@@ -586,6 +659,7 @@ function parseList(
   to: number,
   first: ListMarker,
   budget: RenderBudget,
+  quoteDepth: number,
 ): { html: string; next: number } {
   const items: string[] = [];
   let i = from;
@@ -614,7 +688,7 @@ function parseList(
     if (marker === null || marker.indent < first.indent) break;
     if (marker.indent === first.indent && marker.kind !== first.kind) break;
     if (marker.indent === first.indent) {
-      const item = collectListItem(lines, i, to, marker, budget);
+      const item = collectListItem(lines, i, to, marker, budget, quoteDepth);
       items.push(`<li>${item.html}</li>`);
       i = item.next;
       continue;
@@ -632,6 +706,7 @@ function collectListItem(
   to: number,
   marker: ListMarker,
   budget: RenderBudget,
+  quoteDepth: number,
 ): { html: string; next: number } {
   const itemLines = [marker.text];
   let i = from + 1;
@@ -662,7 +737,7 @@ function collectListItem(
   const html =
     itemLines.length === 1
       ? first
-      : `${first}${renderLines(itemLines, 1, itemLines.length, 0, budget).html}`;
+      : `${first}${renderLines(itemLines, 1, itemLines.length, 0, budget, quoteDepth).html}`;
   return { html, next: i };
 }
 

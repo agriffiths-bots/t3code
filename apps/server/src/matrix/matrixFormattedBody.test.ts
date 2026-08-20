@@ -4,7 +4,10 @@ import {
   MATRIX_FORMATTED_BODY_MAX_BYTES,
   MATRIX_FORMATTED_CONTENT_MAX_JSON_BYTES,
   MATRIX_HTML_FORMAT,
+  MATRIX_HTML_MAX_NESTING,
+  MATRIX_MAX_BLOCKQUOTE_DEPTH,
   isPermittedHref,
+  matrixRenderStats,
   matrixTextContent,
   sanitizeMatrixHtml,
 } from "./matrixFormattedBody.ts";
@@ -119,6 +122,34 @@ describe("matrixTextContent rendering", () => {
     expect(formatted("> a\n> b")).toBe("<blockquote><p>a<br>b</p></blockquote>");
   });
 
+  it("caps nested blockquote depth and keeps the inner text", () => {
+    const html = formatted(`${">".repeat(40)} inner`);
+    expect(html.match(/<blockquote>/g)?.length).toBe(MATRIX_MAX_BLOCKQUOTE_DEPTH);
+    expect(html.match(/<\/blockquote>/g)?.length).toBe(MATRIX_MAX_BLOCKQUOTE_DEPTH);
+    expect(html.includes("inner")).toBe(true);
+  });
+
+  it("charges leftover quote markers at the depth cap instead of recursing", () => {
+    const markdown = `${">".repeat(4_000)} x`;
+    const stats = matrixRenderStats(markdown);
+    expect(stats.exceeded).toBe(false);
+    expect(stats.ops).toBeGreaterThan(4_000);
+    expect(stats.ops).toBeLessThanOrEqual(stats.maxOps);
+    const content = matrixTextContent(markdown);
+    expect(content.body).toBe(markdown);
+    expect(content.msgtype).toBe("m.text");
+    if (!("formatted_body" in content) || content.formatted_body === undefined) {
+      throw new Error("expected formatted_body for capped quote markers");
+    }
+    expect(content.formatted_body.match(/<blockquote>/g)?.length).toBe(MATRIX_MAX_BLOCKQUOTE_DEPTH);
+    expect(content.formatted_body.includes("x")).toBe(true);
+  });
+
+  it("keeps literal quote markers inside a fenced block at the quote cap", () => {
+    const prefix = ">".repeat(MATRIX_MAX_BLOCKQUOTE_DEPTH);
+    expect(formatted(`${prefix} \`\`\`\n${prefix} >kept\n${prefix} \`\`\``)).toContain("&gt;kept");
+  });
+
   it("renders links with permitted schemes and drops unsafe ones", () => {
     expect(formatted("[ok](https://example.com/path)")).toBe(
       '<p><a href="https://example.com/path">ok</a></p>',
@@ -158,6 +189,16 @@ describe("matrixTextContent rendering", () => {
     expect(formatted("<https://example.com>")).toBe(
       '<p><a href="https://example.com">https://example.com</a></p>',
     );
+  });
+
+  it("leaves GFM tables as a paragraph of pipe rows (follow-up, not this PR)", () => {
+    expect(formatted("| a | b |\n| --- | --- |\n| 1 | 2 |")).toBe(
+      "<p>| a | b |<br>| --- | --- |<br>| 1 | 2 |</p>",
+    );
+  });
+
+  it("leaves setext headings as paragraph text (follow-up, not this PR)", () => {
+    expect(formatted("Title\n=====")).toBe("<p>Title<br>=====</p>");
   });
 });
 
@@ -230,15 +271,33 @@ describe("sanitizeMatrixHtml", () => {
   });
 
   it("does not let a skipped overflow open tag close an outer ancestor", () => {
-    const depth = 102;
+    const depth = MATRIX_HTML_MAX_NESTING + 2;
     const html = `${"<blockquote>".repeat(depth)}keep${"</blockquote>".repeat(depth)}`;
     const sanitized = sanitizeMatrixHtml(html);
     expect(sanitized.startsWith("<blockquote>")).toBe(true);
     expect(sanitized.endsWith("</blockquote>")).toBe(true);
     expect(sanitized.includes("keep")).toBe(true);
-    expect(sanitized.match(/<blockquote>/g)?.length).toBe(100);
-    expect(sanitized.match(/<\/blockquote>/g)?.length).toBe(100);
-    expect(sanitized).toBe(`${"<blockquote>".repeat(100)}keep${"</blockquote>".repeat(100)}`);
+    expect(sanitized.match(/<blockquote>/g)?.length).toBe(MATRIX_HTML_MAX_NESTING);
+    expect(sanitized.match(/<\/blockquote>/g)?.length).toBe(MATRIX_HTML_MAX_NESTING);
+    expect(sanitized).toBe(
+      `${"<blockquote>".repeat(MATRIX_HTML_MAX_NESTING)}keep${"</blockquote>".repeat(MATRIX_HTML_MAX_NESTING)}`,
+    );
+  });
+
+  it("unmatched close tags stay linear against a bounded stack", () => {
+    const opens = 5_000;
+    const html = `${"<p>".repeat(opens)}keep${"</b>".repeat(opens)}`;
+    const sanitized = sanitizeMatrixHtml(html);
+    expect(sanitized).toBe(
+      `${"<p>".repeat(MATRIX_HTML_MAX_NESTING)}keep${"</p>".repeat(MATRIX_HTML_MAX_NESTING)}`,
+    );
+  });
+
+  it("does not let overflow closes steal a later emitted tag of the same name", () => {
+    const html = `${"<blockquote>".repeat(MATRIX_HTML_MAX_NESTING)}<b></blockquote><b>x</b>y${"</blockquote>".repeat(MATRIX_HTML_MAX_NESTING - 1)}`;
+    expect(sanitizeMatrixHtml(html)).toBe(
+      `${"<blockquote>".repeat(MATRIX_HTML_MAX_NESTING)}</blockquote><b>x</b>y${"</blockquote>".repeat(MATRIX_HTML_MAX_NESTING - 1)}`,
+    );
   });
 });
 
@@ -310,12 +369,22 @@ describe("matrixTextContent fallback", () => {
         markdown: `${"*a [`<".repeat(3_000)}z`,
       },
     ];
-    const budgetMs = 50;
+    // Deterministic bound is the renderer's own op counter (linear in input
+    // length). Exceeding the budget and falling back to plaintext is the
+    // designed safety valve, not a failure. Wall-clock is only a generous
+    // smoke ceiling so a CI runner cannot flake the way a 50ms budget did
+    // after the temp-dir teardown flakes in #263. The last tick may overshoot
+    // maxOps by one scan, so allow one extra input-length of ops.
+    const smokeMs = 2_000;
     for (const { name, markdown } of cases) {
       const started = performance.now();
+      const stats = matrixRenderStats(markdown);
       const content = matrixTextContent(markdown);
       const elapsed = performance.now() - started;
-      expect(elapsed, `${name} took ${elapsed.toFixed(2)}ms`).toBeLessThan(budgetMs);
+      expect(stats.ops, `${name} ops ${stats.ops}/${stats.maxOps}`).toBeLessThanOrEqual(
+        stats.maxOps + markdown.length,
+      );
+      expect(elapsed, `${name} took ${elapsed.toFixed(2)}ms`).toBeLessThan(smokeMs);
       expect(content.body).toBe(markdown);
       expect(content.msgtype).toBe("m.text");
     }
