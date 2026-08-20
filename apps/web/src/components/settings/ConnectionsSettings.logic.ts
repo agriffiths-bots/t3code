@@ -367,6 +367,22 @@ export function matrixBridgeDraftAfterConfigure(
   };
 }
 
+/**
+ * The form as a saved connection describes it. The token is never returned by
+ * the server and must be retyped to reconfigure, so it stays empty; a bridge
+ * that is not configured leaves the form blank.
+ */
+export function matrixBridgeDraftFromSavedConfig(
+  view: MatrixBridgeConfigView | null,
+): MatrixBridgeFormDraft {
+  if (view === null) return EMPTY_MATRIX_BRIDGE_DRAFT;
+  return {
+    homeserverUrl: view.homeserverUrl,
+    accessToken: "",
+    allowedUserIds: view.allowedUserIds.join("\n"),
+  };
+}
+
 export async function applyWslEnableSelection(input: {
   readonly bridge: WslEnableBridge;
   readonly mode: "both" | "wsl-only";

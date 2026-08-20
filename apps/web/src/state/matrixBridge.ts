@@ -1,6 +1,7 @@
 import { useAtomValue } from "@effect/atom-react";
 import {
   createEnvironmentRpcCommand,
+  createEnvironmentRpcQueryAtomFamily,
   createEnvironmentRpcSubscriptionAtomFamily,
 } from "@t3tools/client-runtime/state/runtime";
 import {
@@ -8,6 +9,7 @@ import {
   WS_METHODS,
   type AuthSessionState,
   type EnvironmentId,
+  type MatrixBridgeConfigView,
   type MatrixBridgeStatus,
   type ScopedThreadRef,
 } from "@t3tools/contracts";
@@ -31,10 +33,10 @@ import { environmentSession } from "./session";
  * `matrixBridge.*` RPCs, so a stale client view can mislabel a control but can
  * never invent bridge state.
  *
- * `configure` and `disconnect` need `access:write`, `setOwner` needs
- * `orchestration:operate`, and the status subscription needs
- * `orchestration:read`. The bot access token is write-only: it goes out with
- * `configure` and is never returned by any of these calls.
+ * `configure` and `disconnect` need `access:write`, `getConfig` needs
+ * `access:read`, `setOwner` needs `orchestration:operate`, and the status
+ * subscription needs `orchestration:read`. The bot access token is write-only:
+ * it goes out with `configure` and is never returned by any of these calls.
  */
 export const matrixBridgeEnvironment = {
   configure: createEnvironmentRpcCommand(connectionAtomRuntime, {
@@ -50,6 +52,25 @@ export const matrixBridgeEnvironment = {
     tag: WS_METHODS.matrixBridgeSetOwner,
   }),
 };
+
+/**
+ * The saved connection, for repopulating the Connections form after a reload.
+ * A session without `access:read` simply fails this query and keeps the blank
+ * form it had before, which is why nothing else depends on it.
+ */
+export const matrixBridgeSavedConfig = createEnvironmentRpcQueryAtomFamily(connectionAtomRuntime, {
+  label: "environment-data:matrix-bridge:get-config",
+  tag: WS_METHODS.matrixBridgeGetConfig,
+  staleTimeMs: 5_000,
+  idleTtlMs: 60_000,
+});
+
+/** The saved connection when one is readable, and nothing otherwise. */
+export function matrixBridgeSavedConfigView(
+  result: AsyncResult.AsyncResult<{ readonly config: MatrixBridgeConfigView | null }, unknown>,
+): MatrixBridgeConfigView | null {
+  return AsyncResult.isSuccess(result) ? result.value.config : null;
+}
 
 const matrixBridgeStatusAtom = createEnvironmentRpcSubscriptionAtomFamily(connectionAtomRuntime, {
   label: "environment-data:matrix-bridge:status",
@@ -74,6 +95,8 @@ const UNAVAILABLE_STATUS_VIEW: MatrixBridgeStatusView = { kind: "unavailable" };
 /** What one environment's server allows this client to see and do. */
 export interface MatrixBridgeEnvironmentState {
   readonly statusView: MatrixBridgeStatusView;
+  /** The saved connection when this session may read it, and null otherwise. */
+  readonly savedConfig: MatrixBridgeConfigView | null;
   readonly canOperate: boolean;
 }
 
@@ -121,6 +144,9 @@ export const matrixBridgeStatesAtom = Atom.make((get) => {
     }
     states.set(environmentId, {
       statusView: matrixBridgeStatusView(get(matrixBridgeStatusAtom({ environmentId, input: {} }))),
+      savedConfig: matrixBridgeSavedConfigView(
+        get(matrixBridgeSavedConfig({ environmentId, input: {} })),
+      ),
       canOperate: canOperateMatrixBridge(
         get(environmentSession.sessionStateValueAtom(environmentId)),
       ),
@@ -204,4 +230,17 @@ export function useMatrixBridgeStatusView(
   environmentId: EnvironmentId | null,
 ): MatrixBridgeStatusView {
   return selectMatrixBridgeStatusView(useMatrixBridgeStates(), environmentId);
+}
+
+export function selectMatrixBridgeSavedConfig(
+  states: ReadonlyMap<EnvironmentId, MatrixBridgeEnvironmentState>,
+  environmentId: EnvironmentId | null,
+): MatrixBridgeConfigView | null {
+  return environmentId === null ? null : (states.get(environmentId)?.savedConfig ?? null);
+}
+
+export function useMatrixBridgeSavedConfig(
+  environmentId: EnvironmentId | null,
+): MatrixBridgeConfigView | null {
+  return selectMatrixBridgeSavedConfig(useMatrixBridgeStates(), environmentId);
 }

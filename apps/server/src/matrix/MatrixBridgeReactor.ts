@@ -1,4 +1,10 @@
 import {
+  AuthOrchestrationOperateScope,
+  AuthOrchestrationReadScope,
+  CommandId,
+  MessageId,
+  type AuthAudienceCeiling,
+  type AuthEnvironmentScope,
   type EnvironmentId,
   type OrchestrationEvent,
   type OrchestrationThread,
@@ -9,6 +15,9 @@ import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
+import * as Crypto from "effect/Crypto";
+import * as DateTime from "effect/DateTime";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -17,17 +26,62 @@ import * as Stream from "effect/Stream";
 import * as TxQueue from "effect/TxQueue";
 import * as TxRef from "effect/TxRef";
 
+import { EnvironmentAuth } from "../auth/EnvironmentAuth.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
+import { threadAudienceSystemDispatchAuthority } from "../orchestration/commandAudienceGuard.ts";
+import { BootstrapTurnStartDispatcher } from "../orchestration/Services/BootstrapTurnStartDispatcher.ts";
 import * as OrchestrationEngine from "../orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { forkParked } from "../serverActivation.ts";
-import { MatrixBridgeClient } from "./MatrixBridgeClient.ts";
+import {
+  MatrixBridgeClient,
+  type MatrixBridgeInboundEvent,
+  type MatrixBridgeInboundOverflow,
+  type MatrixBridgeInboundText,
+  type MatrixBridgeRoomMembership,
+} from "./MatrixBridgeClient.ts";
 import { MatrixBridgeConfig, type MatrixBridgeConfigV1 } from "./MatrixBridgeConfig.ts";
 
 export const MATRIX_BRIDGE_OUTBOUND_CAPACITY = 64;
+/** Reserved separately so a full model-output queue cannot hide the gate. */
+export const MATRIX_BRIDGE_PAIRING_CAPACITY = 8;
+/** A pairing outcome gets its own slots so queued prompts cannot bury it. */
+export const MATRIX_BRIDGE_PAIRING_RESULT_CAPACITY = 4;
 export const MATRIX_BRIDGE_RETRY_WINDOW_MS = 10 * 60 * 1_000;
 export const MATRIX_BRIDGE_RETRY_MAX_DELAY_MS = 30_000;
+export const MATRIX_BRIDGE_SEEN_EVENT_CAPACITY = 1_024;
 const MATRIX_BRIDGE_SEEN_TURN_CAPACITY = 1_024;
+/** Same bound the scheduled-task dispatcher uses for one turn start. */
+const MATRIX_BRIDGE_DISPATCH_TIMEOUT_SECONDS = 30;
+/** A transient engine failure must not silently swallow a Matrix command. */
+const MATRIX_BRIDGE_DISPATCH_ATTEMPTS = 3;
+/**
+ * What a paired Matrix account can do through the bridge: read a private
+ * thread's output and start turns in it. Pairing therefore accepts only a
+ * credential that was granted the same reach, so a narrower code cannot unlock
+ * a wider surface than it was minted for.
+ */
+export const MATRIX_BRIDGE_REQUIRED_PROOF: {
+  readonly audienceCeiling: AuthAudienceCeiling;
+  readonly scopes: ReadonlyArray<AuthEnvironmentScope>;
+} = {
+  audienceCeiling: "private",
+  scopes: [AuthOrchestrationReadScope, AuthOrchestrationOperateScope],
+};
+
+/**
+ * The only non-model messages the bridge ever sends. They are fixed strings so
+ * the gate reads identically for every code, and a rejection never says which
+ * of the four failures happened.
+ */
+export const MATRIX_BRIDGE_PAIRING_PROMPT =
+  "T3 bridge is locked. Reply with a pairing code from T3 Settings > Connections.";
+export const MATRIX_BRIDGE_PAIRING_REJECTED =
+  "Pairing code rejected. It is invalid, expired, revoked, or already used.";
+export const MATRIX_BRIDGE_PAIRING_SUCCESS =
+  "Pairing complete. T3 bridging is active when a thread is selected.";
+export const MATRIX_BRIDGE_PAIRING_FAILED =
+  "Pairing could not be completed. Create a new code in T3 Settings > Connections and try again.";
 
 interface TerminalCandidate {
   readonly threadId: ThreadId;
@@ -43,6 +97,26 @@ interface OutboundJob extends TerminalCandidate {
   readonly transactionId: string;
   readonly body: string;
   readonly enqueuedAt: number;
+}
+
+interface PairingJob {
+  readonly cryptoStoreGeneration: string;
+  readonly roomId: string;
+  /** A prompt is re-armed when it is not delivered; an answer is not. */
+  readonly kind: "prompt" | "rejection" | "result";
+  readonly transactionId: string;
+  readonly body: string;
+  /** A gate message is only true while the bridge is in this pairing state. */
+  readonly validWhile: MatrixBridgeConfigV1["pairing"]["state"];
+  readonly enqueuedAt: number;
+}
+
+/** Joined membership of the bridged room for one connection generation. */
+interface RoomMembershipState {
+  readonly cryptoStoreGeneration: string;
+  readonly botUserId: string;
+  readonly allowedMemberPresent: boolean;
+  readonly unexpectedMemberPresent: boolean;
 }
 
 type ActiveMatrixBridgeConfig = MatrixBridgeConfigV1 & {
@@ -107,6 +181,15 @@ function transactionId(input: {
   readonly turnId: TurnId;
 }): string {
   return `t3.${encodeURIComponent(input.environmentId)}.${encodeURIComponent(input.threadId)}.${encodeURIComponent(input.turnId)}`;
+}
+
+/** Stable per connection and cause, so a retried gate message never doubles. */
+function pairingTransactionId(input: {
+  readonly environmentId: EnvironmentId;
+  readonly cryptoStoreGeneration: string;
+  readonly cause: string;
+}): string {
+  return `t3.pairing.${encodeURIComponent(input.environmentId)}.${encodeURIComponent(input.cryptoStoreGeneration)}.${encodeURIComponent(input.cause)}`;
 }
 
 function currentOwner(
@@ -197,6 +280,29 @@ function rememberBounded(
   return true;
 }
 
+/** Fixed-size recent-event memory; no room timeline or decrypted body is kept. */
+function rememberEventId(
+  seen: Set<string>,
+  order: Array<string>,
+  eventId: string,
+  capacity: number,
+): boolean {
+  if (seen.has(eventId)) return false;
+  seen.add(eventId);
+  order.push(eventId);
+  if (order.length > capacity) {
+    const oldest = order.shift();
+    if (oldest !== undefined) seen.delete(oldest);
+  }
+  return true;
+}
+
+function forgetEventId(seen: Set<string>, order: Array<string>, eventId: string): void {
+  if (!seen.delete(eventId)) return;
+  const index = order.lastIndexOf(eventId);
+  if (index >= 0) order.splice(index, 1);
+}
+
 function retryDelayMs(attempt: number): number {
   return Math.min(1_000 * 2 ** Math.min(attempt, 10), MATRIX_BRIDGE_RETRY_MAX_DELAY_MS);
 }
@@ -206,7 +312,16 @@ export const make = Effect.gen(function* () {
   const configService = yield* MatrixBridgeConfig;
   const orchestrationEngine = yield* OrchestrationEngine.OrchestrationEngineService;
   const projection = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
+  const environmentAuth = yield* EnvironmentAuth;
+  const dispatcher = yield* BootstrapTurnStartDispatcher;
+  const crypto = yield* Crypto.Crypto;
   const environmentId = yield* (yield* ServerEnvironment.ServerEnvironment).getEnvironmentId;
+  const randomUUID = crypto.randomUUIDv4.pipe(Effect.orDie);
+  const seenEventIds = new Set<string>();
+  const seenEventOrder: Array<string> = [];
+  let membership: RoomMembershipState | null = null;
+  let observedOwnership: string | null = null;
+  let promptedGeneration: string | null = null;
   const seenTurns = new Map<ThreadId, Set<TurnId>>();
   const seenTurnOrder: Array<readonly [ThreadId, TurnId]> = [];
   const pendingCandidates = new Map<ThreadId, TerminalCandidate>();
@@ -253,6 +368,16 @@ export const make = Effect.gen(function* () {
   const prunePendingCandidates = Effect.fn("MatrixBridgeReactor.prunePendingCandidates")(
     function* () {
       const config = yield* configService.currentConfig;
+      const ownership = Option.isNone(config)
+        ? null
+        : `${config.value.cryptoStoreGeneration}:${config.value.ownershipEpoch}`;
+      if (ownership !== observedOwnership) {
+        observedOwnership = ownership;
+        // Inbound text the transport is still holding was typed for the thread
+        // that was bridged then, so it is dropped rather than started in the
+        // one bridged now.
+        yield* client.discardPendingInbound;
+      }
       for (const [threadId, candidate] of pendingCandidates) {
         if (
           Option.isNone(config) ||
@@ -287,6 +412,50 @@ export const make = Effect.gen(function* () {
     config.ownershipEpoch === candidate.ownershipEpoch &&
     config.cryptoStoreGeneration === candidate.cryptoStoreGeneration;
 
+  /**
+   * Fail closed on membership: output leaves only while this connection's own
+   * membership is known and holds nobody outside the allowed list. Unknown or
+   * previous-connection membership blocks too, because a reconnect may be
+   * joining a room somebody else entered while the bridge was away. Delivery is
+   * paused rather than dropped, so a room that becomes safe again inside the
+   * retry window is still served.
+   */
+  const membershipFor = (cryptoStoreGeneration: string) =>
+    membership !== null && membership.cryptoStoreGeneration === cryptoStoreGeneration
+      ? membership
+      : null;
+
+  const outboundPaused = (cryptoStoreGeneration: string) => {
+    const current = membershipFor(cryptoStoreGeneration);
+    // No allowed member in the room means the message would be encrypted
+    // without them; holding it beats spending the delivery marker on output
+    // their device could never decrypt after they rejoin.
+    return current === null || current.unexpectedMemberPresent || !current.allowedMemberPresent;
+  };
+
+  /**
+   * Gate messages exist for the allowed member reading them, so they wait while
+   * the room is unsafe or unknown and are abandoned once that member is gone: a
+   * rejoin is owed a fresh prompt rather than this one.
+   */
+  const pairingGate = (cryptoStoreGeneration: string): "send" | "wait" | "abandon" => {
+    const current = membershipFor(cryptoStoreGeneration);
+    if (current === null || current.unexpectedMemberPresent) return "wait";
+    return current.allowedMemberPresent ? "send" : "abandon";
+  };
+
+  /** Sleeps one capped backoff step; false once the retry window is spent. */
+  const waitBeforeRetry = Effect.fn("MatrixBridgeReactor.waitBeforeRetry")(function* (
+    enqueuedAt: number,
+    attempt: number,
+  ) {
+    const now = yield* Clock.currentTimeMillis;
+    const remaining = MATRIX_BRIDGE_RETRY_WINDOW_MS - (now - enqueuedAt);
+    if (remaining <= 0) return false;
+    yield* Effect.sleep(Math.min(retryDelayMs(attempt), remaining));
+    return true;
+  });
+
   const ownerStillMatches = Effect.fn("MatrixBridgeReactor.ownerStillMatches")(function* (
     job: OutboundJob,
   ) {
@@ -305,6 +474,18 @@ export const make = Effect.gen(function* () {
     while (true) {
       if (!(yield* ownerStillMatches(job))) {
         yield* Effect.logDebug("Matrix bridge dropped stale owner turn", {
+          threadId: job.threadId,
+          turnId: job.turnId,
+        });
+        return;
+      }
+
+      if (!sent && outboundPaused(job.cryptoStoreGeneration)) {
+        if (yield* waitBeforeRetry(job.enqueuedAt, attempt)) {
+          attempt += 1;
+          continue;
+        }
+        yield* Effect.logWarning("Matrix bridge dropped a final held by the room membership gate", {
           threadId: job.threadId,
           turnId: job.turnId,
         });
@@ -354,9 +535,7 @@ export const make = Effect.gen(function* () {
         return;
       }
 
-      const now = yield* Clock.currentTimeMillis;
-      const remaining = MATRIX_BRIDGE_RETRY_WINDOW_MS - (now - job.enqueuedAt);
-      if (remaining <= 0) {
+      if (!(yield* waitBeforeRetry(job.enqueuedAt, attempt))) {
         yield* Effect.logWarning(
           sent
             ? "Matrix bridge delivery-marker retry window expired"
@@ -369,10 +548,7 @@ export const make = Effect.gen(function* () {
         );
         return;
       }
-
-      const delay = Math.min(retryDelayMs(attempt), remaining);
       attempt += 1;
-      yield* Effect.sleep(delay);
     }
   });
 
@@ -380,6 +556,112 @@ export const make = Effect.gen(function* () {
     MATRIX_BRIDGE_OUTBOUND_CAPACITY,
     deliver,
   );
+
+  const deliverPairingMessage = Effect.fn("MatrixBridgeReactor.deliverPairingMessage")(function* (
+    job: PairingJob,
+  ) {
+    // An undelivered prompt must not keep the connection marked as prompted, or
+    // an unpaired room could sit silent until it reconnects.
+    const rearmPrompt = () => {
+      if (job.kind === "prompt" && promptedGeneration === job.cryptoStoreGeneration) {
+        promptedGeneration = null;
+      }
+    };
+
+    let attempt = 0;
+    while (true) {
+      const config = Option.getOrNull(yield* configService.currentConfig);
+      if (
+        config === null ||
+        config.cryptoStoreGeneration !== job.cryptoStoreGeneration ||
+        config.roomId !== job.roomId ||
+        // A prompt or rejection that lost a race to a working code would
+        // contradict the room's state and delay the acknowledgement behind it.
+        config.pairing.state !== job.validWhile
+      ) {
+        return;
+      }
+
+      const gate = pairingGate(job.cryptoStoreGeneration);
+      if (gate === "abandon") {
+        // Nobody the gate is for is in the room any more. Delivering now would
+        // spend the prompt on an empty room, and a returning device could not
+        // decrypt it, so drop it and let a rejoin prompt afresh.
+        yield* Effect.logDebug("Matrix bridge abandoned a pairing message with no allowed member");
+        rearmPrompt();
+        return;
+      }
+      if (gate === "send") {
+        const result = yield* Effect.result(
+          client.sendText({
+            roomId: job.roomId,
+            transactionId: job.transactionId,
+            content: { msgtype: "m.text", body: job.body },
+          }),
+        );
+        if (result._tag === "Success") return;
+        if (
+          result.failure._tag === "MatrixBridgeClientError" &&
+          result.failure.retryability === "permanent"
+        ) {
+          yield* Effect.logWarning("Matrix bridge dropped a permanent pairing-message failure");
+          rearmPrompt();
+          return;
+        }
+      }
+
+      if (!(yield* waitBeforeRetry(job.enqueuedAt, attempt))) {
+        yield* Effect.logWarning("Matrix bridge pairing-message retry window expired", {
+          attempts: attempt + 1,
+        });
+        rearmPrompt();
+        return;
+      }
+      attempt += 1;
+    }
+  });
+
+  const pairingWorker = yield* makeBoundedDrainableWorker(
+    MATRIX_BRIDGE_PAIRING_CAPACITY,
+    deliverPairingMessage,
+  );
+  // The outcome of a consumed code is the one gate message that cannot be
+  // reproduced, so a full prompt/rejection queue must not be able to drop it.
+  const pairingResultWorker = yield* makeBoundedDrainableWorker(
+    MATRIX_BRIDGE_PAIRING_RESULT_CAPACITY,
+    deliverPairingMessage,
+  );
+
+  const enqueuePairingMessage = Effect.fn("MatrixBridgeReactor.enqueuePairingMessage")(function* (
+    config: MatrixBridgeConfigV1 & { readonly roomId: string },
+    message: {
+      readonly kind: PairingJob["kind"];
+      readonly cause: string;
+      readonly body: string;
+      readonly validWhile?: MatrixBridgeConfigV1["pairing"]["state"];
+    },
+  ) {
+    const enqueuedAt = yield* Clock.currentTimeMillis;
+    const worker = message.kind === "result" ? pairingResultWorker : pairingWorker;
+    const accepted = yield* worker.enqueue({
+      cryptoStoreGeneration: config.cryptoStoreGeneration,
+      roomId: config.roomId,
+      kind: message.kind,
+      transactionId: pairingTransactionId({
+        environmentId,
+        cryptoStoreGeneration: config.cryptoStoreGeneration,
+        cause: message.cause,
+      }),
+      body: message.body,
+      validWhile: message.validWhile ?? config.pairing.state,
+      enqueuedAt,
+    });
+    if (!accepted) {
+      yield* Effect.logWarning("Matrix bridge pairing queue is full; newest message dropped", {
+        capacity: MATRIX_BRIDGE_PAIRING_CAPACITY,
+      });
+    }
+  });
 
   const inspectProjectedCandidate = Effect.fn("MatrixBridgeReactor.inspectProjectedCandidate")(
     function* (candidate: TerminalCandidate, detail: Option.Option<OrchestrationThread>) {
@@ -608,6 +890,290 @@ export const make = Effect.gen(function* () {
     ),
   );
 
+  const dispatchInboundText = Effect.fn("MatrixBridgeReactor.dispatchInboundText")(function* (
+    config: MatrixBridgeConfigV1,
+    event: MatrixBridgeInboundText,
+  ) {
+    const ownerThreadId = config.ownerThreadId;
+    // No owner means the bridge stays silent rather than guessing a thread.
+    if (ownerThreadId === null) return;
+
+    for (let attempt = 0; attempt < MATRIX_BRIDGE_DISPATCH_ATTEMPTS; attempt += 1) {
+      // Ownership is read immediately before every attempt: a message must land
+      // in the thread that is bridged now, or nowhere. Moving the bridge while
+      // this waits means the message belongs to the thread it was typed for,
+      // which is no longer bridged, so it is dropped rather than redirected.
+      const current = Option.getOrNull(yield* configService.currentConfig);
+      if (
+        current === null ||
+        current.cryptoStoreGeneration !== config.cryptoStoreGeneration ||
+        current.pairing.state !== "paired" ||
+        current.ownershipEpoch !== event.ownershipEpoch ||
+        current.ownerThreadId !== ownerThreadId
+      ) {
+        yield* Effect.logDebug("Matrix bridge dropped an inbound message for a former owner");
+        return;
+      }
+
+      const shell = yield* projection.getThreadShellByIdIncludingArchived(ownerThreadId);
+      if (Option.isNone(shell) || shell.value.archivedAt !== null) {
+        yield* clearInactiveOwner(ownerThreadId);
+        return;
+      }
+
+      // The composer sends `thread.turn.start` whether the thread is idle or
+      // running, and the provider adapter turns the running case into steering
+      // on the live turn. Using the same command keeps both behaviors identical.
+      //
+      // Both ids come from the Matrix event, so a retry - here or from a later
+      // redelivery of the same event - is the same command and produces one
+      // turn and one user message rather than a duplicate.
+      const dispatched = yield* Effect.result(
+        dispatcher
+          .dispatch(
+            {
+              type: "thread.turn.start",
+              commandId: CommandId.make(`server:matrix-bridge:${event.eventId}`),
+              threadId: ownerThreadId,
+              message: {
+                messageId: MessageId.make(`matrix-bridge:${event.eventId}`),
+                role: "user",
+                text: event.body,
+                attachments: [],
+              },
+              modelSelection: shell.value.modelSelection,
+              runtimeMode: shell.value.runtimeMode,
+              interactionMode: shell.value.interactionMode,
+              bootstrap: undefined,
+              createdAt: DateTime.formatIso(yield* DateTime.now),
+            },
+            threadAudienceSystemDispatchAuthority(shell.value, "MatrixBridge"),
+          )
+          .pipe(Effect.timeout(Duration.seconds(MATRIX_BRIDGE_DISPATCH_TIMEOUT_SECONDS))),
+      );
+      if (dispatched._tag === "Success") return;
+      yield* Effect.logWarning("Matrix bridge could not dispatch an inbound message", {
+        threadId: ownerThreadId,
+        attempt: attempt + 1,
+      });
+      if (attempt + 1 < MATRIX_BRIDGE_DISPATCH_ATTEMPTS) {
+        yield* Effect.sleep(retryDelayMs(attempt));
+      }
+    }
+
+    // Out of attempts: forget the event so a redelivery of it can try again,
+    // which the deterministic command id makes safe.
+    forgetEventId(seenEventIds, seenEventOrder, event.eventId);
+  });
+
+  const attemptPairing = Effect.fn("MatrixBridgeReactor.attemptPairing")(function* (
+    config: MatrixBridgeConfigV1 & { readonly roomId: string },
+    event: MatrixBridgeInboundText,
+  ) {
+    // Consumes the grant as proof only: no access-token session is created, so
+    // a paired room never appears as an authorized client. The grant must still
+    // cover what the bridge does on the paired account's behalf.
+    const proof = yield* Effect.result(
+      environmentAuth.consumePairingCredentialForProof(
+        event.body.trim(),
+        MATRIX_BRIDGE_REQUIRED_PROOF,
+      ),
+    );
+    if (proof._tag === "Failure") {
+      // Unknown, expired, revoked, and consumed codes answer identically, and
+      // the code itself is never logged.
+      yield* Effect.logWarning("Matrix bridge rejected a pairing code");
+      yield* enqueuePairingMessage(config, {
+        kind: "rejection",
+        cause: `rejected.${event.eventId}`,
+        body: MATRIX_BRIDGE_PAIRING_REJECTED,
+      });
+      return;
+    }
+
+    const marked = yield* Effect.result(
+      configService.markPairedIfMatches({
+        cryptoStoreGeneration: config.cryptoStoreGeneration,
+        roomId: config.roomId,
+        userId: event.sender,
+        pairedAt: DateTime.formatIso(yield* DateTime.now),
+        eventId: event.eventId,
+      }),
+    );
+    if (marked._tag === "Failure") {
+      // The code is spent and the pairing is not durable, so the bridge stays
+      // locked instead of activating on memory alone.
+      yield* configService.reportDegradedIfMatches({
+        cryptoStoreGeneration: config.cryptoStoreGeneration,
+        cause: "pairing-persist-failure",
+      });
+      yield* enqueuePairingMessage(config, {
+        kind: "result",
+        cause: `failed.${event.eventId}`,
+        body: MATRIX_BRIDGE_PAIRING_FAILED,
+      });
+      return;
+    }
+    // A refusal here means the connection was replaced mid-pairing; the next
+    // code minted for the new connection is the way forward.
+    if (!marked.success) return;
+
+    // Everything the transport still holds was sent to a locked room, so it is
+    // a gate answer, not a turn: the newly opened gate does not let it through.
+    yield* client.discardPendingInbound;
+    yield* enqueuePairingMessage(config, {
+      kind: "result",
+      cause: `paired.${event.eventId}`,
+      body: MATRIX_BRIDGE_PAIRING_SUCCESS,
+      validWhile: "paired",
+    });
+  });
+
+  const handleRoomMembership = Effect.fn("MatrixBridgeReactor.handleRoomMembership")(function* (
+    event: MatrixBridgeRoomMembership,
+  ) {
+    const config = Option.getOrNull(yield* configService.currentConfig);
+    const roomId = config?.roomId ?? null;
+    if (config === null || roomId === null || roomId !== event.roomId) return;
+
+    const allowed = new Set<string>(config.allowedUserIds);
+    const members = event.joined.filter((userId) => userId !== event.botUserId);
+    const next: RoomMembershipState = {
+      cryptoStoreGeneration: config.cryptoStoreGeneration,
+      botUserId: event.botUserId,
+      allowedMemberPresent: members.some((userId) => allowed.has(userId)),
+      unexpectedMemberPresent: members.some((userId) => !allowed.has(userId)),
+    };
+    membership = next;
+    yield* configService.reportRoomMembershipIfMatches({
+      cryptoStoreGeneration: config.cryptoStoreGeneration,
+      allowedMemberPresent: next.allowedMemberPresent,
+      unexpectedMemberPresent: next.unexpectedMemberPresent,
+    });
+
+    if (!next.allowedMemberPresent && promptedGeneration === config.cryptoStoreGeneration) {
+      // The member this connection prompted has left, so the next arrival is
+      // owed a fresh prompt rather than one they may not be able to decrypt.
+      promptedGeneration = null;
+    }
+    if (
+      config.pairing.state !== "unpaired" ||
+      !next.allowedMemberPresent ||
+      next.unexpectedMemberPresent ||
+      promptedGeneration === config.cryptoStoreGeneration
+    ) {
+      return;
+    }
+    // Prompting waits for an allowed member so their devices hold the Megolm
+    // session for it. Each prompt carries its own nonce, so a re-prompt (after
+    // a leave, or after a restart) is a new encrypted room event rather than
+    // the homeserver replaying one the device could not read, while retries of
+    // a single prompt keep its transaction.
+    promptedGeneration = config.cryptoStoreGeneration;
+    yield* enqueuePairingMessage(
+      { ...config, roomId },
+      {
+        kind: "prompt",
+        cause: `prompt.${yield* randomUUID}`,
+        body: MATRIX_BRIDGE_PAIRING_PROMPT,
+      },
+    );
+  });
+
+  const handleInboundText = Effect.fn("MatrixBridgeReactor.handleInboundText")(function* (
+    event: MatrixBridgeInboundText,
+  ) {
+    const config = Option.getOrNull(yield* configService.currentConfig);
+    const roomId = config?.roomId ?? null;
+    if (config === null || roomId === null || roomId !== event.roomId) return;
+    // A room the bridge considers unsafe is inert in both directions: a pairing
+    // code typed while an outside account is joined is not treated as proof,
+    // and no turn is started for output that could not be delivered anyway.
+    const roomMembership = membershipFor(config.cryptoStoreGeneration);
+    if (
+      !event.roomAllowedOnly ||
+      roomMembership === null ||
+      roomMembership.unexpectedMemberPresent
+    ) {
+      yield* Effect.logDebug("Matrix bridge ignored inbound text from an unsafe room");
+      return;
+    }
+    // The bot's own events, pairing messages and finals alike, are ignored
+    // before every other rule so bridge output can never loop back in.
+    if (event.sender === roomMembership.botUserId) return;
+    if (event.isEdit) return;
+    if (
+      !rememberEventId(
+        seenEventIds,
+        seenEventOrder,
+        event.eventId,
+        MATRIX_BRIDGE_SEEN_EVENT_CAPACITY,
+      )
+    ) {
+      return;
+    }
+
+    if (config.pairing.state === "paired") {
+      if (event.sender !== config.pairing.userId) return;
+      // The bridge moved after the transport took this message off its queue,
+      // so the thread it was typed for is no longer the one bridged.
+      if (config.ownershipEpoch !== event.ownershipEpoch) {
+        yield* Effect.logDebug("Matrix bridge dropped an inbound message for a former owner");
+        return;
+      }
+      // The reply that paired this connection is remembered durably, so a
+      // redelivery after a restart is still a pairing reply and not a turn.
+      if (config.pairing.eventId === event.eventId) return;
+      // A code typed just before pairing completed, or one sent afterwards by
+      // mistake, must not become a user message: thread history and model
+      // context are the last places a redeemable credential should land. An
+      // unavailable credential store withholds too, rather than guessing.
+      const credentialCheck = yield* Effect.result(
+        environmentAuth.isLivePairingCredential(event.body.trim()),
+      );
+      if (credentialCheck._tag === "Failure" || credentialCheck.success) {
+        yield* Effect.logWarning(
+          "Matrix bridge withheld a possible pairing credential from a turn",
+        );
+        return;
+      }
+      yield* dispatchInboundText(config, event);
+      return;
+    }
+    // A sender outside the allowed list is ignored without revealing that a
+    // gate exists, and pre-pairing text is a code candidate, never a turn.
+    if (!config.allowedUserIds.includes(event.sender)) return;
+    yield* attemptPairing({ ...config, roomId }, event);
+  });
+
+  const handleInboundOverflow = Effect.fn("MatrixBridgeReactor.handleInboundOverflow")(function* (
+    event: MatrixBridgeInboundOverflow,
+  ) {
+    const config = Option.getOrNull(yield* configService.currentConfig);
+    if (config === null || config.roomId !== event.roomId) return;
+    // Bounded memory means a burst can outrun dispatch. Say so in the status
+    // rather than letting a message disappear without a trace.
+    yield* Effect.logWarning("Matrix bridge dropped inbound messages under load");
+    yield* configService.reportDegradedIfMatches({
+      cryptoStoreGeneration: config.cryptoStoreGeneration,
+      cause: "inbound-overflow",
+    });
+  });
+
+  const handleInboundEvent = (event: MatrixBridgeInboundEvent): Effect.Effect<void> =>
+    (event.kind === "membership"
+      ? handleRoomMembership(event)
+      : event.kind === "overflow"
+        ? handleInboundOverflow(event)
+        : handleInboundText(event)
+    ).pipe(
+      Effect.catchCause((cause) =>
+        Cause.hasInterruptsOnly(cause)
+          ? Effect.interrupt
+          : Effect.logWarning("Matrix bridge failed to handle an inbound Matrix event"),
+      ),
+    );
+
   const reconcileOwnerAtStartup = Effect.fn("MatrixBridgeReactor.reconcileOwnerAtStartup")(
     function* () {
       let config = Option.getOrNull(yield* configService.currentConfig);
@@ -776,7 +1342,7 @@ export const make = Effect.gen(function* () {
       );
       yield* forkParked(
         client
-          .listen(() => Effect.void)
+          .listen(handleInboundEvent)
           .pipe(
             Effect.catchCause((cause) =>
               Cause.hasInterruptsOnly(cause)
@@ -794,6 +1360,8 @@ export const make = Effect.gen(function* () {
     drain: Effect.yieldNow.pipe(
       Effect.andThen(terminalWorker.drain),
       Effect.andThen(outboundWorker.drain),
+      Effect.andThen(pairingWorker.drain),
+      Effect.andThen(pairingResultWorker.drain),
     ),
   });
 });

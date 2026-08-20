@@ -71,6 +71,9 @@ it.layer(NodeServices.layer)("ServerEnvironmentLive", (it) => {
       expect(second.capabilities.repositoryIdentity).toBe(true);
       expect(second.capabilities.connectionProbe).toBe(true);
       expect(second.capabilities.threadTitleRegeneration).toBe(true);
+      // Advertised only now that the bridge gate, inbound dispatch, and
+      // membership guard all ship; clients key their controls off this.
+      expect(second.capabilities.matrixBridge).toBe(true);
     }),
   );
 

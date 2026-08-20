@@ -16,7 +16,9 @@ import {
   matrixBridgeFailureMessage,
   matrixBridgeOwnership,
   matrixBridgeStatusView,
+  matrixBridgeSavedConfigView,
   selectMatrixBridgeMenuState,
+  selectMatrixBridgeSavedConfig,
   selectMatrixBridgeStatusView,
   type MatrixBridgeEnvironmentState,
 } from "./matrixBridge";
@@ -34,7 +36,10 @@ const activeStatus: MatrixBridgeStatus = {
 };
 
 const states: ReadonlyMap<EnvironmentId, MatrixBridgeEnvironmentState> = new Map([
-  [environmentA, { statusView: { kind: "status", status: activeStatus }, canOperate: true }],
+  [
+    environmentA,
+    { statusView: { kind: "status", status: activeStatus }, savedConfig: null, canOperate: true },
+  ],
 ]);
 
 describe("matrixBridgeStatusView", () => {
@@ -121,11 +126,46 @@ describe("selectMatrixBridgeMenuState", () => {
 
   it("has unknown ownership before the status subscription delivers one", () => {
     const pending = new Map([
-      [environmentA, { statusView: { kind: "pending" } as const, canOperate: true }],
+      [
+        environmentA,
+        { statusView: { kind: "pending" } as const, savedConfig: null, canOperate: true },
+      ],
     ]);
     expect(
       selectMatrixBridgeMenuState(pending, scopeThreadRef(environmentA, otherThread)),
     ).toMatchObject({ supported: true, ownership: { kind: "unknown" } });
+  });
+});
+
+describe("selectMatrixBridgeSavedConfig", () => {
+  const saved = {
+    homeserverUrl: "https://matrix.example.test/",
+    allowedUserIds: ["@adam:beeper.com"],
+    roomId: "!room:matrix.example.test",
+  } as const;
+
+  it("returns the saved connection for the environment that owns it", () => {
+    const withConfig = new Map([
+      [
+        environmentA,
+        { statusView: { kind: "pending" } as const, savedConfig: saved, canOperate: true },
+      ],
+    ]);
+    expect(selectMatrixBridgeSavedConfig(withConfig, environmentA)).toEqual(saved);
+  });
+
+  it("has nothing for an environment with no bridge, and nothing without one selected", () => {
+    expect(selectMatrixBridgeSavedConfig(states, environmentB)).toBeNull();
+    expect(selectMatrixBridgeSavedConfig(states, null)).toBeNull();
+  });
+});
+
+describe("matrixBridgeSavedConfigView", () => {
+  it("is nothing until the query answers, so the form stays as the operator left it", () => {
+    expect(matrixBridgeSavedConfigView(AsyncResult.initial())).toBeNull();
+    expect(
+      matrixBridgeSavedConfigView(AsyncResult.failure(Cause.fail(new Error("no access:read")))),
+    ).toBeNull();
   });
 });
 

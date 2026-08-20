@@ -14,7 +14,9 @@ import {
   MatrixBridgeClient,
   MatrixBridgeClientError,
   type MatrixBridgeInboundHandler,
+  type MatrixBridgeInboundOverflow,
   type MatrixBridgeInboundText,
+  type MatrixBridgeRoomMembership,
   type MatrixBridgeOutboundText,
 } from "./MatrixBridgeClient.ts";
 import { MatrixBridgeConfig, type MatrixBridgeConfigV1 } from "./MatrixBridgeConfig.ts";
@@ -32,7 +34,20 @@ const MATRIX_STORE_KEY_BYTES = 16;
  */
 export const MATRIX_CRYPTO_SQLITE_STORE_TYPE = 0;
 const MATRIX_DECRYPTED_EVENT = "room.decrypted_event";
-const MATRIX_INBOUND_QUEUE_CAPACITY = 64;
+/** Membership is plaintext state, so it arrives on the raw timeline event. */
+const MATRIX_ROOM_EVENT = "room.event";
+export const MATRIX_INBOUND_QUEUE_CAPACITY = 64;
+/** Bounded so a room that keeps changing fails closed rather than looping. */
+const MATRIX_MEMBERSHIP_READ_ATTEMPTS = 3;
+/** A transient read must not turn an inbound command into a silent drop. */
+const MATRIX_MEMBERSHIP_VERIFY_ATTEMPTS = 3;
+/**
+ * The timeline is not a complete membership feed: a change during a sync gap
+ * can appear only in the state block, which the SDK does not emit. A quiet
+ * room therefore reconciles on this interval so a join is noticed even with no
+ * traffic to carry it.
+ */
+const MATRIX_MEMBERSHIP_RECONCILE_INTERVAL_MS = 60_000;
 /** Retries reuse one ciphertext per transaction, so only in-flight sends are held. */
 const MATRIX_ENCRYPTED_PAYLOAD_CAPACITY = 16;
 const MATRIX_RECONNECT_MIN_DELAY_MS = 1_000;
@@ -154,6 +169,7 @@ export interface MatrixSdkCryptoClient {
 export interface MatrixSdkClient {
   readonly crypto?: MatrixSdkCryptoClient | undefined;
   getJoinedRooms(): Promise<ReadonlyArray<string>>;
+  getJoinedRoomMembers(roomId: string): Promise<ReadonlyArray<string>>;
   getRoomState(roomId: string): Promise<ReadonlyArray<unknown>>;
   createRoom(options: MatrixCreateRoomOptions): Promise<string>;
   inviteUser(userId: string, roomId: string): Promise<unknown>;
@@ -298,7 +314,7 @@ function toInboundText(
   eventRoomId: string,
   roomId: string,
   botUserId: string,
-): MatrixBridgeInboundText | null {
+): Omit<MatrixBridgeInboundText, "roomAllowedOnly" | "ownershipEpoch"> | null {
   if (eventRoomId !== roomId) return null;
   const record = readRecord(event);
   if (record === null || record.type !== "m.room.message") return null;
@@ -311,12 +327,29 @@ function toInboundText(
   if (body === null) return null;
   const relation = readRecord(content["m.relates_to"]);
   return {
+    kind: "text",
     eventId,
     roomId,
     sender,
     body,
     isEdit: relation?.rel_type === "m.replace",
   };
+}
+
+/** A membership transition for one account in the bridged room. */
+function toMembershipChange(
+  event: unknown,
+  eventRoomId: string,
+  roomId: string,
+): { readonly userId: string; readonly joined: boolean } | null {
+  if (eventRoomId !== roomId) return null;
+  const record = readRecord(event);
+  if (record === null || record.type !== "m.room.member") return null;
+  const userId = readString(record, "state_key");
+  if (userId === null) return null;
+  const membership = readString(record.content, "membership");
+  if (membership === null) return null;
+  return { userId, joined: membership === "join" };
 }
 
 /** Older stable room versions allow integer strings in power-level content. */
@@ -717,12 +750,29 @@ export const ensureSyncFilter = Effect.fn("MatrixBotSdkClient.ensureSyncFilter")
  * identifies the batch being emitted: the first belongs to the catch-up sync,
  * everything after it is live.
  */
+/** One sync batch whose cursor is waiting on the work it delivered. */
+export interface SyncBatchClaim {
+  readonly token: string;
+  outstanding: number;
+  emitted: boolean;
+}
+
 export interface FencedSyncStorage {
   /** Handed to the SDK in place of the real provider. */
   readonly storage: MatrixSdkStorageProvider;
   /** False only while the pre-fence catch-up batch is being emitted. */
   readonly acceptsTimelineEvents: () => boolean;
   readonly syncedBatches: () => number;
+  /**
+   * Claims the batch being emitted for a message that is not handled yet, and
+   * returns the claim to release later. The SDK persists a batch's cursor
+   * before it emits that batch, so a crash between the two would resume after
+   * a command nobody acted on: the cursor is held back until the work it
+   * covers is done, and Matrix redelivers instead of skipping.
+   */
+  readonly beginInbound: () => SyncBatchClaim | null;
+  /** Releases one claim; a batch with none left lets its cursor through. */
+  readonly endInbound: (claim: SyncBatchClaim) => void;
   /** Permanently drops writes and events from a client being discarded. */
   readonly retire: () => void;
   /**
@@ -740,26 +790,60 @@ export function createFencedSyncStorage(inner: MatrixSdkStorageProvider): Fenced
   let retired = false;
   let boundary = Deferred.makeUnsafe<void>();
   if (!fenced) Deferred.doneUnsafe(boundary, Effect.void);
+  /**
+   * Batches whose cursor is not stored yet, oldest first. A batch is written
+   * once it has finished being emitted and nothing it delivered is still being
+   * handled, so the stored cursor always names work that is done.
+   */
+  let batches: Array<SyncBatchClaim> = [];
+
+  const flushBatches = () => {
+    while (batches.length > 0) {
+      const head = batches[0];
+      if (head === undefined || head.outstanding > 0 || !head.emitted) return;
+      batches.shift();
+      // Only the durable write waits: the fence's own bookkeeping happened
+      // when the SDK announced this cursor, so nothing else is delayed.
+      inner.setSyncToken(head.token);
+    }
+  };
+
   const storage: MatrixSdkStorageProvider = {
     getSyncToken: () => inner.getSyncToken(),
     setSyncToken: (token) => {
       // A retired client's in-flight sync still resolves and still tries to
       // write; its cursor belongs to a connection that no longer exists.
       if (retired) return;
-      // The write comes first: a store that failed to persist the cursor has
-      // not advanced the batch, and a retry of the same catch-up must stay
-      // fenced rather than count as a second batch.
-      inner.setSyncToken(token);
+      // A cleared cursor is a filter change, which must take effect at once.
       if (token === null || token === "") {
+        batches = [];
+        inner.setSyncToken(token);
         // Registering a filter clears the cursor, and the sync that follows is
         // a fresh catch-up: re-arm rather than trusting the state at startup.
         fenced = true;
         syncedBatches = 0;
         boundary = Deferred.makeUnsafe<void>();
-      } else {
-        syncedBatches += 1;
-        Deferred.doneUnsafe(boundary, Effect.void);
+        return;
       }
+      // A newer cursor means every earlier batch has finished being emitted,
+      // so those are writable as soon as their work is done.
+      for (const batch of batches) batch.emitted = true;
+      flushBatches();
+      // A batch whose timeline is fenced delivers nothing to hold the cursor
+      // for, and its whole point is that a restart does not replay it.
+      const deliversEvents = !fenced || syncedBatches + 1 >= 2;
+      if (deliversEvents) {
+        // Held, not dropped: the sync loop keeps running from the older cursor,
+        // so room keys and device updates still arrive, and a batch whose work
+        // this process never finished is simply redelivered.
+        batches.push({ token, outstanding: 0, emitted: false });
+      } else {
+        inner.setSyncToken(token);
+      }
+      // Counted and announced now, so the catch-up fence and readiness behave
+      // exactly as they did when the cursor was written here.
+      syncedBatches += 1;
+      Deferred.doneUnsafe(boundary, Effect.void);
     },
     getFilter: () => inner.getFilter(),
     setFilter: (filter) => {
@@ -773,6 +857,21 @@ export function createFencedSyncStorage(inner: MatrixSdkStorageProvider): Fenced
     acceptsTimelineEvents: () => !retired && (!fenced || syncedBatches >= 2),
     syncedBatches: () => syncedBatches,
     awaitSyncBoundary: Effect.suspend(() => Deferred.await(boundary)),
+    beginInbound: () => {
+      if (retired) return null;
+      const current = batches[batches.length - 1];
+      if (current === undefined) return null;
+      current.outstanding += 1;
+      return current;
+    },
+    endInbound: (claim) => {
+      if (retired) return;
+      claim.outstanding = Math.max(0, claim.outstanding - 1);
+      // The handler that queued this message ran during the batch's emission,
+      // and this release runs after it, so that emission is over.
+      claim.emitted = true;
+      flushBatches();
+    },
     retire: () => {
       retired = true;
     },
@@ -898,7 +997,16 @@ interface LiveTransport {
    * reused sync loop cannot advance its cursor through a gap between
    * connections and drop the messages in that batch.
    */
-  readonly inbound: Queue.Queue<MatrixBridgeInboundText>;
+  readonly inbound: Queue.Queue<
+    Omit<MatrixBridgeInboundText, "roomAllowedOnly" | "ownershipEpoch">
+  >;
+  /**
+   * Reports text the buffer could not take. It rides its own slot because the
+   * report must survive the queue that is full, and only the latest matters.
+   */
+  readonly overflow: Queue.Queue<MatrixBridgeInboundOverflow>;
+  /** Events taken from a batch but not finished with, and the batch each holds. */
+  readonly inFlightEvents: Map<string, SyncBatchClaim | null>;
   /** The room the attached handler accepts, set by the live connection. */
   roomId: string | null;
   /** The filter its sync loop is running, or null before it started. */
@@ -909,9 +1017,90 @@ interface MatrixConnection {
   readonly cryptoStoreGeneration: string;
   readonly roomId: string;
   readonly client: MatrixSdkClient;
+  readonly botUserId: string;
+  readonly allowedUserIds: ReadonlySet<string>;
+  /**
+   * Joined members, mutated synchronously by the timeline handler. Sending
+   * reads it at the last moment, so a join cannot slip in between a bridge
+   * decision and the encryption that follows it.
+   */
+  readonly joined: Set<string>;
+  /** Incremented whenever the room's joined membership changes. */
+  readonly membershipRevision: { value: number };
+  /** Publishes the current membership when it differs from the last snapshot. */
+  readonly publishMembership: Effect.Effect<void>;
+  /**
+   * Drops inbound text the transport is still holding, for when ownership
+   * moves or the gate opens: those messages belong to what came before.
+   */
+  readonly discardPendingText: Effect.Effect<void>;
   /** Retries must present the ciphertext that was encrypted for the first attempt. */
   readonly encryptedPayloads: Map<string, unknown>;
+  /** Transactions whose PUT may already have reached the homeserver. */
+  readonly attemptedTransactions: Set<string>;
+  /** Drops one transaction's ciphertext and its send record together. */
+  readonly forgetTransaction: (transactionId: string) => void;
+  /** Drops ciphertext for transactions no send has been attempted for. */
+  readonly retireUnsentCiphertext: () => void;
 }
+
+/**
+ * A room is safe to send into when nobody outside the allowed list is in it and
+ * at least one allowed account is: a room with no reader would take a message
+ * their devices could never decrypt after they return.
+ */
+function roomSendState(
+  connection: MatrixConnection,
+): "safe" | "unexpected-member" | "no-allowed-member" {
+  let allowedReader = false;
+  for (const userId of connection.joined) {
+    if (userId === connection.botUserId) continue;
+    if (!connection.allowedUserIds.has(userId)) return "unexpected-member";
+    allowedReader = true;
+  }
+  return allowedReader ? "safe" : "no-allowed-member";
+}
+
+const ROOM_SEND_STATE_REASONS = {
+  "unexpected-member": "An account outside the allowed list is in the Matrix room.",
+  "no-allowed-member": "No account from the allowed list is in the Matrix room.",
+  unverified: "The Matrix room membership kept changing while it was being read.",
+} as const;
+
+/**
+ * Re-reads the room's joined members from the homeserver and answers whether
+ * only allowed accounts are in it. The timeline feed alone is not a complete
+ * membership record: a gappy sync reports membership in the state block, which
+ * the SDK does not emit. A change during the read invalidates the answer in
+ * either direction, so it is read again rather than merged.
+ */
+const refreshRoomMembership = Effect.fn("MatrixBotSdkClient.refreshRoomMembership")(function* (
+  connection: MatrixConnection,
+  operation: "listen" | "send",
+) {
+  for (let attempt = 0; attempt < MATRIX_MEMBERSHIP_READ_ATTEMPTS; attempt += 1) {
+    const revisionBeforeRead = connection.membershipRevision.value;
+    const joinedNow = yield* request(
+      operation,
+      "The bridged Matrix room members could not be read.",
+      () => connection.client.getJoinedRoomMembers(connection.roomId),
+    );
+    if (connection.membershipRevision.value !== revisionBeforeRead) continue;
+    const before = [...connection.joined].toSorted().join("\u0000");
+    connection.joined.clear();
+    for (const userId of joinedNow) connection.joined.add(userId);
+    if ([...connection.joined].toSorted().join("\u0000") !== before) {
+      // An authoritative change counts like a timeline one: it moves the
+      // revision and retires ciphertext encrypted for the previous devices,
+      // except where a send under that transaction may already have landed.
+      connection.membershipRevision.value += 1;
+      connection.retireUnsentCiphertext();
+    }
+    yield* connection.publishMembership;
+    return roomSendState(connection);
+  }
+  return "unverified" as const;
+});
 
 export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
   loadModule: MatrixSdkLoader = loadMatrixBotSdk,
@@ -1178,7 +1367,13 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
       retiredByStoreKey.delete(input.storeKey);
     }
 
-    const inbound = yield* Queue.dropping<MatrixBridgeInboundText>(MATRIX_INBOUND_QUEUE_CAPACITY);
+    const inbound = yield* Queue.dropping<
+      Omit<MatrixBridgeInboundText, "roomAllowedOnly" | "ownershipEpoch">
+    >(MATRIX_INBOUND_QUEUE_CAPACITY);
+    const overflow = yield* Queue.sliding<MatrixBridgeInboundOverflow>(1);
+    /** Events taken from a batch but not finished with, so a redelivered batch
+     * does not queue them twice. Bounded by the queue it mirrors. */
+    const inFlightEvents = new Map<string, SyncBatchClaim | null>();
     return yield* Effect.try({
       try: () => {
         const storageProvider = new input.module.SimpleFsStorageProvider(
@@ -1211,6 +1406,8 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
           storage: fencedStorage.storage,
           fence: fencedStorage,
           inbound,
+          overflow,
+          inFlightEvents,
           roomId: null,
           syncFilterKey: null,
         };
@@ -1221,7 +1418,20 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
           // batch's room keys and device updates into the crypto store.
           if (transport.roomId === null || !fencedStorage.acceptsTimelineEvents()) return;
           const message = toInboundText(event, eventRoomId, transport.roomId, input.botUserId);
-          if (message !== null) Queue.offerUnsafe(inbound, message);
+          if (message === null) return;
+          // Holding the cursor means the homeserver redelivers a batch whose
+          // work is still running, so an event already in hand is not taken a
+          // second time.
+          if (inFlightEvents.has(message.eventId)) return;
+          // A dropped message is reported rather than swallowed: the operator
+          // sees why it never became a turn.
+          if (!Queue.offerUnsafe(inbound, message)) {
+            Queue.offerUnsafe(overflow, { kind: "overflow", roomId: message.roomId });
+            return;
+          }
+          // The cursor this batch would advance to is now this message's to
+          // release: a crash before that leaves Matrix redelivering it.
+          inFlightEvents.set(message.eventId, fencedStorage.beginInbound());
         });
         return transport;
       },
@@ -1307,21 +1517,6 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
     // delivered by the next one rather than lost, and the allowed list is read
     // at delivery: a member removed while a message was queued is not one the
     // bridge still listens to.
-    yield* Effect.forkScoped(
-      Stream.runForEach(Stream.fromQueue(transport.inbound), (event) =>
-        Effect.gen(function* () {
-          // The queue outlives a connection, so an event buffered for the room
-          // this connection replaced is not one it may deliver.
-          if (event.roomId !== roomId) return;
-          const stored = yield* currentConfig;
-          if (Option.isNone(stored) || !stored.value.allowedUserIds.includes(event.sender)) {
-            return;
-          }
-          yield* onInboundText(event);
-        }),
-      ),
-    );
-
     // Starting the sync loop also prepares encryption. A homeserver rejects the
     // device keys when the bot token was paired with a different crypto store,
     // which a new bot login repairs. A loop already running this filter is left
@@ -1363,12 +1558,134 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
     yield* Effect.logDebug("Matrix bridge waiting for its first sync response");
     yield* fence.awaitSyncBoundary;
 
+    const joined = new Set<string>();
+    const membershipRevision = { value: 0 };
+    const membershipQueue = yield* Queue.sliding<MatrixBridgeRoomMembership>(1);
+    const encryptedPayloads = new Map<string, unknown>();
+    /**
+     * Transactions whose PUT may already have reached the homeserver. Their
+     * ciphertext is what that transaction id now means: a repeat returns the
+     * original event, so re-encrypting under it would report a message the
+     * room never received.
+     */
+    const attemptedTransactions = new Set<string>();
+    /**
+     * Drops one transaction's ciphertext and the note that it was sent. The
+     * two are kept together so the set cannot outgrow the cache it describes.
+     */
+    const forgetTransaction = (transactionId: string) => {
+      encryptedPayloads.delete(transactionId);
+      attemptedTransactions.delete(transactionId);
+    };
+    /** Retires only ciphertext that no send has been attempted for. */
+    const retireUnsentCiphertext = () => {
+      // Deleting the current entry is safe while iterating a Map.
+      for (const transactionId of encryptedPayloads.keys()) {
+        if (!attemptedTransactions.has(transactionId)) forgetTransaction(transactionId);
+      }
+    };
+    let lastPublishedMembers: string | null = null;
+    const membershipEvent = (): MatrixBridgeRoomMembership => ({
+      kind: "membership",
+      roomId,
+      botUserId,
+      joined: [...joined].toSorted(),
+    });
+    // Registered before the first read, so a change during it bumps the
+    // revision and forces the read again rather than being missed until the
+    // reconciliation interval comes round.
+    yield* Effect.acquireRelease(
+      Effect.sync(() => {
+        const timelineHandler: MatrixSdkEventHandler = (eventRoomId, event) => {
+          const change = toMembershipChange(event, eventRoomId, roomId);
+          if (change === null) return;
+          const changed = joined.has(change.userId) !== change.joined;
+          if (change.joined) joined.add(change.userId);
+          else joined.delete(change.userId);
+          if (!changed) return;
+          membershipRevision.value += 1;
+          // A held retry must not present a session the current members may not
+          // have; the next attempt encrypts for the room as it is now. A
+          // transaction already put to the homeserver keeps its ciphertext.
+          retireUnsentCiphertext();
+          Queue.offerUnsafe(membershipQueue, membershipEvent());
+        };
+        client.on(MATRIX_ROOM_EVENT, timelineHandler);
+        return timelineHandler;
+      }),
+      (timelineHandler) =>
+        Effect.sync(() => {
+          client.off(MATRIX_ROOM_EVENT, timelineHandler);
+        }),
+    );
+
+    // Seeded before the room is served so the first thing the bridge learns
+    // about it is who is in it, and re-read when the room changes under it.
+    for (let attempt = 0; attempt < MATRIX_MEMBERSHIP_READ_ATTEMPTS; attempt += 1) {
+      const revisionBeforeRead = membershipRevision.value;
+      const seeded = yield* request(
+        "listen",
+        "The bridged Matrix room members could not be read.",
+        () => client.getJoinedRoomMembers(roomId),
+      );
+      if (membershipRevision.value !== revisionBeforeRead) continue;
+      joined.clear();
+      for (const userId of seeded) joined.add(userId);
+      break;
+    }
+
     const connection: MatrixConnection = {
       cryptoStoreGeneration: config.cryptoStoreGeneration,
       roomId,
       client,
-      encryptedPayloads: new Map(),
+      botUserId,
+      allowedUserIds: new Set(config.allowedUserIds),
+      joined,
+      membershipRevision,
+      publishMembership: Effect.suspend(() => {
+        const snapshot = membershipEvent();
+        const key = snapshot.joined.join("\u0000");
+        if (key === lastPublishedMembers) return Effect.void;
+        lastPublishedMembers = key;
+        return Queue.offer(membershipQueue, snapshot).pipe(Effect.asVoid);
+      }),
+      // `clear` and not `takeAll`: nothing to discard is the common case, and
+      // `takeAll` would wait for a message to arrive first.
+      discardPendingText: Queue.clear(transport.inbound).pipe(
+        Effect.tap((dropped) =>
+          Effect.sync(() => {
+            // A discarded message still holds its batch's cursor, so releasing
+            // the claim is what lets the cursor advance past work nobody will
+            // do; leaving it would stall the cursor for the whole connection.
+            for (const event of dropped) {
+              const claim = transport.inFlightEvents.get(event.eventId);
+              transport.inFlightEvents.delete(event.eventId);
+              if (claim != null) transport.fence.endInbound(claim);
+            }
+          }),
+        ),
+        Effect.tap((dropped) =>
+          dropped.length === 0
+            ? Effect.void
+            : Effect.logWarning("Matrix bridge discarded inbound messages it may no longer start", {
+                dropped: dropped.length,
+              }),
+        ),
+        Effect.asVoid,
+      ),
+      encryptedPayloads,
+      attemptedTransactions,
+      forgetTransaction,
+      retireUnsentCiphertext,
     };
+
+    // This connection's membership is applied before anything can be sent on
+    // it, so a reconnect never delivers under the previous connection's
+    // membership and the first published status already reflects the room.
+    const initialMembership = membershipEvent();
+    lastPublishedMembers = initialMembership.joined.join("\u0000");
+    yield* onInboundText(initialMembership);
+
     yield* Effect.acquireRelease(Ref.set(connectionRef, Option.some(connection)), () =>
       Ref.update(connectionRef, (current) =>
         Option.isSome(current) && current.value === connection ? Option.none() : current,
@@ -1379,6 +1696,56 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
       transport: { state: "ready" },
     });
     yield* publishReady;
+
+    // Membership and overflow drain independently of text: they decide whether
+    // output may leave, and a report must not queue behind a dispatch that can
+    // take the full thirty seconds.
+    yield* Effect.forkScoped(Stream.runForEach(Stream.fromQueue(membershipQueue), onInboundText));
+    yield* Effect.forkScoped(
+      Stream.runForEach(Stream.fromQueue(transport.overflow), onInboundText),
+    );
+    yield* Effect.forkScoped(
+      Effect.sleep(MATRIX_MEMBERSHIP_RECONCILE_INTERVAL_MS).pipe(
+        Effect.andThen(refreshRoomMembership(connection, "listen").pipe(Effect.ignore)),
+        Effect.forever,
+      ),
+    );
+    // Room order is preserved by draining one message at a time. The queue
+    // belongs to the transport, so anything buffered between connections is
+    // delivered by the next one rather than lost, and the allowed list is read
+    // at delivery: a member removed while a message was queued is not one the
+    // bridge still listens to.
+    yield* Effect.forkScoped(
+      Stream.runForEach(Stream.fromQueue(transport.inbound), (event) =>
+        Effect.gen(function* () {
+          // The queue outlives a connection, so an event buffered for the room
+          // this connection replaced is not one it may deliver.
+          if (event.roomId !== roomId) return;
+          const stored = yield* currentConfig;
+          if (Option.isNone(stored) || !stored.value.allowedUserIds.includes(event.sender)) {
+            return;
+          }
+          // Read before the verification below, so the message carries the
+          // bridge it was taken off the queue for: a move during that work
+          // invalidates it rather than redirecting it into another thread.
+          const ownershipEpoch = stored.value.ownershipEpoch;
+          // Asked at hand-off, from the homeserver, for the same reason the
+          // send gate asks: a room that cannot be verified is not safe.
+          const state = yield* verifyRoomForInbound(connection);
+          yield* onInboundText({ ...event, roomAllowedOnly: state === "safe", ownershipEpoch });
+        }).pipe(
+          // Released however this ends: the cursor must not be held by a
+          // message the bridge has finished with, or refused.
+          Effect.ensuring(
+            Effect.sync(() => {
+              const claim = transport.inFlightEvents.get(event.eventId);
+              transport.inFlightEvents.delete(event.eventId);
+              if (claim != null) transport.fence.endInbound(claim);
+            }),
+          ),
+        ),
+      ),
+    );
     // Resubmitting identical settings republishes `connecting` without
     // replacing this connection, so the live transport restores the truth
     // rather than leaving the status stuck mid-connect.
@@ -1389,6 +1756,32 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
     );
     yield* Effect.logInfo("Matrix bridge transport connected");
     return yield* Effect.never;
+  });
+
+  /**
+   * A message is only dropped as unsafe once verification has really failed: a
+   * transient read is retried, and a room that stays unverifiable is reported
+   * rather than quietly swallowing commands.
+   */
+  const verifyRoomForInbound = Effect.fn("MatrixBotSdkClient.verifyRoomForInbound")(function* (
+    connection: MatrixConnection,
+  ) {
+    for (let attempt = 0; attempt < MATRIX_MEMBERSHIP_VERIFY_ATTEMPTS; attempt += 1) {
+      const verified = yield* Effect.result(refreshRoomMembership(connection, "listen"));
+      // A room that kept changing under the read is unverified, not verified
+      // unsafe: it is retried like a failed read and reported the same way.
+      if (verified._tag === "Success" && verified.success !== "unverified") {
+        return verified.success;
+      }
+      if (verified._tag === "Failure" && verified.failure.retryability === "permanent") break;
+      yield* Effect.sleep(reconnectDelayMs(attempt));
+    }
+    yield* Effect.logWarning("Matrix bridge could not verify the room for an inbound message");
+    yield* configService.reportDegradedIfMatches({
+      cryptoStoreGeneration: connection.cryptoStoreGeneration,
+      cause: "inbound-unverified",
+    });
+    return "unverified" as const;
   });
 
   const listen: MatrixBridgeClient["Service"]["listen"] = (onInboundText) =>
@@ -1492,7 +1885,7 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
     );
     if (connection.encryptedPayloads.size >= MATRIX_ENCRYPTED_PAYLOAD_CAPACITY) {
       const oldest = connection.encryptedPayloads.keys().next();
-      if (!oldest.done) connection.encryptedPayloads.delete(oldest.value);
+      if (!oldest.done) connection.forgetTransaction(oldest.value);
     }
     connection.encryptedPayloads.set(message.transactionId, encrypted);
     return encrypted;
@@ -1514,7 +1907,40 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
       );
     }
 
+    // The timeline feed alone is not a complete membership record, so the gate
+    // before encryption asks the homeserver. That read also fails when the bot
+    // itself is no longer in the room.
+    const beforeEncryption = yield* refreshRoomMembership(connection, "send");
+    if (beforeEncryption !== "safe") {
+      return yield* clientError("send", ROOM_SEND_STATE_REASONS[beforeEncryption], "transient");
+    }
+
+    // Encryption is asynchronous, so it is fenced on the membership revision:
+    // any change at all during it - a join, a leave, or one reader swapped for
+    // another - means the ciphertext was built for a device set that is no
+    // longer the room's, so it is discarded and the retry encrypts afresh.
+    const revisionBeforeEncryption = connection.membershipRevision.value;
     const encrypted = yield* encryptOnce(connection, message);
+    // Asked of the homeserver again, not of the cache: preparing encryption is
+    // itself a joined-member lookup inside the SDK, so an account that joined
+    // through a sync gap can have taken this room key without the timeline ever
+    // saying so. The revision comparison then covers the rest: any change at
+    // all - a join, a leave, or one reader swapped for another - means the
+    // ciphertext was built for a device set that is no longer the room's.
+    const afterEncryption = yield* refreshRoomMembership(connection, "send");
+    if (
+      afterEncryption !== "safe" ||
+      connection.membershipRevision.value !== revisionBeforeEncryption
+    ) {
+      connection.forgetTransaction(message.transactionId);
+      return yield* clientError(
+        "send",
+        afterEncryption === "safe"
+          ? "The Matrix room membership changed while the message was being encrypted."
+          : `${ROOM_SEND_STATE_REASONS[afterEncryption]} The room changed while the message was being encrypted.`,
+        "transient",
+      );
+    }
 
     // Reconfiguration and disconnect happen while a send is in flight, and the
     // connection captured above may already be retired: check the live
@@ -1534,7 +1960,10 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
     }
 
     // The transaction ID makes the send idempotent across retries: the
-    // homeserver returns the original event for a repeated PUT.
+    // homeserver returns the original event for a repeated PUT. From here on
+    // this ciphertext is what that transaction means, even if the response is
+    // lost, so it is never replaced by a re-encryption.
+    connection.attemptedTransactions.add(message.transactionId);
     yield* request("send", "The Matrix message could not be delivered.", () =>
       connection.client.doRequest(
         "PUT",
@@ -1543,10 +1972,21 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
         encrypted,
       ),
     );
-    connection.encryptedPayloads.delete(message.transactionId);
+    connection.forgetTransaction(message.transactionId);
   });
 
-  return MatrixBridgeClient.of({ listen, sendText });
+  const discardPendingInbound: MatrixBridgeClient["Service"]["discardPendingInbound"] = Ref.get(
+    connectionRef,
+  ).pipe(
+    Effect.flatMap(
+      Option.match({
+        onNone: () => Effect.void,
+        onSome: (connection) => connection.discardPendingText,
+      }),
+    ),
+  );
+
+  return MatrixBridgeClient.of({ listen, sendText, discardPendingInbound });
 });
 
 export const layer = Layer.effect(MatrixBridgeClient, make());

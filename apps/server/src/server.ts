@@ -271,7 +271,14 @@ const ReactorLayerLive = Layer.empty.pipe(
   Layer.provideMerge(ChildThreadCoordinatorLive.pipe(Layer.provide(PendingDispatchRepositoryLive))),
   Layer.provideMerge(AgentAwarenessRelay.layer.pipe(Layer.provide(ServerSecretStore.layer))),
   Layer.provideMerge(RuntimeReceiptBusLive),
-  Layer.provideMerge(MatrixBridgeReactor.layer.pipe(Layer.provide(MatrixBotSdkClient.layer))),
+  Layer.provideMerge(
+    MatrixBridgeReactor.layer.pipe(
+      Layer.provide(MatrixBotSdkClient.layer),
+      // The same dispatcher instance the scheduler uses, so an inbound Matrix
+      // message takes exactly the composer's `thread.turn.start` path.
+      Layer.provide(BootstrapTurnStartDispatcher.layer),
+    ),
+  ),
 );
 
 const ProviderSessionDirectoryLayerLive = ProviderSessionDirectoryLive.pipe(

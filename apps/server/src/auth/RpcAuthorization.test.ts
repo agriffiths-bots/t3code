@@ -1,4 +1,5 @@
 import {
+  AuthAccessReadScope,
   AuthAccessWriteScope,
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
@@ -39,6 +40,7 @@ describe("RPC authorization scopes", () => {
 
   it("assigns Matrix configuration, ownership, and status scopes", () => {
     expect(requiredScopeForRpcMethod(WS_METHODS.matrixBridgeConfigure)).toBe(AuthAccessWriteScope);
+    expect(requiredScopeForRpcMethod(WS_METHODS.matrixBridgeGetConfig)).toBe(AuthAccessReadScope);
     expect(requiredScopeForRpcMethod(WS_METHODS.matrixBridgeDisconnect)).toBe(AuthAccessWriteScope);
     expect(requiredScopeForRpcMethod(WS_METHODS.matrixBridgeSetOwner)).toBe(
       AuthOrchestrationOperateScope,

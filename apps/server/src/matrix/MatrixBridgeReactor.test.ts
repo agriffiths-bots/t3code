@@ -2,7 +2,9 @@ import {
   CheckpointRef,
   EnvironmentId,
   EventId,
+  MatrixBridgeOperationError,
   MessageId,
+  OrchestrationDispatchCommandError,
   NonNegativeInt,
   ProjectId,
   ProviderInstanceId,
@@ -12,8 +14,10 @@ import {
   type OrchestrationEvent,
   type OrchestrationMessage,
   type OrchestrationThread,
+  type OrchestrationThreadShell,
 } from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
+import * as Crypto from "effect/Crypto";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -25,17 +29,29 @@ import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import { TestClock } from "effect/testing";
 
+import { EnvironmentAuth, ServerAuthInvalidCredentialError } from "../auth/EnvironmentAuth.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import { ServerActivation } from "../serverActivation.ts";
+import { BootstrapTurnStartDispatcher } from "../orchestration/Services/BootstrapTurnStartDispatcher.ts";
 import {
   OrchestrationEngineService,
   type OrchestrationEngineShape,
 } from "../orchestration/Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
-import { makeFakeMatrixBridgeClient, type FakeMatrixBridgeClient } from "./MatrixBridgeClient.ts";
+import {
+  makeFakeMatrixBridgeClient,
+  type FakeMatrixBridgeClient,
+  type MatrixBridgeInboundText,
+  type MatrixBridgeRoomMembership,
+} from "./MatrixBridgeClient.ts";
 import {
   MatrixBridgeReactor,
   MATRIX_BRIDGE_OUTBOUND_CAPACITY,
+  MATRIX_BRIDGE_PAIRING_CAPACITY,
+  MATRIX_BRIDGE_PAIRING_FAILED,
+  MATRIX_BRIDGE_PAIRING_PROMPT,
+  MATRIX_BRIDGE_PAIRING_REJECTED,
+  MATRIX_BRIDGE_PAIRING_SUCCESS,
   MATRIX_BRIDGE_RETRY_WINDOW_MS,
   layer as MatrixBridgeReactorLive,
   makeBoundedDrainableWorker,
@@ -259,18 +275,100 @@ function lifecycleEvent(
       };
 }
 
-function status(ownerThreadId: ThreadId | null): MatrixBridgeStatus {
+function status(
+  ownerThreadId: ThreadId | null,
+  state: MatrixBridgeStatus["state"] = "active",
+): MatrixBridgeStatus {
   return {
-    state: "active",
+    state,
     ownerThreadId,
     encryptionReady: true,
     reason: null,
   };
 }
 
+const allowedUserId = "@adam:example";
+const roomId = "!room:example";
+const botUserId = "@t3bot:example";
+
+function threadShell(input: {
+  readonly threadId?: ThreadId;
+  readonly archivedAt?: string | null;
+}): OrchestrationThreadShell {
+  return {
+    id: input.threadId ?? threadA,
+    projectId,
+    dataAudience: "private",
+    title: "Matrix test thread",
+    modelSelection,
+    runtimeMode: "full-access",
+    interactionMode: "default",
+    branch: null,
+    worktreePath: null,
+    latestTurn: null,
+    createdAt: baseAt,
+    updatedAt: baseAt,
+    archivedAt: input.archivedAt ?? null,
+    settledOverride: null,
+    settledAt: null,
+    session: null,
+    latestUserMessageAt: null,
+    hasPendingApprovals: false,
+    hasPendingUserInput: false,
+    hasActionableProposedPlan: false,
+    parentThreadId: null,
+  };
+}
+
+function inboundText(input: {
+  readonly eventId: string;
+  readonly body: string;
+  readonly sender?: string;
+  readonly room?: string;
+  readonly isEdit?: boolean;
+  readonly roomAllowedOnly?: boolean;
+  readonly ownershipEpoch?: number;
+}): MatrixBridgeInboundText {
+  return {
+    kind: "text",
+    eventId: input.eventId,
+    roomId: input.room ?? roomId,
+    sender: input.sender ?? allowedUserId,
+    body: input.body,
+    isEdit: input.isEdit ?? false,
+    roomAllowedOnly: input.roomAllowedOnly ?? true,
+    // The harness config starts at this epoch, so a message is for the bridge
+    // as it stands unless a test says otherwise.
+    ownershipEpoch: input.ownershipEpoch ?? 1,
+  };
+}
+
+function inboundMembership(joined: ReadonlyArray<string>): MatrixBridgeRoomMembership {
+  return { kind: "membership", roomId, botUserId, joined };
+}
+
+interface DispatchedTurn {
+  readonly threadId: ThreadId;
+  readonly commandId: string;
+  readonly text: string;
+}
+
 interface ReactorHarness {
   readonly reactor: MatrixBridgeReactor["Service"];
   readonly fake: FakeMatrixBridgeClient;
+  readonly dispatched: Effect.Effect<ReadonlyArray<DispatchedTurn>>;
+  readonly dispatchAttempts: Effect.Effect<ReadonlyArray<DispatchedTurn>>;
+  readonly awaitDispatchAttempt: Effect.Effect<void>;
+  readonly failNextDispatches: (count: number) => Effect.Effect<void>;
+  readonly consumedCodes: Effect.Effect<ReadonlyArray<string>>;
+  readonly requestedProofs: Effect.Effect<
+    ReadonlyArray<{ readonly audienceCeiling: string; readonly scopes: ReadonlyArray<string> }>
+  >;
+  readonly livePairingCodes: Effect.Effect<ReadonlyArray<string>>;
+  readonly failPairingPersistence: Effect.Effect<void>;
+  readonly setThreadShell: (value: OrchestrationThreadShell | null) => Effect.Effect<void>;
+  readonly awaitStatusState: (state: MatrixBridgeStatus["state"]) => Effect.Effect<void>;
+  readonly statusState: Effect.Effect<MatrixBridgeStatus["state"]>;
   readonly publish: (event: OrchestrationEvent) => Effect.Effect<void>;
   readonly publishWithoutDrain: (event: OrchestrationEvent) => Effect.Effect<void>;
   readonly setThread: (value: OrchestrationThread | null) => Effect.Effect<void>;
@@ -289,11 +387,21 @@ interface ReactorHarness {
 interface ReactorHarnessOptions {
   readonly initialOwner?: ThreadId | null;
   readonly initialThread?: OrchestrationThread | null;
+  readonly initialThreadShell?: OrchestrationThreadShell | null;
   readonly lastDeliveredTurnId?: TurnId | null;
   readonly deliveryBaselineSequence?: number;
   readonly deliveryCheckpointInitialized?: boolean;
   readonly historicalEvents?: ReadonlyArray<OrchestrationEvent>;
   readonly activation?: Effect.Effect<void>;
+  readonly pairing?: MatrixBridgeConfigV1["pairing"];
+  readonly initialStatusState?: MatrixBridgeStatus["state"];
+  /**
+   * The real adapter applies this connection's joined membership before the
+   * transport can send, so the harness does the same. `null` reproduces a
+   * bridge that has not learned who is in the room yet.
+   */
+  readonly initialMembers?: ReadonlyArray<string> | null;
+  readonly livePairingCodes?: ReadonlyArray<string>;
 }
 
 function withHarness<A, E>(
@@ -330,16 +438,17 @@ function withHarness<A, E>(
         version: 1,
         homeserverUrl: "https://matrix.example",
         accessToken: "secret-test-token",
-        allowedUserIds: ["@adam:example"],
-        roomId: "!room:example",
-        pairing: {
+        allowedUserIds: [allowedUserId],
+        roomId,
+        pairing: options.pairing ?? {
           state: "paired",
-          userId: "@adam:example",
+          userId: allowedUserId,
           pairedAt: baseAt,
         },
         ownerThreadId: options.initialOwner === undefined ? threadA : options.initialOwner,
         ownershipEpoch: NonNegativeInt.make(1),
         cryptoStoreGeneration: "test-generation",
+        configuredAt: baseAt,
         lastDeliveredTurnId: options.lastDeliveredTurnId ?? null,
         deliveryBaselineSequence: NonNegativeInt.make(options.deliveryBaselineSequence ?? 0),
         deliveryCheckpointInitialized: options.deliveryCheckpointInitialized ?? true,
@@ -347,7 +456,32 @@ function withHarness<A, E>(
       const configRef = yield* SubscriptionRef.make<Option.Option<MatrixBridgeConfigV1>>(
         Option.some(initialConfig),
       );
+      const statusRef = yield* SubscriptionRef.make(
+        status(initialConfig.ownerThreadId, options.initialStatusState ?? "active"),
+      );
+      const shellRef = yield* Ref.make<Option.Option<OrchestrationThreadShell>>(
+        Option.fromNullishOr(
+          options.initialThreadShell === undefined ? threadShell({}) : options.initialThreadShell,
+        ),
+      );
+      const dispatchedRef = yield* Ref.make<ReadonlyArray<DispatchedTurn>>([]);
+      const dispatchAttemptsRef = yield* Ref.make<ReadonlyArray<DispatchedTurn>>([]);
+      const observedDispatchAttempts = yield* Queue.unbounded<void>();
+      const failDispatchesRef = yield* Ref.make(0);
+      const consumedRef = yield* Ref.make<ReadonlyArray<string>>([]);
+      // Only these strings are redeemable; anything else is unknown, expired,
+      // revoked, or already spent, which the gate answers identically.
+      const liveCodesRef = yield* Ref.make<ReadonlyArray<string>>(
+        options.livePairingCodes ?? ["valid-code"],
+      );
+      const requestedProofsRef = yield* Ref.make<
+        ReadonlyArray<{ readonly audienceCeiling: string; readonly scopes: ReadonlyArray<string> }>
+      >([]);
+      const failPersistRef = yield* Ref.make(false);
       const fake = yield* makeFakeMatrixBridgeClient;
+
+      const setStatus = (state: MatrixBridgeStatus["state"]) =>
+        SubscriptionRef.update(statusRef, (current) => ({ ...current, state }));
 
       const setOwner = (ownerThreadId: ThreadId | null) =>
         Effect.gen(function* () {
@@ -355,11 +489,11 @@ function withHarness<A, E>(
           const baselineTurn =
             ownerThreadId !== null && detail?.id === ownerThreadId ? detail.latestTurn : null;
           const baselineSequence = NonNegativeInt.make(yield* Ref.get(sequenceRef));
-          return yield* SubscriptionRef.modify(configRef, (current) => {
+          const next = yield* SubscriptionRef.modify(configRef, (current) => {
             if (Option.isNone(current)) {
               return [status(null), current] as const;
             }
-            const next: MatrixBridgeConfigV1 = {
+            const nextConfig: MatrixBridgeConfigV1 = {
               ...current.value,
               ownerThreadId,
               ownershipEpoch: NonNegativeInt.make(current.value.ownershipEpoch + 1),
@@ -367,8 +501,10 @@ function withHarness<A, E>(
               deliveryBaselineSequence: baselineSequence,
               deliveryCheckpointInitialized: true,
             };
-            return [status(ownerThreadId), Option.some(next)] as const;
+            return [status(ownerThreadId), Option.some(nextConfig)] as const;
           });
+          yield* SubscriptionRef.update(statusRef, (current) => ({ ...current, ownerThreadId }));
+          return next;
         });
 
       const clearOwnerIfMatches = (expected: {
@@ -446,19 +582,82 @@ function withHarness<A, E>(
           ] as const;
         });
 
+      const markPairedIfMatches: MatrixBridgeConfig["Service"]["markPairedIfMatches"] = (
+        expected,
+      ) =>
+        Effect.gen(function* () {
+          if (yield* Ref.get(failPersistRef)) {
+            return yield* new MatrixBridgeOperationError({
+              reason: "persistenceFailed",
+              message: "Matrix bridge configuration could not be persisted.",
+            });
+          }
+          const paired = yield* SubscriptionRef.modify(configRef, (current) => {
+            if (
+              Option.isNone(current) ||
+              current.value.cryptoStoreGeneration !== expected.cryptoStoreGeneration ||
+              current.value.roomId !== expected.roomId ||
+              !current.value.allowedUserIds.includes(expected.userId)
+            ) {
+              return [false, current] as const;
+            }
+            return [
+              true,
+              Option.some({
+                ...current.value,
+                pairing: {
+                  state: "paired" as const,
+                  userId: expected.userId,
+                  pairedAt: expected.pairedAt,
+                  eventId: expected.eventId,
+                },
+              }),
+            ] as const;
+          });
+          if (paired) {
+            const current = yield* SubscriptionRef.get(configRef);
+            if (Option.isSome(current)) yield* setStatus(deriveStatus(current.value));
+          }
+          return paired;
+        });
+
+      // Mirrors the real derivation: nobody to read means nothing is active.
+      let membership = { allowedMemberPresent: false, unexpectedMemberPresent: false };
+      const deriveStatus = (config: MatrixBridgeConfigV1): MatrixBridgeStatus["state"] =>
+        membership.unexpectedMemberPresent
+          ? "degraded"
+          : !membership.allowedMemberPresent
+            ? "waiting-for-member"
+            : config.pairing.state === "paired"
+              ? "active"
+              : "awaiting-pairing";
+
+      const reportRoomMembershipIfMatches: MatrixBridgeConfig["Service"]["reportRoomMembershipIfMatches"] =
+        (expected) =>
+          Effect.gen(function* () {
+            const current = yield* SubscriptionRef.get(configRef);
+            if (
+              Option.isNone(current) ||
+              current.value.cryptoStoreGeneration !== expected.cryptoStoreGeneration
+            ) {
+              return false;
+            }
+            membership = {
+              allowedMemberPresent: expected.allowedMemberPresent,
+              unexpectedMemberPresent: expected.unexpectedMemberPresent,
+            };
+            yield* setStatus(deriveStatus(current.value));
+            return true;
+          });
+
       const configLayer = Layer.succeed(
         MatrixBridgeConfig,
         MatrixBridgeConfig.of({
           currentConfig: SubscriptionRef.get(configRef),
-          status: SubscriptionRef.get(configRef).pipe(
-            Effect.map((current) =>
-              status(Option.isSome(current) ? current.value.ownerThreadId : null),
-            ),
-          ),
+          configView: unsupported(),
+          status: SubscriptionRef.get(statusRef),
           statusChanges: SubscriptionRef.changes(configRef).pipe(
-            Stream.map((current) =>
-              status(Option.isSome(current) ? current.value.ownerThreadId : null),
-            ),
+            Stream.mapEffect(() => SubscriptionRef.get(statusRef)),
           ),
           configure: () => unsupported(),
           disconnect: unsupported(),
@@ -466,11 +665,73 @@ function withHarness<A, E>(
           clearOwnerIfMatches,
           recordRoomIfMatches: () => unsupported(),
           reportTransportStateIfMatches: () => unsupported(),
+          markPairedIfMatches,
+          reportRoomMembershipIfMatches,
+          reportDegradedIfMatches: () => setStatus("degraded").pipe(Effect.as(true)),
           initializeDeliveryCheckpointIfMissing,
           markDeliveredIfMatches,
           reportPermanentSendFailureIfMatches: () => Effect.succeed(true),
         }),
       );
+
+      const authLayer = Layer.mock(EnvironmentAuth)({
+        consumePairingCredentialForProof: (credential, required) =>
+          Effect.gen(function* () {
+            // A bridged thread may be private and the bridge starts turns in
+            // it, so a narrower credential must never be accepted as proof.
+            yield* Ref.update(requestedProofsRef, (proofs) => [
+              ...proofs,
+              { audienceCeiling: required.audienceCeiling, scopes: [...required.scopes] },
+            ]);
+            const live = yield* Ref.get(liveCodesRef);
+            if (!live.includes(credential)) {
+              return yield* new ServerAuthInvalidCredentialError({});
+            }
+            // One-time: redeeming spends it.
+            yield* Ref.set(
+              liveCodesRef,
+              live.filter((code) => code !== credential),
+            );
+            yield* Ref.update(consumedRef, (consumed) => [...consumed, credential]);
+          }),
+        isLivePairingCredential: (credential) =>
+          Ref.get(liveCodesRef).pipe(Effect.map((live) => live.includes(credential))),
+      });
+
+      const dispatcherLayer = Layer.succeed(BootstrapTurnStartDispatcher, {
+        dispatch: (command) =>
+          Effect.gen(function* () {
+            const attempt: DispatchedTurn = {
+              threadId: command.threadId,
+              commandId: command.commandId,
+              text: command.message.text,
+            };
+            yield* Ref.update(dispatchAttemptsRef, (attempts) => [...attempts, attempt]);
+            yield* Queue.offer(observedDispatchAttempts, undefined);
+            const failing = yield* Ref.getAndUpdate(failDispatchesRef, (count) =>
+              Math.max(0, count - 1),
+            );
+            if (failing > 0) {
+              return yield* new OrchestrationDispatchCommandError({
+                message: "Injected dispatch failure.",
+              });
+            }
+            yield* Ref.update(dispatchedRef, (dispatched) => [...dispatched, attempt]);
+            return { sequence: 1 };
+          }),
+      });
+
+      const cryptoLayer = Layer.sync(Crypto.Crypto, () => {
+        let nextByte = 0;
+        return Crypto.make({
+          randomBytes: (size) =>
+            Uint8Array.from({ length: size }, () => {
+              nextByte = (nextByte + 1) % 256;
+              return nextByte;
+            }),
+          digest: (_algorithm, data) => Effect.succeed(data),
+        });
+      });
       const engineLayer = Layer.succeed(OrchestrationEngineService, {
         readEvents: (fromSequenceExclusive) =>
           Stream.fromIterable(
@@ -506,6 +767,7 @@ function withHarness<A, E>(
               Option.map(detail, (thread) => ({ snapshotSequence, thread })),
             ),
           ),
+        getThreadShellByIdIncludingArchived: () => Ref.get(shellRef),
       });
       const environmentLayer = Layer.mock(ServerEnvironment.ServerEnvironment)({
         getEnvironmentId: Effect.succeed(EnvironmentId.make("matrix-env")),
@@ -516,12 +778,30 @@ function withHarness<A, E>(
         engineLayer,
         projectionLayer,
         environmentLayer,
+        authLayer,
+        dispatcherLayer,
+        cryptoLayer,
       );
       const reactorLayer = MatrixBridgeReactorLive.pipe(Layer.provide(dependencies));
 
       return yield* Effect.gen(function* () {
         const reactor = yield* MatrixBridgeReactor;
         yield* reactor.start();
+        const initialMembers =
+          options.initialMembers === undefined
+            ? [botUserId, allowedUserId]
+            : options.initialMembers;
+        if (initialMembers !== null) {
+          const applyMembership = fake.awaitListening.pipe(
+            Effect.andThen(fake.emitInbound(inboundMembership(initialMembers))),
+            Effect.asVoid,
+          );
+          // A parked activation holds the listener, so the snapshot lands as
+          // soon as the test releases it rather than deadlocking here.
+          yield* options.activation === undefined
+            ? applyMembership
+            : Effect.forkScoped(applyMembership).pipe(Effect.asVoid);
+        }
         yield* reactor.drain;
         yield* Ref.set(inspectionCountRef, 0);
 
@@ -551,6 +831,22 @@ function withHarness<A, E>(
         return yield* use({
           reactor,
           fake,
+          dispatched: Ref.get(dispatchedRef),
+          dispatchAttempts: Ref.get(dispatchAttemptsRef),
+          awaitDispatchAttempt: Queue.take(observedDispatchAttempts),
+          failNextDispatches: (count) => Ref.set(failDispatchesRef, count),
+          consumedCodes: Ref.get(consumedRef),
+          requestedProofs: Ref.get(requestedProofsRef),
+          livePairingCodes: Ref.get(liveCodesRef),
+          failPairingPersistence: Ref.set(failPersistRef, true),
+          setThreadShell: (value) => Ref.set(shellRef, Option.fromNullishOr(value)),
+          awaitStatusState: (state) =>
+            SubscriptionRef.changes(statusRef).pipe(
+              Stream.filter((current) => current.state === state),
+              Stream.runHead,
+              Effect.asVoid,
+            ),
+          statusState: SubscriptionRef.get(statusRef).pipe(Effect.map((current) => current.state)),
           publish,
           publishWithoutDrain,
           setThread: (value) => Ref.set(detailRef, Option.fromNullishOr(value)),
@@ -1933,4 +2229,731 @@ it.effect(
         ),
       ),
     ),
+);
+
+it.effect("prompts once an allowed member joins and never before", () =>
+  withHarness(
+    (harness) =>
+      Effect.gen(function* () {
+        yield* harness.fake.awaitListening;
+
+        // The bot alone in the room is not someone to prompt.
+        expect(yield* harness.fake.emitInbound(inboundMembership([botUserId]))).toBe(true);
+        yield* harness.reactor.drain;
+        expect(yield* harness.fake.sent).toEqual([]);
+        expect(yield* harness.statusState).toBe("waiting-for-member");
+
+        yield* harness.fake.emitInbound(inboundMembership([botUserId, allowedUserId]));
+        yield* harness.reactor.drain;
+        expect((yield* harness.fake.sent).map((entry) => entry.content.body)).toEqual([
+          MATRIX_BRIDGE_PAIRING_PROMPT,
+        ]);
+        expect(yield* harness.statusState).toBe("awaiting-pairing");
+
+        // Reconnecting or re-reading membership must not repeat the prompt.
+        yield* harness.fake.emitInbound(inboundMembership([botUserId, allowedUserId]));
+        yield* harness.reactor.drain;
+        expect(yield* harness.fake.sent).toHaveLength(1);
+      }),
+    {
+      pairing: { state: "unpaired" },
+      initialStatusState: "waiting-for-member",
+      initialMembers: null,
+    },
+  ),
+);
+
+it.effect(
+  "rejects unusable codes identically, consumes a valid one once, and never dispatches",
+  () =>
+    withHarness(
+      (harness) =>
+        Effect.gen(function* () {
+          yield* harness.fake.awaitListening;
+          yield* harness.fake.emitInbound(inboundMembership([botUserId, allowedUserId]));
+          yield* harness.reactor.drain;
+
+          for (const [index, code] of ["unknown-code", "expired-code", "revoked-code"].entries()) {
+            yield* harness.fake.emitInbound(inboundText({ eventId: `$bad-${index}`, body: code }));
+            yield* harness.reactor.drain;
+          }
+          // Surrounding whitespace from a phone keyboard still pairs.
+          yield* harness.fake.emitInbound(
+            inboundText({ eventId: "$good", body: "  valid-code  " }),
+          );
+          yield* harness.reactor.drain;
+
+          expect((yield* harness.fake.sent).map((entry) => entry.content.body)).toEqual([
+            MATRIX_BRIDGE_PAIRING_PROMPT,
+            MATRIX_BRIDGE_PAIRING_REJECTED,
+            MATRIX_BRIDGE_PAIRING_REJECTED,
+            MATRIX_BRIDGE_PAIRING_REJECTED,
+            MATRIX_BRIDGE_PAIRING_SUCCESS,
+          ]);
+          expect(yield* harness.consumedCodes).toEqual(["valid-code"]);
+          // Every proof demands the audience a bridged thread may hold and the
+          // scopes the bridge exercises for the paired account.
+          for (const proof of yield* harness.requestedProofs) {
+            expect(proof).toEqual({
+              audienceCeiling: "private",
+              scopes: ["orchestration:read", "orchestration:operate"],
+            });
+          }
+          // The code message is a gate answer, never a turn.
+          expect(yield* harness.dispatched).toEqual([]);
+
+          // Anything sent to the locked room and still in flight was a gate
+          // answer, so opening the gate does not let it through as a turn.
+          expect(yield* harness.fake.discardedInbound).toBeGreaterThan(0);
+
+          const paired = Option.getOrThrow(yield* harness.currentConfig).pairing;
+          expect(paired.state).toBe("paired");
+          expect(paired.state === "paired" ? paired.userId : null).toBe(allowedUserId);
+          expect(yield* harness.statusState).toBe("active");
+        }),
+      {
+        pairing: { state: "unpaired" },
+        initialStatusState: "waiting-for-member",
+      },
+    ),
+);
+
+it.effect("stays locked when the paired state cannot be written", () =>
+  withHarness(
+    (harness) =>
+      Effect.gen(function* () {
+        yield* harness.fake.awaitListening;
+        yield* harness.fake.emitInbound(inboundMembership([botUserId, allowedUserId]));
+        yield* harness.failPairingPersistence;
+        yield* harness.fake.emitInbound(inboundText({ eventId: "$code", body: "valid-code" }));
+        yield* harness.reactor.drain;
+
+        expect((yield* harness.fake.sent).map((entry) => entry.content.body)).toEqual([
+          MATRIX_BRIDGE_PAIRING_PROMPT,
+          MATRIX_BRIDGE_PAIRING_FAILED,
+        ]);
+        // The grant is spent and the bridge is still locked, so the code cannot
+        // be replayed into an active bridge.
+        expect(yield* harness.consumedCodes).toEqual(["valid-code"]);
+        expect(Option.getOrThrow(yield* harness.currentConfig).pairing).toEqual({
+          state: "unpaired",
+        });
+        expect(yield* harness.statusState).toBe("degraded");
+        expect(yield* harness.dispatched).toEqual([]);
+      }),
+    {
+      pairing: { state: "unpaired" },
+      initialStatusState: "waiting-for-member",
+    },
+  ),
+);
+
+it.effect("ignores bot, wrong-room, unpaired-sender, edited, and duplicate events", () =>
+  withHarness((harness) =>
+    Effect.gen(function* () {
+      yield* harness.fake.awaitListening;
+      yield* harness.fake.emitInbound(inboundMembership([botUserId, allowedUserId]));
+
+      yield* harness.fake.emitInbound(
+        inboundText({ eventId: "$echo", body: "bridge output", sender: botUserId }),
+      );
+      yield* harness.fake.emitInbound(
+        inboundText({ eventId: "$elsewhere", body: "another room", room: "!other:example" }),
+      );
+      yield* harness.fake.emitInbound(
+        inboundText({ eventId: "$stranger", body: "let me in", sender: "@stranger:example" }),
+      );
+      yield* harness.fake.emitInbound(
+        inboundText({ eventId: "$edit", body: "second thoughts", isEdit: true }),
+      );
+      yield* harness.reactor.drain;
+      expect(yield* harness.dispatched).toEqual([]);
+
+      yield* harness.fake.emitInbound(inboundText({ eventId: "$turn", body: "Do the thing" }));
+      yield* harness.fake.emitInbound(inboundText({ eventId: "$turn", body: "Do the thing" }));
+      yield* harness.reactor.drain;
+
+      const dispatched = yield* harness.dispatched;
+      expect(dispatched.map((entry) => entry.text)).toEqual(["Do the thing"]);
+      expect(dispatched[0]?.threadId).toBe(threadA);
+      // Nothing the bridge received produced Matrix output of its own.
+      expect(yield* harness.fake.sent).toEqual([]);
+    }),
+  ),
+);
+
+it.effect("takes one turn-start path for idle and running owner threads", () =>
+  withHarness((harness) =>
+    Effect.gen(function* () {
+      yield* harness.fake.awaitListening;
+      yield* harness.fake.emitInbound(inboundText({ eventId: "$idle", body: "First message" }));
+      yield* harness.reactor.drain;
+
+      // Mid-turn the reactor deliberately does not branch: the same command is
+      // dispatched again and the provider adapter steers the live turn.
+      yield* harness.setThread(
+        thread({ turnId: TurnId.make("turn-running"), state: "running", messages: [] }),
+      );
+      yield* harness.fake.emitInbound(inboundText({ eventId: "$running", body: "Second message" }));
+      yield* harness.reactor.drain;
+
+      const dispatched = yield* harness.dispatched;
+      expect(dispatched.map((entry) => entry.text)).toEqual(["First message", "Second message"]);
+      expect(dispatched.map((entry) => entry.threadId)).toEqual([threadA, threadA]);
+      expect(new Set(dispatched.map((entry) => entry.commandId)).size).toBe(2);
+    }),
+  ),
+);
+
+it.effect("stays silent for an unbridged, missing, or archived owner thread", () =>
+  withHarness(
+    (harness) =>
+      Effect.gen(function* () {
+        yield* harness.fake.awaitListening;
+        yield* harness.fake.emitInbound(inboundText({ eventId: "$no-owner", body: "anyone home" }));
+        yield* harness.reactor.drain;
+        expect(yield* harness.dispatched).toEqual([]);
+
+        yield* harness.setOwner(threadA);
+        yield* harness.setThreadShell(threadShell({ archivedAt: "2026-08-19T10:30:00.000Z" }));
+        yield* harness.setThread(
+          thread({
+            turnId: TurnId.make("turn-archived"),
+            state: "completed",
+            messages: [],
+            archivedAt: "2026-08-19T10:30:00.000Z",
+          }),
+        );
+        // Sent for the bridge as it stands now, after the owner was selected.
+        const epoch = Option.getOrThrow(yield* harness.currentConfig).ownershipEpoch;
+        yield* harness.fake.emitInbound(
+          inboundText({ eventId: "$archived", body: "still there", ownershipEpoch: epoch }),
+        );
+        yield* harness.awaitOwner(null);
+        yield* harness.reactor.drain;
+
+        expect(yield* harness.dispatched).toEqual([]);
+        expect(Option.getOrThrow(yield* harness.currentConfig).ownerThreadId).toBe(null);
+      }),
+    { initialOwner: null },
+  ),
+);
+
+it.effect("never sends while an unexpected member is joined", () =>
+  withHarness((harness) =>
+    Effect.gen(function* () {
+      const turnId = TurnId.make("turn-paused");
+      const final = message({
+        id: "message-paused-final",
+        role: "assistant",
+        text: "Not for strangers",
+        turnId,
+        at: "2026-08-19T10:00:09.000Z",
+      });
+      yield* harness.fake.awaitListening;
+      yield* harness.fake.emitInbound(
+        inboundMembership([botUserId, allowedUserId, "@stranger:example"]),
+      );
+      yield* harness.reactor.drain;
+      expect(yield* harness.statusState).toBe("degraded");
+
+      yield* harness.setThread(thread({ turnId, state: "completed", messages: [final] }));
+      yield* harness.publishWithoutDrain(
+        assistantEvent({ turnId, messageId: "message-paused-final", at: final.updatedAt }),
+      );
+      const drainFiber = yield* harness.reactor.drain.pipe(Effect.forkChild);
+      yield* TestClock.adjust(MATRIX_BRIDGE_RETRY_WINDOW_MS);
+      yield* Fiber.join(drainFiber);
+
+      expect(yield* harness.fake.attempts).toEqual([]);
+      expect(yield* harness.fake.sent).toEqual([]);
+    }),
+  ),
+);
+
+it.effect("resumes delivery once the unexpected member leaves", () =>
+  withHarness((harness) =>
+    Effect.gen(function* () {
+      const turnId = TurnId.make("turn-resumed");
+      const final = message({
+        id: "message-resumed-final",
+        role: "assistant",
+        text: "Safe to send",
+        turnId,
+        at: "2026-08-19T10:00:09.000Z",
+      });
+      yield* harness.fake.awaitListening;
+      yield* harness.fake.emitInbound(
+        inboundMembership([botUserId, allowedUserId, "@stranger:example"]),
+      );
+      yield* harness.setThread(thread({ turnId, state: "completed", messages: [final] }));
+      yield* harness.publishWithoutDrain(
+        assistantEvent({ turnId, messageId: "message-resumed-final", at: final.updatedAt }),
+      );
+      const drainFiber = yield* harness.reactor.drain.pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+
+      yield* harness.fake.emitInbound(inboundMembership([botUserId, allowedUserId]));
+      yield* TestClock.adjust("1 second");
+      yield* Fiber.join(drainFiber);
+
+      expect((yield* harness.fake.sent).map((entry) => entry.content.body)).toEqual([
+        "Safe to send",
+      ]);
+      expect(yield* harness.statusState).toBe("active");
+    }),
+  ),
+);
+
+it.effect("sends each queued final once and in order after a brief outage", () =>
+  withHarness((harness) =>
+    Effect.gen(function* () {
+      const firstTurn = TurnId.make("turn-outage-first");
+      const secondTurn = TurnId.make("turn-outage-second");
+      const firstFinal = message({
+        id: "message-outage-first",
+        role: "assistant",
+        text: "First final",
+        turnId: firstTurn,
+        at: "2026-08-19T10:00:09.000Z",
+      });
+      const secondFinal = message({
+        id: "message-outage-second",
+        role: "assistant",
+        text: "Second final",
+        turnId: secondTurn,
+        at: "2026-08-19T10:00:19.000Z",
+      });
+
+      yield* harness.setThread(
+        thread({ turnId: firstTurn, state: "completed", messages: [firstFinal] }),
+      );
+      yield* harness.fake.failNextSends(1);
+      yield* harness.publishWithoutDrain(
+        assistantEvent({
+          turnId: firstTurn,
+          messageId: "message-outage-first",
+          at: firstFinal.updatedAt,
+        }),
+      );
+      const drainFiber = yield* harness.reactor.drain.pipe(Effect.forkChild);
+      yield* harness.fake.awaitAttemptCount(1);
+
+      // The second final lands while the first is still retrying.
+      yield* harness.setThread(
+        thread({
+          turnId: secondTurn,
+          state: "completed",
+          messages: [firstFinal, secondFinal],
+          terminalAt: "2026-08-19T10:00:20.000Z",
+        }),
+      );
+      yield* harness.publishWithoutDrain(
+        assistantEvent({
+          turnId: secondTurn,
+          messageId: "message-outage-second",
+          at: secondFinal.updatedAt,
+        }),
+      );
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust("1 second");
+      yield* Fiber.join(drainFiber);
+
+      const sent = yield* harness.fake.sent;
+      expect(sent.map((entry) => entry.content.body)).toEqual(["First final", "Second final"]);
+      expect(new Set(sent.map((entry) => entry.transactionId)).size).toBe(2);
+      expect(yield* harness.fake.attempts).toHaveLength(3);
+    }),
+  ),
+);
+
+it.effect("holds a final until this connection's membership is known", () =>
+  withHarness(
+    (harness) =>
+      Effect.gen(function* () {
+        const turnId = TurnId.make("turn-unknown-membership");
+        const final = message({
+          id: "message-unknown-membership",
+          role: "assistant",
+          text: "Wait for the room",
+          turnId,
+          at: "2026-08-19T10:00:09.000Z",
+        });
+        yield* harness.fake.awaitListening;
+        yield* harness.setThread(thread({ turnId, state: "completed", messages: [final] }));
+        yield* harness.publishWithoutDrain(
+          assistantEvent({ turnId, messageId: "message-unknown-membership", at: final.updatedAt }),
+        );
+        const drainFiber = yield* harness.reactor.drain.pipe(Effect.forkChild);
+        yield* Effect.yieldNow;
+
+        // A reconnect publishes membership before the transport can send, so an
+        // unknown room is the same fail-closed state as a room with a stranger.
+        expect(yield* harness.fake.attempts).toEqual([]);
+
+        yield* harness.fake.emitInbound(inboundMembership([botUserId, allowedUserId]));
+        yield* TestClock.adjust("1 second");
+        yield* Fiber.join(drainFiber);
+
+        expect((yield* harness.fake.sent).map((entry) => entry.content.body)).toEqual([
+          "Wait for the room",
+        ]);
+      }),
+    { initialMembers: null },
+  ),
+);
+
+it.effect("abandons an undelivered prompt when the member leaves and prompts again on return", () =>
+  withHarness(
+    (harness) =>
+      Effect.gen(function* () {
+        yield* harness.fake.awaitListening;
+        yield* harness.fake.failNextSends(1);
+        yield* harness.fake.emitInbound(inboundMembership([botUserId, allowedUserId]));
+        const drainFiber = yield* harness.reactor.drain.pipe(Effect.forkChild);
+        yield* harness.fake.awaitAttemptCount(1);
+
+        yield* harness.fake.emitInbound(inboundMembership([botUserId]));
+        yield* TestClock.adjust("1 second");
+        yield* Fiber.join(drainFiber);
+        // Never delivered into a room the member has left.
+        expect(yield* harness.fake.sent).toEqual([]);
+
+        yield* harness.fake.emitInbound(inboundMembership([botUserId, allowedUserId]));
+        yield* harness.reactor.drain;
+
+        expect((yield* harness.fake.sent).map((entry) => entry.content.body)).toEqual([
+          MATRIX_BRIDGE_PAIRING_PROMPT,
+        ]);
+        // A returning device needs a new room event, not the homeserver
+        // replaying the transaction it could not decrypt.
+        expect(
+          new Set((yield* harness.fake.attempts).map((entry) => entry.transactionId)).size,
+        ).toBe(2);
+      }),
+    {
+      pairing: { state: "unpaired" },
+      initialStatusState: "waiting-for-member",
+      initialMembers: null,
+    },
+  ),
+);
+
+it.effect("holds a final while no allowed member is in the room", () =>
+  withHarness((harness) =>
+    Effect.gen(function* () {
+      const turnId = TurnId.make("turn-empty-room");
+      const final = message({
+        id: "message-empty-room",
+        role: "assistant",
+        text: "Wait for the reader",
+        turnId,
+        at: "2026-08-19T10:00:09.000Z",
+      });
+      yield* harness.fake.awaitListening;
+      yield* harness.fake.emitInbound(inboundMembership([botUserId]));
+      yield* harness.setThread(thread({ turnId, state: "completed", messages: [final] }));
+      yield* harness.publishWithoutDrain(
+        assistantEvent({ turnId, messageId: "message-empty-room", at: final.updatedAt }),
+      );
+      const drainFiber = yield* harness.reactor.drain.pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+
+      // Sending now would encrypt for nobody and burn the delivery marker on
+      // output the returning device could never read.
+      expect(yield* harness.fake.attempts).toEqual([]);
+
+      yield* harness.fake.emitInbound(inboundMembership([botUserId, allowedUserId]));
+      yield* TestClock.adjust("1 second");
+      yield* Fiber.join(drainFiber);
+
+      expect((yield* harness.fake.sent).map((entry) => entry.content.body)).toEqual([
+        "Wait for the reader",
+      ]);
+    }),
+  ),
+);
+
+it.effect("treats a room with an unexpected member as inert in both directions", () =>
+  withHarness(
+    (harness) =>
+      Effect.gen(function* () {
+        yield* harness.fake.awaitListening;
+        yield* harness.fake.emitInbound(
+          inboundMembership([botUserId, allowedUserId, "@stranger:example"]),
+        );
+        yield* harness.reactor.drain;
+        expect(yield* harness.statusState).toBe("degraded");
+        // No prompt: the room the code would be typed into is not private.
+        expect(yield* harness.fake.sent).toEqual([]);
+
+        yield* harness.fake.emitInbound(inboundText({ eventId: "$code", body: "valid-code" }));
+        yield* harness.reactor.drain;
+
+        // The code is not treated as proof, so an account that can read the
+        // room cannot get the bridge activated by watching someone type it.
+        expect(yield* harness.consumedCodes).toEqual([]);
+        expect(Option.getOrThrow(yield* harness.currentConfig).pairing).toEqual({
+          state: "unpaired",
+        });
+        expect(yield* harness.fake.sent).toEqual([]);
+      }),
+    {
+      pairing: { state: "unpaired" },
+      initialStatusState: "waiting-for-member",
+      initialMembers: null,
+    },
+  ),
+);
+
+it.effect("drops a gate message that pairing has already answered", () =>
+  withHarness(
+    (harness) =>
+      Effect.gen(function* () {
+        yield* harness.fake.awaitListening;
+        yield* harness.fake.failNextSends(1);
+        yield* harness.fake.emitInbound(inboundMembership([botUserId, allowedUserId]));
+        const drainFiber = yield* harness.reactor.drain.pipe(Effect.forkChild);
+        yield* harness.fake.awaitAttemptCount(1);
+
+        // The code lands while the prompt is still backing off.
+        yield* harness.fake.emitInbound(inboundText({ eventId: "$code", body: "valid-code" }));
+        yield* TestClock.adjust("1 second");
+        yield* Fiber.join(drainFiber);
+
+        // The stale "locked" prompt never contradicts the active bridge, and
+        // the acknowledgement is not stuck behind it.
+        expect((yield* harness.fake.sent).map((entry) => entry.content.body)).toEqual([
+          MATRIX_BRIDGE_PAIRING_SUCCESS,
+        ]);
+      }),
+    {
+      pairing: { state: "unpaired" },
+      initialStatusState: "waiting-for-member",
+      initialMembers: null,
+    },
+  ),
+);
+
+it.effect("never forwards a live pairing credential into the owner thread", () =>
+  withHarness(
+    (harness) =>
+      Effect.gen(function* () {
+        yield* harness.fake.awaitListening;
+        yield* harness.fake.emitInbound(inboundText({ eventId: "$first", body: "first-code" }));
+        yield* harness.reactor.drain;
+        expect(Option.getOrThrow(yield* harness.currentConfig).pairing.state).toBe("paired");
+
+        // A second code, typed before the first was processed or pasted by
+        // mistake afterwards, must not become a user message.
+        yield* harness.fake.emitInbound(inboundText({ eventId: "$second", body: " second-code " }));
+        yield* harness.reactor.drain;
+        expect(yield* harness.dispatched).toEqual([]);
+        // It stays redeemable rather than being spent by the bridge.
+        expect(yield* harness.livePairingCodes).toEqual(["second-code"]);
+
+        yield* harness.fake.emitInbound(inboundText({ eventId: "$turn", body: "Do the thing" }));
+        yield* harness.reactor.drain;
+        expect((yield* harness.dispatched).map((entry) => entry.text)).toEqual(["Do the thing"]);
+      }),
+    {
+      pairing: { state: "unpaired" },
+      initialStatusState: "waiting-for-member",
+      livePairingCodes: ["first-code", "second-code"],
+    },
+  ),
+);
+
+it.effect("prompts again after an undeliverable prompt expires", () =>
+  withHarness(
+    (harness) =>
+      Effect.gen(function* () {
+        yield* harness.fake.awaitListening;
+        yield* harness.fake.failNextSends(1, "permanent");
+        yield* harness.fake.emitInbound(inboundMembership([botUserId, allowedUserId]));
+        yield* harness.reactor.drain;
+        expect(yield* harness.fake.sent).toEqual([]);
+
+        // The connection is still unpaired and still holds a reader, so the
+        // next membership report must be able to prompt again.
+        yield* harness.fake.emitInbound(
+          inboundMembership([botUserId, allowedUserId, "@other:example"]),
+        );
+        yield* harness.fake.emitInbound(inboundMembership([botUserId, allowedUserId]));
+        yield* harness.reactor.drain;
+
+        expect((yield* harness.fake.sent).map((entry) => entry.content.body)).toEqual([
+          MATRIX_BRIDGE_PAIRING_PROMPT,
+        ]);
+      }),
+    {
+      pairing: { state: "unpaired" },
+      initialStatusState: "waiting-for-member",
+      initialMembers: null,
+    },
+  ),
+);
+
+it.effect("retries a failed dispatch under one command id and keeps the message replayable", () =>
+  withHarness((harness) =>
+    Effect.gen(function* () {
+      yield* harness.fake.awaitListening;
+      yield* harness.failNextDispatches(3);
+
+      const emitting = yield* harness.fake
+        .emitInbound(inboundText({ eventId: "$turn", body: "Do the thing" }))
+        .pipe(Effect.forkChild);
+      yield* TestClock.adjust("1 second");
+      yield* TestClock.adjust("2 seconds");
+      yield* Fiber.join(emitting);
+      yield* harness.reactor.drain;
+
+      const attempts = yield* harness.dispatchAttempts;
+      expect(attempts).toHaveLength(3);
+      // One command id across retries, so the engine treats them as one turn.
+      expect(new Set(attempts.map((entry) => entry.commandId)).size).toBe(1);
+      expect(yield* harness.dispatched).toEqual([]);
+
+      // The event was not marked as handled, so a redelivery can still land.
+      yield* harness.fake.emitInbound(inboundText({ eventId: "$turn", body: "Do the thing" }));
+      yield* harness.reactor.drain;
+      const dispatched = yield* harness.dispatched;
+      expect(dispatched.map((entry) => entry.text)).toEqual(["Do the thing"]);
+      expect(dispatched[0]?.commandId).toBe(attempts[0]?.commandId);
+    }),
+  ),
+);
+
+it.effect("reports dropped inbound messages instead of losing them silently", () =>
+  withHarness((harness) =>
+    Effect.gen(function* () {
+      yield* harness.fake.awaitListening;
+      expect(yield* harness.fake.emitInbound({ kind: "overflow", roomId })).toBe(true);
+      yield* harness.reactor.drain;
+
+      expect(yield* harness.statusState).toBe("degraded");
+      expect(yield* harness.dispatched).toEqual([]);
+    }),
+  ),
+);
+
+it.effect("delivers a pairing outcome even when the gate queue is saturated", () =>
+  withHarness(
+    (harness) =>
+      Effect.gen(function* () {
+        yield* harness.fake.awaitListening;
+        yield* harness.fake.failNextSends(1);
+        yield* harness.fake.emitInbound(inboundMembership([botUserId, allowedUserId]));
+        const drainFiber = yield* harness.reactor.drain.pipe(Effect.forkChild);
+        yield* harness.fake.awaitAttemptCount(1);
+
+        // The gate worker is backing off, so these rejections queue behind it
+        // and overrun its capacity.
+        for (let index = 0; index < MATRIX_BRIDGE_PAIRING_CAPACITY + 4; index += 1) {
+          yield* harness.fake.emitInbound(
+            inboundText({ eventId: `$bad-${index}`, body: `bad-code-${index}` }),
+          );
+        }
+        yield* harness.fake.emitInbound(inboundText({ eventId: "$good", body: "valid-code" }));
+        yield* TestClock.adjust("1 second");
+        yield* Fiber.join(drainFiber);
+
+        // The one message that cannot be reproduced still lands, and the now
+        // obsolete prompt and rejections do not.
+        expect((yield* harness.fake.sent).map((entry) => entry.content.body)).toEqual([
+          MATRIX_BRIDGE_PAIRING_SUCCESS,
+        ]);
+        expect(Option.getOrThrow(yield* harness.currentConfig).pairing.state).toBe("paired");
+      }),
+    {
+      pairing: { state: "unpaired" },
+      initialStatusState: "waiting-for-member",
+      initialMembers: null,
+    },
+  ),
+);
+
+it.effect("drops an inbound message when the bridge moves while it is retrying", () =>
+  withHarness((harness) =>
+    Effect.gen(function* () {
+      yield* harness.fake.awaitListening;
+      yield* harness.failNextDispatches(1);
+
+      const emitting = yield* harness.fake
+        .emitInbound(inboundText({ eventId: "$moved", body: "For thread A" }))
+        .pipe(Effect.forkChild);
+      // The first attempt failed and the retry is sleeping; the bridge moves.
+      yield* harness.awaitDispatchAttempt;
+      yield* harness.setOwner(threadB);
+      yield* TestClock.adjust("1 second");
+      yield* Fiber.join(emitting);
+      yield* harness.reactor.drain;
+
+      // One attempt, against thread A, and nothing redirected to thread B.
+      const attempts = yield* harness.dispatchAttempts;
+      expect(attempts.map((entry) => entry.threadId)).toEqual([threadA]);
+      expect(yield* harness.dispatched).toEqual([]);
+    }),
+  ),
+);
+
+it.effect("still treats the remembered pairing reply as a reply after a restart", () =>
+  withHarness(
+    (harness) =>
+      Effect.gen(function* () {
+        yield* harness.fake.awaitListening;
+        // A fresh process has no in-memory record of the event, but the paired
+        // state names it, so a redelivery cannot become a turn.
+        yield* harness.fake.emitInbound(inboundText({ eventId: "$code", body: "valid-code" }));
+        yield* harness.reactor.drain;
+        expect(yield* harness.dispatched).toEqual([]);
+
+        yield* harness.fake.emitInbound(inboundText({ eventId: "$next", body: "Do the thing" }));
+        yield* harness.reactor.drain;
+        expect((yield* harness.dispatched).map((entry) => entry.text)).toEqual(["Do the thing"]);
+      }),
+    {
+      pairing: {
+        state: "paired",
+        userId: allowedUserId,
+        pairedAt: baseAt,
+        eventId: "$code",
+      },
+    },
+  ),
+);
+
+it.effect("discards inbound text the transport still holds when the bridge moves", () =>
+  withHarness((harness) =>
+    Effect.gen(function* () {
+      yield* harness.fake.awaitListening;
+      const discardedBefore = yield* harness.fake.discardedInbound;
+
+      yield* harness.setOwner(threadB);
+      yield* harness.reactor.drain;
+
+      // A message typed while thread A was bridged must not start in thread B.
+      expect(yield* harness.fake.discardedInbound).toBeGreaterThan(discardedBefore);
+    }),
+  ),
+);
+
+it.effect("drops an inbound message stamped for a bridge that has since moved", () =>
+  withHarness((harness) =>
+    Effect.gen(function* () {
+      yield* harness.fake.awaitListening;
+      const epochBefore = Option.getOrThrow(yield* harness.currentConfig).ownershipEpoch;
+
+      // The transport took this message off its queue for the bridge as it was;
+      // by the time the reactor sees it, the bridge has moved.
+      yield* harness.setOwner(threadB);
+      yield* harness.fake.emitInbound(
+        inboundText({ eventId: "$in-flight", body: "For thread A", ownershipEpoch: epochBefore }),
+      );
+      yield* harness.reactor.drain;
+
+      expect(yield* harness.dispatchAttempts).toEqual([]);
+      expect(yield* harness.dispatched).toEqual([]);
+    }),
+  ),
 );

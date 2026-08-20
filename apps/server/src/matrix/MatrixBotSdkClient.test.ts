@@ -9,13 +9,19 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
+import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
 import { TestClock } from "effect/testing";
 
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as ServerConfig from "../config.ts";
-import type { MatrixBridgeInboundText } from "./MatrixBridgeClient.ts";
+import type {
+  MatrixBridgeInboundEvent,
+  MatrixBridgeInboundText,
+  MatrixBridgeRoomMembership,
+} from "./MatrixBridgeClient.ts";
 import {
+  MATRIX_INBOUND_QUEUE_CAPACITY,
   MEGOLM_ALGORITHM,
   buildSyncFilter,
   make,
@@ -50,6 +56,8 @@ interface RecordedRequest {
 interface FakeSdkOptions {
   readonly roomState?: Record<string, unknown>;
   readonly joinedRooms?: ReadonlyArray<string>;
+  /** The homeserver's own view of who is joined to the bridged room. */
+  readonly joinedMembers?: ReadonlyArray<string>;
   readonly syncToken?: string | null;
   readonly storedFilter?: MatrixSdkFilterInfo | null;
   readonly roomMembership?: Record<string, string>;
@@ -134,11 +142,32 @@ interface FakeSdk {
   readonly resolvePendingSyncs: () => void;
   readonly pendingProcessingCount: () => number;
   readonly resolvePendingProcessing: () => void;
+  /** Delivers a plaintext timeline event, as a membership change arrives. */
+  readonly emitTimeline: (roomId: string, event: unknown) => void;
+  /** Joins an account the way a gappy sync does: no room event is emitted. */
+  readonly joinSilently: (userId: string) => void;
+  /** The same for a leave the client never hears about. */
+  readonly leaveSilently: (userId: string) => void;
+  /** Runs once, inside the next membership read, to race a change against it. */
+  readonly onMembersRead: (hook: () => void) => void;
+  /** The same, on every read, for a room that never settles. */
+  readonly onEveryMembersRead: (hook: () => void) => void;
+  /** Runs once, inside the next encryption, to race membership against it. */
+  readonly onEncrypt: (hook: () => void) => void;
+  /** Fails the next `count` membership reads, the way a blip would. */
+  readonly failNextMemberReads: (count: number) => void;
   readonly started: Deferred.Deferred<void>;
 }
 
 const makeFakeSdk = (options: FakeSdkOptions = {}): FakeSdk => {
   const createdRooms: Array<MatrixCreateRoomOptions> = [];
+  // The homeserver's own view of the room, which a membership event updates
+  // before any client hears about it.
+  const joinedMembers = new Set(options.joinedMembers ?? [BOT_USER_ID]);
+  let membersReadHook: (() => void) | null = null;
+  let everyMembersReadHook: (() => void) | null = null;
+  let encryptHook: (() => void) | null = null;
+  let failingMemberReads = 0;
   const requests: Array<RecordedRequest> = [];
   const encryptions: Array<unknown> = [];
   const storageWrites: Array<string | null> = [];
@@ -244,6 +273,9 @@ const makeFakeSdk = (options: FakeSdkOptions = {}): FakeSdk => {
       isReady: options.cryptoReady ?? true,
       encryptRoomEvent: (roomId: string, eventType: string, content: unknown) => {
         encryptionCounter += 1;
+        const hook = encryptHook;
+        encryptHook = null;
+        hook?.();
         const encrypted = {
           algorithm: MEGOLM_ALGORITHM,
           ciphertext: `ciphertext-${encryptionCounter}`,
@@ -287,6 +319,21 @@ const makeFakeSdk = (options: FakeSdkOptions = {}): FakeSdk => {
 
     getJoinedRooms(): Promise<ReadonlyArray<string>> {
       return Promise.resolve(options.joinedRooms ?? [ROOM_ID]);
+    }
+
+    getJoinedRoomMembers(_roomId: string): Promise<ReadonlyArray<string>> {
+      if (failingMemberReads > 0) {
+        failingMemberReads -= 1;
+        return Promise.reject(httpError(502));
+      }
+      // Deliberately the pre-hook snapshot: a homeserver answers what it knew
+      // when the request arrived.
+      const snapshot = [...joinedMembers];
+      const hook = membersReadHook;
+      membersReadHook = null;
+      hook?.();
+      everyMembersReadHook?.();
+      return Promise.resolve(snapshot);
     }
 
     getRoomState(_roomId: string): Promise<ReadonlyArray<unknown>> {
@@ -435,6 +482,36 @@ const makeFakeSdk = (options: FakeSdkOptions = {}): FakeSdk => {
       for (const resolve of pendingProcessing.splice(0)) resolve();
     },
     deliverSyncBatch,
+    emitTimeline: (roomId, event) => {
+      const record = event as {
+        type?: string;
+        state_key?: string;
+        content?: { membership?: string };
+      };
+      if (record.type === "m.room.member" && typeof record.state_key === "string") {
+        if (record.content?.membership === "join") joinedMembers.add(record.state_key);
+        else joinedMembers.delete(record.state_key);
+      }
+      for (const handler of handlers.get("room.event") ?? []) handler(roomId, event);
+    },
+    joinSilently: (userId) => {
+      joinedMembers.add(userId);
+    },
+    leaveSilently: (userId) => {
+      joinedMembers.delete(userId);
+    },
+    onMembersRead: (hook) => {
+      membersReadHook = hook;
+    },
+    onEveryMembersRead: (hook) => {
+      everyMembersReadHook = hook;
+    },
+    onEncrypt: (hook) => {
+      encryptHook = hook;
+    },
+    failNextMemberReads: (count) => {
+      failingMemberReads = count;
+    },
     started,
   };
 };
@@ -454,6 +531,14 @@ const testLayer = matrixBridgeConfigLayer.pipe(
   Layer.provideMerge(ServerSecretStore.layer),
   Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "t3-matrix-adapter-test-" })),
 );
+
+const membershipEvent = (input: { readonly userId: string; readonly membership: string }) => ({
+  type: "m.room.member",
+  event_id: `$member-${input.userId}-${input.membership}`,
+  sender: input.userId,
+  state_key: input.userId,
+  content: { membership: input.membership },
+});
 
 const configureBridge = Effect.fn("configureBridge")(function* () {
   const configService = yield* MatrixBridgeConfig;
@@ -487,7 +572,7 @@ const awaitCondition = Effect.fn("awaitCondition")(function* (predicate: () => b
 /** Starts the adapter's listen loop for the life of the test scope. */
 const startAdapter = Effect.fn("startAdapter")(function* (
   sdk: FakeSdk,
-  onInbound: (event: MatrixBridgeInboundText) => Effect.Effect<void> = () => Effect.void,
+  onInbound: (event: MatrixBridgeInboundEvent) => Effect.Effect<void> = () => Effect.void,
 ) {
   const client = yield* make(sdk.load);
   yield* Effect.forkScoped(client.listen(onInbound));
@@ -734,7 +819,9 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
       const sdk = makeFakeSdk();
       const received = yield* Queue.unbounded<MatrixBridgeInboundText>();
       const configService = yield* configureBridge();
-      yield* startAdapter(sdk, (event) => Queue.offer(received, event));
+      yield* startAdapter(sdk, (event) =>
+        event.kind === "text" ? Queue.offer(received, event).pipe(Effect.asVoid) : Effect.void,
+      );
       yield* awaitStatusState(configService, "waiting-for-member");
 
       // An allowlist edit reuses the running sync loop, and a batch can land
@@ -772,7 +859,9 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
       const sdk = makeFakeSdk({ pendingSync: true, deviceId: "T3DEVICE-1" });
       const received = yield* Queue.unbounded<MatrixBridgeInboundText>();
       const configService = yield* configureBridge();
-      yield* startAdapter(sdk, (event) => Queue.offer(received, event));
+      yield* startAdapter(sdk, (event) =>
+        event.kind === "text" ? Queue.offer(received, event).pipe(Effect.asVoid) : Effect.void,
+      );
       yield* awaitStatusState(configService, "waiting-for-member");
       assert.equal(sdk.pendingSyncCount(), 1);
       const retiredStorePath = sdk.syncStorePaths[0] ?? "";
@@ -1427,7 +1516,9 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
       });
       const received = yield* Queue.unbounded<MatrixBridgeInboundText>();
       const configService = yield* configureBridge();
-      yield* startAdapter(sdk, (event) => Queue.offer(received, event));
+      yield* startAdapter(sdk, (event) =>
+        event.kind === "text" ? Queue.offer(received, event).pipe(Effect.asVoid) : Effect.void,
+      );
       yield* awaitStatusState(configService, "waiting-for-member");
       assert.equal(yield* Queue.size(received), 0);
 
@@ -1477,7 +1568,9 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
       });
       const received = yield* Queue.unbounded<MatrixBridgeInboundText>();
       const configService = yield* configureBridge();
-      yield* startAdapter(sdk, (event) => Queue.offer(received, event));
+      yield* startAdapter(sdk, (event) =>
+        event.kind === "text" ? Queue.offer(received, event).pipe(Effect.asVoid) : Effect.void,
+      );
       yield* awaitStatusState(configService, "waiting-for-member");
 
       assert.deepEqual([...sdk.storageWrites], [null, "catch-up-1"]);
@@ -1522,7 +1615,9 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
       });
       const received = yield* Queue.unbounded<MatrixBridgeInboundText>();
       yield* configureBridge();
-      yield* startAdapter(sdk, (event) => Queue.offer(received, event));
+      yield* startAdapter(sdk, (event) =>
+        event.kind === "text" ? Queue.offer(received, event).pipe(Effect.asVoid) : Effect.void,
+      );
       yield* Deferred.await(sdk.started);
 
       assert.equal((yield* Queue.take(received)).eventId, "$after-restart");
@@ -1534,7 +1629,10 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
 
   it.effect("encrypts once and retries one transaction id", () =>
     Effect.gen(function* () {
-      const sdk = makeFakeSdk({ failSendsWith: [httpError(502)] });
+      const sdk = makeFakeSdk({
+        joinedMembers: [BOT_USER_ID, ALLOWED_USER_ID],
+        failSendsWith: [httpError(502)],
+      });
       const configService = yield* configureBridge();
       const client = yield* startAdapter(sdk);
       yield* awaitStatusState(configService, "waiting-for-member");
@@ -1672,12 +1770,582 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
     }).pipe(Effect.provide(testLayer)),
   );
 
+  it.effect("publishes joined membership on connect and on every change", () =>
+    Effect.gen(function* () {
+      const sdk = makeFakeSdk({ joinedMembers: [BOT_USER_ID, ALLOWED_USER_ID] });
+      const received = yield* Queue.unbounded<MatrixBridgeRoomMembership>();
+      const configService = yield* configureBridge();
+      yield* startAdapter(sdk, (event) =>
+        event.kind === "membership"
+          ? Queue.offer(received, event).pipe(Effect.asVoid)
+          : Effect.void,
+      );
+      yield* awaitStatusState(configService, "waiting-for-member");
+
+      const connected = yield* Queue.take(received);
+      assert.deepEqual([...connected.joined], [ALLOWED_USER_ID, BOT_USER_ID]);
+      assert.equal(connected.botUserId, BOT_USER_ID);
+      assert.equal(connected.roomId, ROOM_ID);
+
+      // A membership event from another room, and a repeat of a state already
+      // held, must not republish.
+      sdk.emitTimeline(
+        "!other:matrix.example.test",
+        membershipEvent({ userId: "@elsewhere:example.test", membership: "join" }),
+      );
+      sdk.emitTimeline(ROOM_ID, membershipEvent({ userId: ALLOWED_USER_ID, membership: "join" }));
+      sdk.emitTimeline(
+        ROOM_ID,
+        membershipEvent({ userId: "@stranger:example.test", membership: "join" }),
+      );
+      const joined = yield* Queue.take(received);
+      assert.deepEqual(
+        [...joined.joined],
+        [ALLOWED_USER_ID, "@stranger:example.test", BOT_USER_ID],
+      );
+
+      sdk.emitTimeline(
+        ROOM_ID,
+        membershipEvent({ userId: "@stranger:example.test", membership: "leave" }),
+      );
+      const left = yield* Queue.take(received);
+      assert.deepEqual([...left.joined], [ALLOWED_USER_ID, BOT_USER_ID]);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("applies this connection's membership before the transport is usable", () =>
+    Effect.gen(function* () {
+      const sdk = makeFakeSdk({ joinedMembers: [BOT_USER_ID, ALLOWED_USER_ID] });
+      const configService = yield* configureBridge();
+      const observed = yield* Ref.make<ReadonlyArray<string>>([]);
+      yield* startAdapter(sdk, (event) =>
+        event.kind === "membership"
+          ? configService.status.pipe(
+              Effect.flatMap((status) =>
+                Ref.update(observed, (states) => [...states, status.state]),
+              ),
+            )
+          : Effect.void,
+      );
+      yield* awaitStatusState(configService, "waiting-for-member");
+
+      // The bridge learns who is in the room while the transport is still
+      // connecting, so a reconnect can never deliver under the old membership.
+      assert.deepEqual([...(yield* Ref.get(observed))], ["connecting"]);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("refuses to encrypt for a room an outside account has joined", () =>
+    Effect.gen(function* () {
+      const sdk = makeFakeSdk({ joinedMembers: [BOT_USER_ID, ALLOWED_USER_ID] });
+      const configService = yield* configureBridge();
+      const client = yield* startAdapter(sdk);
+      yield* awaitStatusState(configService, "waiting-for-member");
+
+      const message = {
+        roomId: ROOM_ID,
+        transactionId: "t3-guarded-send",
+        content: { msgtype: "m.text", body: "private final" },
+      } as const;
+      yield* client.sendText(message);
+      assert.lengthOf(sdk.encryptions, 1);
+
+      // The join is applied by the same synchronous handler the SDK calls, so
+      // the very next send is refused without encrypting for the newcomer.
+      sdk.emitTimeline(
+        ROOM_ID,
+        membershipEvent({ userId: "@stranger:example.test", membership: "join" }),
+      );
+      const blocked = yield* Effect.result(
+        client.sendText({ ...message, transactionId: "t3-guarded-send-2" }),
+      );
+      assert.equal(blocked._tag, "Failure");
+      if (blocked._tag === "Failure") {
+        // Transient: the room can become safe again inside the retry window.
+        assert.equal(blocked.failure.retryability, "transient");
+        assert.include(blocked.failure.reason, "outside the allowed list");
+      }
+      assert.lengthOf(sdk.encryptions, 1);
+
+      sdk.emitTimeline(
+        ROOM_ID,
+        membershipEvent({ userId: "@stranger:example.test", membership: "leave" }),
+      );
+      yield* client.sendText({ ...message, transactionId: "t3-guarded-send-3" });
+      assert.lengthOf(sdk.encryptions, 2);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("refuses a send when only the homeserver knows about a joined account", () =>
+    Effect.gen(function* () {
+      const sdk = makeFakeSdk({ joinedMembers: [BOT_USER_ID, ALLOWED_USER_ID] });
+      const configService = yield* configureBridge();
+      const client = yield* startAdapter(sdk);
+      yield* awaitStatusState(configService, "waiting-for-member");
+
+      // A gappy sync reports membership in the state block, which the SDK never
+      // emits as a room event, so the room can be unsafe with no local signal.
+      sdk.joinSilently("@unseen:example.test");
+      const blocked = yield* Effect.result(
+        client.sendText({
+          roomId: ROOM_ID,
+          transactionId: "t3-unseen-member",
+          content: { msgtype: "m.text", body: "private final" },
+        }),
+      );
+
+      assert.equal(blocked._tag, "Failure");
+      if (blocked._tag === "Failure") {
+        assert.include(blocked.failure.reason, "outside the allowed list");
+      }
+      assert.lengthOf(sdk.encryptions, 0);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("refuses a send into a room the allowed reader has left", () =>
+    Effect.gen(function* () {
+      const sdk = makeFakeSdk({ joinedMembers: [BOT_USER_ID, ALLOWED_USER_ID] });
+      const configService = yield* configureBridge();
+      const client = yield* startAdapter(sdk);
+      yield* awaitStatusState(configService, "waiting-for-member");
+
+      sdk.leaveSilently(ALLOWED_USER_ID);
+      const blocked = yield* Effect.result(
+        client.sendText({
+          roomId: ROOM_ID,
+          transactionId: "t3-no-reader",
+          content: { msgtype: "m.text", body: "private final" },
+        }),
+      );
+
+      assert.equal(blocked._tag, "Failure");
+      if (blocked._tag === "Failure") {
+        assert.include(blocked.failure.reason, "No account from the allowed list");
+        // Transient: the reader can come back inside the retry window.
+        assert.equal(blocked.failure.retryability, "transient");
+      }
+      assert.lengthOf(sdk.encryptions, 0);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("re-reads membership rather than merging a snapshot that changed under it", () =>
+    Effect.gen(function* () {
+      const sdk = makeFakeSdk({ joinedMembers: [BOT_USER_ID, ALLOWED_USER_ID] });
+      const configService = yield* configureBridge();
+      const client = yield* startAdapter(sdk);
+      yield* awaitStatusState(configService, "waiting-for-member");
+
+      // The reader leaves while the first read is in flight, so its answer
+      // still lists them; merging it would resurrect a member who is gone.
+      sdk.onMembersRead(() => {
+        sdk.emitTimeline(
+          ROOM_ID,
+          membershipEvent({ userId: ALLOWED_USER_ID, membership: "leave" }),
+        );
+      });
+      const blocked = yield* Effect.result(
+        client.sendText({
+          roomId: ROOM_ID,
+          transactionId: "t3-racing-leave",
+          content: { msgtype: "m.text", body: "private final" },
+        }),
+      );
+
+      assert.equal(blocked._tag, "Failure");
+      if (blocked._tag === "Failure") {
+        assert.include(blocked.failure.reason, "No account from the allowed list");
+      }
+      assert.lengthOf(sdk.encryptions, 0);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("discards ciphertext when the reader changes during encryption", () =>
+    Effect.gen(function* () {
+      const sdk = makeFakeSdk({ joinedMembers: [BOT_USER_ID, ALLOWED_USER_ID] });
+      const configService = yield* configureBridge();
+      const client = yield* startAdapter(sdk);
+      yield* awaitStatusState(configService, "waiting-for-member");
+
+      // The reader leaves and rejoins while the message is being encrypted:
+      // still only allowed accounts, but not the devices it was built for.
+      sdk.onEncrypt(() => {
+        sdk.emitTimeline(
+          ROOM_ID,
+          membershipEvent({ userId: ALLOWED_USER_ID, membership: "leave" }),
+        );
+        sdk.emitTimeline(ROOM_ID, membershipEvent({ userId: ALLOWED_USER_ID, membership: "join" }));
+      });
+      const raced = yield* Effect.result(
+        client.sendText({
+          roomId: ROOM_ID,
+          transactionId: "t3-reader-swap",
+          content: { msgtype: "m.text", body: "private final" },
+        }),
+      );
+
+      assert.equal(raced._tag, "Failure");
+      if (raced._tag === "Failure") {
+        assert.include(raced.failure.reason, "changed while the message was being encrypted");
+      }
+      assert.lengthOf(
+        sdk.requests.filter((request) => request.endpoint.includes("t3-reader-swap")),
+        0,
+      );
+
+      // The retry encrypts again rather than reusing the retired ciphertext.
+      yield* client.sendText({
+        roomId: ROOM_ID,
+        transactionId: "t3-reader-swap",
+        content: { msgtype: "m.text", body: "private final" },
+      });
+      assert.lengthOf(sdk.encryptions, 2);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("keeps ciphertext for a transaction whose send may already have landed", () =>
+    Effect.gen(function* () {
+      const sdk = makeFakeSdk({
+        joinedMembers: [BOT_USER_ID, ALLOWED_USER_ID],
+        failSendsWith: [httpError(502)],
+      });
+      const configService = yield* configureBridge();
+      const client = yield* startAdapter(sdk);
+      yield* awaitStatusState(configService, "waiting-for-member");
+
+      const message = {
+        roomId: ROOM_ID,
+        transactionId: "t3-membership-retry",
+        content: { msgtype: "m.text", body: "final answer" },
+      } as const;
+      const firstAttempt = yield* Effect.result(client.sendText(message));
+      assert.equal(firstAttempt._tag, "Failure");
+      assert.lengthOf(sdk.encryptions, 1);
+
+      // The reader left and came back while the bridge held the retry. The
+      // first PUT may still have reached the homeserver, and a transaction id
+      // is an idempotency key: re-encrypting under it would claim to replace an
+      // event the homeserver will happily return unchanged.
+      sdk.emitTimeline(ROOM_ID, membershipEvent({ userId: ALLOWED_USER_ID, membership: "leave" }));
+      sdk.emitTimeline(ROOM_ID, membershipEvent({ userId: ALLOWED_USER_ID, membership: "join" }));
+      yield* client.sendText(message);
+
+      assert.lengthOf(sdk.encryptions, 1);
+      const sends = sdk.requests.filter((request) => request.method === "PUT");
+      assert.lengthOf(sends, 2);
+      assert.equal(new Set(sends.map((send) => send.endpoint)).size, 1);
+      assert.strictEqual(sends[0]?.body, sends[1]?.body);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("marks inbound text unsafe when only the homeserver knows about a joiner", () =>
+    Effect.gen(function* () {
+      const sdk = makeFakeSdk({ joinedMembers: [BOT_USER_ID, ALLOWED_USER_ID] });
+      const received = yield* Queue.unbounded<MatrixBridgeInboundText>();
+      const configService = yield* configureBridge();
+      yield* startAdapter(sdk, (event) =>
+        event.kind === "text" ? Queue.offer(received, event).pipe(Effect.asVoid) : Effect.void,
+      );
+      yield* awaitStatusState(configService, "waiting-for-member");
+
+      sdk.joinSilently("@unseen:example.test");
+      sdk.deliverSyncBatch({
+        cursor: "unsafe-batch",
+        timeline: [
+          {
+            event: decryptedTextEvent({ eventId: "$unsafe", sender: ALLOWED_USER_ID, body: "hi" }),
+          },
+        ],
+      });
+      const unsafe = yield* Queue.take(received);
+      assert.isFalse(unsafe.roomAllowedOnly);
+
+      sdk.emitTimeline(
+        ROOM_ID,
+        membershipEvent({ userId: "@unseen:example.test", membership: "leave" }),
+      );
+      sdk.deliverSyncBatch({
+        cursor: "safe-batch",
+        timeline: [
+          { event: decryptedTextEvent({ eventId: "$safe", sender: ALLOWED_USER_ID, body: "hi" }) },
+        ],
+      });
+      const safe = yield* Queue.take(received);
+      assert.isTrue(safe.roomAllowedOnly);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("reconciles a membership change the timeline never reported", () =>
+    Effect.gen(function* () {
+      const sdk = makeFakeSdk({ joinedMembers: [BOT_USER_ID] });
+      const memberships = yield* Queue.unbounded<MatrixBridgeRoomMembership>();
+      const configService = yield* configureBridge();
+      yield* startAdapter(sdk, (event) =>
+        event.kind === "membership"
+          ? Queue.offer(memberships, event).pipe(Effect.asVoid)
+          : Effect.void,
+      );
+      yield* awaitStatusState(configService, "waiting-for-member");
+      const connected = yield* Queue.take(memberships);
+      assert.deepEqual([...connected.joined], [BOT_USER_ID]);
+
+      // The reader joined during a sync gap, so no room event ever arrives and
+      // nothing else would prompt them.
+      sdk.joinSilently(ALLOWED_USER_ID);
+      const ticker = yield* Effect.forkChild(
+        Effect.forever(TestClock.adjust("60 seconds").pipe(Effect.andThen(Effect.yieldNow))),
+      );
+      const reconciled = yield* Queue.take(memberships);
+      yield* Fiber.interrupt(ticker);
+
+      assert.deepEqual([...reconciled.joined], [ALLOWED_USER_ID, BOT_USER_ID]);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("retries a failed membership read rather than dropping the message", () =>
+    Effect.gen(function* () {
+      const sdk = makeFakeSdk({ joinedMembers: [BOT_USER_ID, ALLOWED_USER_ID] });
+      const received = yield* Queue.unbounded<MatrixBridgeInboundText>();
+      const configService = yield* configureBridge();
+      yield* startAdapter(sdk, (event) =>
+        event.kind === "text" ? Queue.offer(received, event).pipe(Effect.asVoid) : Effect.void,
+      );
+      yield* awaitStatusState(configService, "waiting-for-member");
+
+      // A blip while verifying must not turn a valid command into an unsafe
+      // hand-off: Matrix will not deliver that timeline event again.
+      sdk.failNextMemberReads(1);
+      sdk.deliverSyncBatch({
+        cursor: "retry-batch",
+        timeline: [
+          {
+            event: decryptedTextEvent({ eventId: "$retried", sender: ALLOWED_USER_ID, body: "hi" }),
+          },
+        ],
+      });
+
+      // The retry waits on a backoff, so the test clock has to move for it.
+      const ticker = yield* Effect.forkChild(
+        Effect.forever(TestClock.adjust("1 second").pipe(Effect.andThen(Effect.yieldNow))),
+      );
+      const delivered = yield* Queue.take(received);
+      yield* Fiber.interrupt(ticker);
+
+      assert.equal(delivered.eventId, "$retried");
+      assert.isTrue(delivered.roomAllowedOnly);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("reports a room that never settles instead of quietly dropping text", () =>
+    Effect.gen(function* () {
+      const sdk = makeFakeSdk({ joinedMembers: [BOT_USER_ID, ALLOWED_USER_ID] });
+      const received = yield* Queue.unbounded<MatrixBridgeInboundText>();
+      const configService = yield* configureBridge();
+      yield* startAdapter(sdk, (event) =>
+        event.kind === "text" ? Queue.offer(received, event).pipe(Effect.asVoid) : Effect.void,
+      );
+      yield* awaitStatusState(configService, "waiting-for-member");
+
+      // Every read is invalidated by another change, so the room is never
+      // verified rather than verified unsafe.
+      let churn = 0;
+      sdk.onEveryMembersRead(() => {
+        churn += 1;
+        sdk.emitTimeline(
+          ROOM_ID,
+          membershipEvent({ userId: `@churn-${churn}:example.test`, membership: "join" }),
+        );
+      });
+      sdk.deliverSyncBatch({
+        cursor: "churn-batch",
+        timeline: [
+          {
+            event: decryptedTextEvent({
+              eventId: "$churning",
+              sender: ALLOWED_USER_ID,
+              body: "hi",
+            }),
+          },
+        ],
+      });
+      const ticker = yield* Effect.forkChild(
+        Effect.forever(TestClock.adjust("1 second").pipe(Effect.andThen(Effect.yieldNow))),
+      );
+      const delivered = yield* Queue.take(received);
+      yield* awaitStatusState(configService, "degraded");
+      yield* Fiber.interrupt(ticker);
+
+      assert.isFalse(delivered.roomAllowedOnly);
+      assert.include((yield* configService.status).reason ?? "", "could not be verified");
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("reports overflow instead of dropping inbound text silently", () =>
+    Effect.gen(function* () {
+      const sdk = makeFakeSdk({ joinedMembers: [BOT_USER_ID, ALLOWED_USER_ID] });
+      const blocked = yield* Deferred.make<void>();
+      const overflows = yield* Queue.unbounded<MatrixBridgeInboundEvent>();
+      const configService = yield* configureBridge();
+      yield* startAdapter(sdk, (event) =>
+        event.kind === "text"
+          ? Deferred.await(blocked)
+          : Queue.offer(overflows, event).pipe(Effect.asVoid),
+      );
+      yield* awaitStatusState(configService, "waiting-for-member");
+
+      // One message occupies the worker; the rest fill the bounded queue.
+      sdk.deliverSyncBatch({
+        cursor: "burst-batch",
+        timeline: Array.from({ length: MATRIX_INBOUND_QUEUE_CAPACITY + 4 }, (_unused, index) => ({
+          event: decryptedTextEvent({
+            eventId: `$burst-${index}`,
+            sender: ALLOWED_USER_ID,
+            body: "burst",
+          }),
+        })),
+      });
+
+      const reported = yield* Queue.take(overflows).pipe(
+        Effect.repeat({ until: (event) => event.kind === "overflow" }),
+      );
+      assert.equal(reported.kind, "overflow");
+      yield* Deferred.succeed(blocked, undefined);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("holds the sync cursor until an inbound message has been handled", () =>
+    Effect.gen(function* () {
+      const sdk = makeFakeSdk({ joinedMembers: [BOT_USER_ID, ALLOWED_USER_ID] });
+      const handling = yield* Deferred.make<void>();
+      const received = yield* Queue.unbounded<MatrixBridgeInboundText>();
+      const configService = yield* configureBridge();
+      yield* startAdapter(sdk, (event) =>
+        event.kind === "text"
+          ? Queue.offer(received, event).pipe(Effect.andThen(Deferred.await(handling)))
+          : Effect.void,
+      );
+      yield* awaitStatusState(configService, "waiting-for-member");
+      const storePath = sdk.syncStorePaths[0] ?? "";
+      const beforeBatch = sdk.storedSyncToken(storePath);
+
+      sdk.deliverSyncBatch({
+        cursor: "batch-with-work",
+        timeline: [
+          { event: decryptedTextEvent({ eventId: "$held", sender: ALLOWED_USER_ID, body: "hi" }) },
+        ],
+      });
+      yield* Queue.take(received);
+
+      // A crash here must resume before this message, not after it: the
+      // cursor the batch would advance to is still unwritten.
+      assert.equal(sdk.storedSyncToken(storePath), beforeBatch);
+
+      yield* Deferred.succeed(handling, undefined);
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+      assert.equal(sdk.storedSyncToken(storePath), "batch-with-work");
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("releases a discarded message's hold on the sync cursor", () =>
+    Effect.gen(function* () {
+      const sdk = makeFakeSdk({ joinedMembers: [BOT_USER_ID, ALLOWED_USER_ID] });
+      const handling = yield* Deferred.make<void>();
+      const received = yield* Queue.unbounded<MatrixBridgeInboundText>();
+      const configService = yield* configureBridge();
+      const client = yield* startAdapter(sdk, (event) =>
+        event.kind === "text"
+          ? Queue.offer(received, event).pipe(Effect.andThen(Deferred.await(handling)))
+          : Effect.void,
+      );
+      yield* awaitStatusState(configService, "waiting-for-member");
+      const storePath = sdk.syncStorePaths[0] ?? "";
+
+      // Two messages in one batch: the first occupies the worker, the second
+      // waits in the queue and is then discarded.
+      sdk.deliverSyncBatch({
+        cursor: "batch-with-discards",
+        timeline: [
+          { event: decryptedTextEvent({ eventId: "$first", sender: ALLOWED_USER_ID, body: "a" }) },
+          { event: decryptedTextEvent({ eventId: "$second", sender: ALLOWED_USER_ID, body: "b" }) },
+        ],
+      });
+      yield* Queue.take(received);
+      yield* client.discardPendingInbound;
+      yield* Deferred.succeed(handling, undefined);
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+
+      // A discarded message must not hold the cursor for the rest of the
+      // connection: nobody is ever going to finish it.
+      sdk.deliverSyncBatch({ cursor: "later-batch" });
+      yield* Effect.yieldNow;
+      assert.equal(sdk.storedSyncToken(storePath), "batch-with-discards");
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("refuses ciphertext when an unannounced account joins during encryption", () =>
+    Effect.gen(function* () {
+      const sdk = makeFakeSdk({ joinedMembers: [BOT_USER_ID, ALLOWED_USER_ID] });
+      const configService = yield* configureBridge();
+      const client = yield* startAdapter(sdk);
+      yield* awaitStatusState(configService, "waiting-for-member");
+
+      // Preparing encryption is itself a joined-member lookup in the SDK, so an
+      // account that joined through a sync gap can take this room key with no
+      // timeline event and no local revision change to notice it by.
+      sdk.onEncrypt(() => {
+        sdk.joinSilently("@late:example.test");
+      });
+      const blocked = yield* Effect.result(
+        client.sendText({
+          roomId: ROOM_ID,
+          transactionId: "t3-gappy-join",
+          content: { msgtype: "m.text", body: "private final" },
+        }),
+      );
+
+      assert.equal(blocked._tag, "Failure");
+      if (blocked._tag === "Failure") {
+        assert.include(blocked.failure.reason, "outside the allowed list");
+        assert.equal(blocked.failure.retryability, "transient");
+      }
+      assert.lengthOf(
+        sdk.requests.filter((request) => request.endpoint.includes("t3-gappy-join")),
+        0,
+      );
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("sees a join that races the connection's first membership read", () =>
+    Effect.gen(function* () {
+      const sdk = makeFakeSdk({ joinedMembers: [BOT_USER_ID] });
+      const memberships = yield* Queue.unbounded<MatrixBridgeRoomMembership>();
+      const configService = yield* configureBridge();
+      // The reader joins between the snapshot and the listener that would have
+      // reported it, which used to leave them unseen until the reconciliation.
+      sdk.onMembersRead(() => {
+        sdk.emitTimeline(ROOM_ID, membershipEvent({ userId: ALLOWED_USER_ID, membership: "join" }));
+      });
+      yield* startAdapter(sdk, (event) =>
+        event.kind === "membership"
+          ? Queue.offer(memberships, event).pipe(Effect.asVoid)
+          : Effect.void,
+      );
+      yield* awaitStatusState(configService, "waiting-for-member");
+
+      const connected = yield* Queue.take(memberships);
+      assert.deepEqual([...connected.joined], [ALLOWED_USER_ID, BOT_USER_ID]);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
   it.effect("delivers decrypted room text and ignores the bot's own events", () =>
     Effect.gen(function* () {
       const sdk = makeFakeSdk();
       const received = yield* Queue.unbounded<MatrixBridgeInboundText>();
       const configService = yield* configureBridge();
-      yield* startAdapter(sdk, (event) => Queue.offer(received, event));
+      yield* startAdapter(sdk, (event) =>
+        event.kind === "text" ? Queue.offer(received, event).pipe(Effect.asVoid) : Effect.void,
+      );
       // Readiness means the catch-up batch landed, so this one is live traffic.
       yield* awaitStatusState(configService, "waiting-for-member");
       sdk.deliverSyncBatch({

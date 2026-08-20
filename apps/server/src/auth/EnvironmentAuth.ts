@@ -468,6 +468,37 @@ export class EnvironmentAuth extends Context.Service<
       AuthAccessTokenResult,
       ServerAuthInvalidCredentialError | ServerAuthInvalidRequestError | ServerAuthInternalError
     >;
+    /**
+     * Atomically consumes a pairing credential as proof that its holder has T3
+     * access, without issuing a session. Server-internal integrations (the
+     * Matrix bridge) need the one-time proof, not a bearer token: exchanging
+     * for an access token would leave an unused session in Authorized Clients.
+     *
+     * `required` describes what the integration can do once it is unlocked:
+     * the audience it can reach and the scopes it exercises. A credential that
+     * was not granted them cannot open that door, and it is only spent once
+     * both checks pass.
+     */
+    readonly consumePairingCredentialForProof: (
+      credential: string,
+      required: {
+        readonly audienceCeiling: AuthAudienceCeiling;
+        readonly scopes: ReadonlyArray<AuthEnvironmentScope>;
+      },
+    ) => Effect.Effect<
+      void,
+      ServerAuthInvalidCredentialError | ServerAuthInvalidRequestError | ServerAuthInternalError
+    >;
+    /**
+     * Whether this text is a live pairing credential. Integrations that relay
+     * user text elsewhere use it to keep a redeemable credential out of places
+     * it would be stored or read, such as thread history and model context.
+     * An unavailable credential store fails rather than answering "no", so a
+     * caller can withhold the text instead of relaying it.
+     */
+    readonly isLivePairingCredential: (
+      credential: string,
+    ) => Effect.Effect<boolean, ServerAuthInternalError>;
     readonly createPairingLink: (input: {
       readonly audienceCeiling: AuthAudienceCeiling;
       readonly ttl?: Duration.Duration;
@@ -835,6 +866,42 @@ export const make = Effect.gen(function* () {
         Effect.withSpan("EnvironmentAuth.exchangeBootstrapCredentialForAccessToken"),
       );
 
+  const consumePairingCredentialForProof: EnvironmentAuth["Service"]["consumePairingCredentialForProof"] =
+    Effect.fn("EnvironmentAuth.consumePairingCredentialForProof")(function* (credential, required) {
+      const grant = yield* bootstrapCredentials
+        .inspect(credential)
+        .pipe(Effect.mapError(toBootstrapExchangeError));
+      // Both checks run before the grant is spent, so a credential that
+      // cannot authorize this integration is refused rather than burned.
+      if (!canNarrowAudienceCeiling(grant.audienceCeiling, required.audienceCeiling)) {
+        return yield* new ServerAuthAudienceNotGrantedError({});
+      }
+      if (!required.scopes.every((scope) => grant.scopes.includes(scope))) {
+        return yield* new ServerAuthScopeNotGrantedError({});
+      }
+      yield* bootstrapCredentials
+        .consume(credential)
+        .pipe(Effect.mapError(toBootstrapExchangeError));
+    });
+
+  const isLivePairingCredential: EnvironmentAuth["Service"]["isLivePairingCredential"] = (
+    credential,
+  ) =>
+    bootstrapCredentials.inspect(credential).pipe(
+      Effect.as(true),
+      Effect.catch((cause) => {
+        // A store failure is an unknown, not a "no". A proof-key mismatch is a
+        // yes: the credential exists and is redeemable by whoever holds its
+        // proof key, which is exactly what must not be relayed onwards. The
+        // credential itself never reaches a log either way.
+        if (PairingGrantStore.isBootstrapCredentialInternalError(cause)) {
+          return Effect.fail(new ServerAuthBootstrapCredentialValidationError({ cause }));
+        }
+        return Effect.succeed(cause._tag === "BootstrapCredentialProofKeyMismatchError");
+      }),
+      Effect.withSpan("EnvironmentAuth.isLivePairingCredential"),
+    );
+
   const issuePairingCredentialForSubject = (input: {
     readonly scopes: ReadonlyArray<AuthEnvironmentScope>;
     readonly audienceCeiling: AuthAudienceCeiling;
@@ -1127,6 +1194,8 @@ export const make = Effect.gen(function* () {
     getSessionState,
     createBrowserSession,
     exchangeBootstrapCredentialForAccessToken,
+    consumePairingCredentialForProof,
+    isLivePairingCredential,
     createPairingLink,
     issuePairingCredential,
     issueStartupPairingCredential,

@@ -593,14 +593,23 @@ export const MatrixBridgeStatus = Schema.Struct({
 });
 export type MatrixBridgeStatus = typeof MatrixBridgeStatus.Type;
 
-/** Access-write response for connection management. The access token remains
+/** Privileged response for connection management. The access token remains
  * write-only and is intentionally absent. */
 export const MatrixBridgeConfigView = Schema.Struct({
   homeserverUrl: TrimmedNonEmptyString,
   allowedUserIds: Schema.Array(TrimmedNonEmptyString).check(Schema.isNonEmpty()),
   roomId: Schema.NullOr(TrimmedNonEmptyString),
+  /** Absent for connections stored before the server recorded this. */
+  configuredAt: Schema.optionalKey(IsoDateTime),
 });
 export type MatrixBridgeConfigView = typeof MatrixBridgeConfigView.Type;
+
+/** Saved connection, or `null` when the bridge is unconfigured. Lets a client
+ * restore what it can display after a reload without ever seeing the token. */
+export const MatrixBridgeConfigSnapshot = Schema.Struct({
+  config: Schema.NullOr(MatrixBridgeConfigView),
+});
+export type MatrixBridgeConfigSnapshot = typeof MatrixBridgeConfigSnapshot.Type;
 
 // The service performs field-by-field validation so a parse failure for a
 // public field can never echo the write-only token as part of a payload error.

@@ -5,7 +5,9 @@ import {
   activeMatrixBridgePairingCode,
   applyWslEnableSelection,
   matrixBridgeConnectionMode,
+  EMPTY_MATRIX_BRIDGE_DRAFT,
   matrixBridgeDraftAfterConfigure,
+  matrixBridgeDraftFromSavedConfig,
   matrixBridgeSectionAccess,
   matrixBridgeStatusLabel,
   parseMatrixBridgeConfigureInput,
@@ -300,6 +302,25 @@ describe("Matrix bridge connection form", () => {
       accessToken: "syt_token",
       allowedUserIds: ["@you:beeper.com", "@phone:beeper.com"],
     });
+  });
+
+  it("repopulates the form from a saved connection without a token", () => {
+    expect(
+      matrixBridgeDraftFromSavedConfig({
+        homeserverUrl: "https://matrix.example.test/",
+        allowedUserIds: ["@you:beeper.com", "@phone:beeper.com"],
+        roomId: "!room:example.test",
+      }),
+    ).toEqual({
+      homeserverUrl: "https://matrix.example.test/",
+      // Write-only on the server, so reconfiguring always retypes it.
+      accessToken: "",
+      allowedUserIds: "@you:beeper.com\n@phone:beeper.com",
+    });
+  });
+
+  it("leaves the form blank when no bridge is configured", () => {
+    expect(matrixBridgeDraftFromSavedConfig(null)).toEqual(EMPTY_MATRIX_BRIDGE_DRAFT);
   });
 
   it("clears the token after a successful connect and keeps the readable fields", () => {
