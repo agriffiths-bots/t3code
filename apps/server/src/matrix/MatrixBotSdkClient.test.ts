@@ -90,6 +90,7 @@ const botAdministeredPowerLevels = () => ({
 const encryptedRoomState = (): Record<string, unknown> => ({
   "m.room.join_rules": { join_rule: "invite" },
   "m.room.encryption": { algorithm: MEGOLM_ALGORITHM },
+  "m.room.history_visibility": { history_visibility: "invited" },
   "m.room.power_levels": botAdministeredPowerLevels(),
 });
 
@@ -526,6 +527,11 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
             state_key: "",
             content: { algorithm: MEGOLM_ALGORITHM },
           },
+          {
+            type: "m.room.history_visibility",
+            state_key: "",
+            content: { history_visibility: "invited" },
+          },
         ],
       );
 
@@ -866,6 +872,7 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
         roomState: {
           "m.room.join_rules": { join_rule: "public" },
           "m.room.encryption": { algorithm: MEGOLM_ALGORITHM },
+          "m.room.history_visibility": { history_visibility: "invited" },
           "m.room.power_levels": botAdministeredPowerLevels(),
         },
       });
@@ -891,6 +898,7 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
         roomState: {
           "m.room.join_rules": { join_rule: "invite" },
           "m.room.encryption": { algorithm: MEGOLM_ALGORITHM },
+          "m.room.history_visibility": { history_visibility: "invited" },
           // What `trusted_private_chat` produces: the member matches the bot.
           "m.room.power_levels": {
             users_default: 0,
@@ -923,6 +931,7 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
         roomState: {
           "m.room.join_rules": { join_rule: "invite" },
           "m.room.encryption": { algorithm: MEGOLM_ALGORITHM },
+          "m.room.history_visibility": { history_visibility: "invited" },
           "m.room.power_levels": {
             users_default: 0,
             invite: 100,
@@ -1047,6 +1056,7 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
         roomState: {
           "m.room.join_rules": { join_rule: "invite" },
           "m.room.encryption": { algorithm: MEGOLM_ALGORITHM },
+          "m.room.history_visibility": { history_visibility: "invited" },
           "m.room.power_levels": {
             users_default: "0",
             invite: "100",
@@ -1108,12 +1118,113 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
     }).pipe(Effect.provide(testLayer)),
   );
 
+  it.effect("refuses a room with world-readable history", () =>
+    Effect.gen(function* () {
+      // `world_readable` serves history to accounts that never joined at all.
+      const sdk = makeFakeSdk({
+        roomState: {
+          "m.room.join_rules": { join_rule: "invite" },
+          "m.room.encryption": { algorithm: MEGOLM_ALGORITHM },
+          "m.room.history_visibility": { history_visibility: "world_readable" },
+          "m.room.power_levels": botAdministeredPowerLevels(),
+        },
+      });
+      const configService = yield* configureBridge();
+      yield* configService.recordRoomIfMatches({
+        cryptoStoreGeneration: Option.getOrThrow(yield* configService.currentConfig)
+          .cryptoStoreGeneration,
+        roomId: ROOM_ID,
+      });
+      yield* startAdapter(sdk);
+      yield* awaitStatusState(configService, "unavailable");
+
+      assert.include((yield* configService.status).reason ?? "", "shares its history");
+      assert.lengthOf(sdk.startedFilters, 0);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("refuses a room that shares history from before a member arrived", () =>
+    Effect.gen(function* () {
+      // `shared` hands everything said before an invitation to whoever is
+      // invited next, which is the allowlist boundary this bridge holds.
+      const sdk = makeFakeSdk({
+        roomState: {
+          "m.room.join_rules": { join_rule: "invite" },
+          "m.room.encryption": { algorithm: MEGOLM_ALGORITHM },
+          "m.room.history_visibility": { history_visibility: "shared" },
+          "m.room.power_levels": botAdministeredPowerLevels(),
+        },
+      });
+      const configService = yield* configureBridge();
+      yield* configService.recordRoomIfMatches({
+        cryptoStoreGeneration: Option.getOrThrow(yield* configService.currentConfig)
+          .cryptoStoreGeneration,
+        roomId: ROOM_ID,
+      });
+      yield* startAdapter(sdk);
+      yield* awaitStatusState(configService, "unavailable");
+
+      assert.include((yield* configService.status).reason ?? "", "shares its history");
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("accepts a room whose history starts at the member's arrival", () =>
+    Effect.gen(function* () {
+      const sdk = makeFakeSdk({
+        roomState: {
+          "m.room.join_rules": { join_rule: "invite" },
+          "m.room.encryption": { algorithm: MEGOLM_ALGORITHM },
+          "m.room.history_visibility": { history_visibility: "joined" },
+          "m.room.power_levels": botAdministeredPowerLevels(),
+        },
+      });
+      const configService = yield* configureBridge();
+      yield* configService.recordRoomIfMatches({
+        cryptoStoreGeneration: Option.getOrThrow(yield* configService.currentConfig)
+          .cryptoStoreGeneration,
+        roomId: ROOM_ID,
+      });
+      yield* startAdapter(sdk);
+      yield* awaitStatusState(configService, "waiting-for-member");
+
+      assert.isTrue((yield* configService.status).encryptionReady);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("refuses a room whose members can change its history visibility", () =>
+    Effect.gen(function* () {
+      const sdk = makeFakeSdk({
+        roomState: {
+          "m.room.join_rules": { join_rule: "invite" },
+          "m.room.encryption": { algorithm: MEGOLM_ALGORITHM },
+          "m.room.history_visibility": { history_visibility: "invited" },
+          // Private today, but any member could publish the whole history.
+          "m.room.power_levels": {
+            ...botAdministeredPowerLevels(),
+            events: { "m.room.redaction": 100, "m.room.history_visibility": 0 },
+          },
+        },
+      });
+      const configService = yield* configureBridge();
+      yield* configService.recordRoomIfMatches({
+        cryptoStoreGeneration: Option.getOrThrow(yield* configService.currentConfig)
+          .cryptoStoreGeneration,
+        roomId: ROOM_ID,
+      });
+      yield* startAdapter(sdk);
+      yield* awaitStatusState(configService, "unavailable");
+
+      assert.include((yield* configService.status).reason ?? "", "change its access rules");
+    }).pipe(Effect.provide(testLayer)),
+  );
+
   it.effect("refuses a room whose members can send redactions", () =>
     Effect.gen(function* () {
       const sdk = makeFakeSdk({
         roomState: {
           "m.room.join_rules": { join_rule: "invite" },
           "m.room.encryption": { algorithm: MEGOLM_ALGORITHM },
+          "m.room.history_visibility": { history_visibility: "invited" },
           // Everything is locked down except redaction, which would let a
           // member erase the bridge's own output after the fact.
           "m.room.power_levels": {
@@ -1147,6 +1258,7 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
         roomState: {
           "m.room.join_rules": { join_rule: "invite" },
           "m.room.encryption": { algorithm: MEGOLM_ALGORITHM },
+          "m.room.history_visibility": { history_visibility: "invited" },
           // Only the bot can invite, but anyone may publish the room by
           // rewriting its join rules.
           "m.room.power_levels": {
@@ -1208,6 +1320,7 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
       const sdk = makeFakeSdk({
         roomState: {
           "m.room.join_rules": { join_rule: "invite" },
+          "m.room.history_visibility": { history_visibility: "invited" },
           "m.room.power_levels": botAdministeredPowerLevels(),
         },
       });
@@ -1481,6 +1594,58 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
         sdk.requests.filter((request) => request.method === "PUT"),
         0,
       );
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("answers a Connect that lands while a failure is being reported", () =>
+    Effect.gen(function* () {
+      // The room is refused at first, and the operator fixes it and presses
+      // Connect in the window between the failure and its status being
+      // published. That intent is newer than the failure, so it must win
+      // rather than be buried under an unavailable status.
+      const roomState: Record<string, unknown> = {
+        "m.room.join_rules": { join_rule: "public" },
+        "m.room.encryption": { algorithm: MEGOLM_ALGORITHM },
+        "m.room.history_visibility": { history_visibility: "invited" },
+        "m.room.power_levels": botAdministeredPowerLevels(),
+      };
+      const sdk = makeFakeSdk({ roomState });
+      const configService = yield* configureBridge();
+      yield* configService.recordRoomIfMatches({
+        cryptoStoreGeneration: Option.getOrThrow(yield* configService.currentConfig)
+          .cryptoStoreGeneration,
+        roomId: ROOM_ID,
+      });
+
+      let racedOnce = false;
+      const racingConfig = MatrixBridgeConfig.of({
+        ...configService,
+        reportTransportStateIfMatches: (expected) =>
+          Effect.gen(function* () {
+            if (!racedOnce && expected.transport.state === "unavailable") {
+              racedOnce = true;
+              roomState["m.room.join_rules"] = { join_rule: "invite" };
+              // Connect, published before the failure state is written.
+              yield* configService
+                .configure({
+                  homeserverUrl: HOMESERVER_URL,
+                  accessToken: "matrix-secret-token",
+                  allowedUserIds: [ALLOWED_USER_ID],
+                })
+                .pipe(Effect.orDie);
+            }
+            return yield* configService.reportTransportStateIfMatches(expected);
+          }),
+      });
+
+      const client = yield* make(sdk.load).pipe(
+        Effect.provideService(MatrixBridgeConfig, racingConfig),
+      );
+      yield* Effect.forkScoped(client.listen(() => Effect.void));
+
+      yield* awaitStatusState(configService, "waiting-for-member");
+      assert.isTrue(racedOnce);
+      assert.isTrue((yield* configService.status).encryptionReady);
     }).pipe(Effect.provide(testLayer)),
   );
 

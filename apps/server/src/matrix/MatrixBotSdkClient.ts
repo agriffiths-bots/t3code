@@ -118,6 +118,11 @@ export const buildEncryptedRoomCreateOptions = (
   },
   initial_state: [
     { type: "m.room.encryption", state_key: "", content: { algorithm: MEGOLM_ALGORITHM } },
+    {
+      type: "m.room.history_visibility",
+      state_key: "",
+      content: { history_visibility: MATRIX_BRIDGE_HISTORY_VISIBILITY },
+    },
   ],
 });
 
@@ -327,7 +332,18 @@ const PROTECTED_ROOM_STATE_TYPES = [
   "m.room.join_rules",
   "m.room.power_levels",
   "m.room.encryption",
+  "m.room.history_visibility",
 ] as const;
+/**
+ * History a member may read. `invited` is the conventional private value for an
+ * invite-only Matrix room: it starts a member's view at their invitation, which
+ * for this bridge is the moment the room is created, so the owner sees the
+ * whole conversation while nobody reads it earlier. `shared` would let a member
+ * invited later read everything that came before them, and `world_readable`
+ * serves history to accounts that never joined at all, so both are refused.
+ */
+export const MATRIX_BRIDGE_HISTORY_VISIBILITY = "invited";
+const ACCEPTED_HISTORY_VISIBILITIES = new Set([MATRIX_BRIDGE_HISTORY_VISIBILITY, "joined"]);
 /**
  * Message types members must not be able to send. A redaction is authorised by
  * the `redact` level *or* by the sender sharing the original sender's domain,
@@ -556,6 +572,18 @@ export const verifyEncryptedRoom = Effect.fn("MatrixBotSdkClient.verifyEncrypted
     return yield* clientError(
       "listen",
       "The configured Matrix room is not end-to-end encrypted. Encryption cannot be added to a room that already has plaintext history.",
+      "permanent",
+    );
+  }
+
+  const historyVisibility = readString(
+    findStateContent(state, "m.room.history_visibility"),
+    "history_visibility",
+  );
+  if (historyVisibility === null || !ACCEPTED_HISTORY_VISIBILITIES.has(historyVisibility)) {
+    return yield* clientError(
+      "listen",
+      "The configured Matrix room shares its history beyond the people in it, so bridge output could be read by an account that was never invited.",
       "permanent",
     );
   }
@@ -903,6 +931,15 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
    * file and crypto database would race the first one's last response.
    */
   let live: LiveTransport | null = null;
+  /** Monotonic count of connection requests an operator has published. */
+  let connectRequests = 0;
+  /**
+   * Woken by the counter itself. The count is maintained by a separate fiber,
+   * so a request can still be in that fiber's queue when a waiter parks;
+   * signalling the waiter from the increment is what makes the two orders
+   * equivalent.
+   */
+  let connectWaiter: Deferred.Deferred<void> | null = null;
   /**
    * One barrier per retired client's stores. Reconfiguring back to an earlier
    * device must still wait for that device's own retired client, so the
@@ -942,7 +979,17 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
    * Resubmitting identical settings keeps the generation, and an operator who
    * fixed a permission problem elsewhere expects that Connect to retry.
    */
-  const awaitReconnectSignal = (cryptoStoreGeneration: string) =>
+  const awaitReconnectSignal = (cryptoStoreGeneration: string, requestsAtStart: number) =>
+    Effect.suspend(() =>
+      // A request counted while the failure was being published is already the
+      // answer; waiting for the next one would park behind an intent that has
+      // been served.
+      connectRequests !== requestsAtStart
+        ? Effect.void
+        : awaitReconnectPublication(cryptoStoreGeneration),
+    );
+
+  const awaitReconnectPublication = (cryptoStoreGeneration: string) =>
     configService.statusChanges.pipe(
       Stream.mapEffect((status) => Effect.map(currentConfig, (config) => ({ status, config }))),
       Stream.filter(
@@ -1350,12 +1397,38 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
       // reuse it; shutting the listener down is what finally releases it.
       yield* Effect.addFinalizer(() => retireLiveTransport());
 
+      // Every `configure` publishes `connecting`, so counting those is a
+      // monotonic record of how many times an operator has asked for a
+      // connection. The subscription is acquired here, before any connection
+      // runs, so an intent expressed while a failure is being reported is
+      // counted rather than overwritten and lost.
+      const statusPull = yield* Stream.toPull(configService.statusChanges);
+      let replayedStatus = false;
+      yield* Effect.forkScoped(
+        Stream.runForEach(Stream.fromPull(Effect.succeed(statusPull)), (status) =>
+          Effect.sync(() => {
+            // The subscription replays the status this listener starts from,
+            // which describes a request that has already been taken up.
+            if (!replayedStatus) {
+              replayedStatus = true;
+              return;
+            }
+            if (status.state !== "connecting") return;
+            connectRequests += 1;
+            if (connectWaiter === null) return;
+            Deferred.doneUnsafe(connectWaiter, Effect.void);
+            connectWaiter = null;
+          }),
+        ).pipe(Effect.catchCause(() => Effect.void)),
+      );
+
       let attempt = 0;
       while (true) {
         // Disconnect means no Matrix activity at all, not a client left
         // syncing in the background.
         if (Option.isNone(yield* currentConfig)) yield* retireLiveTransport();
         const config = yield* awaitConfigured;
+        const requestsAtStart = connectRequests;
         const outcome = yield* Effect.result(
           Effect.scoped(
             Effect.raceFirst(
@@ -1366,6 +1439,14 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
         );
         if (outcome._tag === "Success") {
           // The configuration was replaced; connect the new one immediately.
+          attempt = 0;
+          continue;
+        }
+
+        if (connectRequests !== requestsAtStart) {
+          // Somebody pressed Connect while this attempt was failing. Their
+          // intent is newer than the failure, so it is answered instead of
+          // being buried under an unavailable status nobody asked for.
           attempt = 0;
           continue;
         }
@@ -1381,7 +1462,7 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
         if (outcome.failure.retryability === "permanent") {
           // A deterministic failure cannot be retried into success, so wait for
           // a human to reconfigure instead of looping on the same error.
-          yield* awaitReconnectSignal(config.cryptoStoreGeneration);
+          yield* awaitReconnectSignal(config.cryptoStoreGeneration, requestsAtStart);
           attempt = 0;
           continue;
         }
@@ -1389,7 +1470,7 @@ export const make = Effect.fn("MatrixBotSdkClient.make")(function* (
         // the failure, so it is not left waiting out the remaining delay.
         yield* Effect.raceFirst(
           Effect.sleep(reconnectDelayMs(attempt)),
-          awaitReconnectSignal(config.cryptoStoreGeneration),
+          awaitReconnectSignal(config.cryptoStoreGeneration, requestsAtStart),
         );
         attempt += 1;
       }
