@@ -1828,6 +1828,14 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
           observeRpcEffect(WS_METHODS.matrixBridgeConfigure, matrixBridge.configure(input), {
             "rpc.aggregate": "matrix",
           }),
+        [WS_METHODS.matrixBridgeGetConfig]: (_input) =>
+          observeRpcEffect(
+            WS_METHODS.matrixBridgeGetConfig,
+            matrixBridge.configView.pipe(
+              Effect.map((view) => ({ config: Option.getOrNull(view) })),
+            ),
+            { "rpc.aggregate": "matrix" },
+          ),
         [WS_METHODS.matrixBridgeDisconnect]: (_input) =>
           observeRpcEffect(WS_METHODS.matrixBridgeDisconnect, matrixBridge.disconnect, {
             "rpc.aggregate": "matrix",

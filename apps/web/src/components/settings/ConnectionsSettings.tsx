@@ -6,7 +6,16 @@ import {
   TerminalIcon,
 } from "lucide-react";
 import { useAtomValue } from "@effect/atom-react";
-import { type ReactNode, memo, useCallback, useEffect, useId, useMemo, useState } from "react";
+import {
+  type ReactNode,
+  memo,
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   AuthAccessReadScope,
   AuthAccessWriteScope,
@@ -44,6 +53,7 @@ import {
   activeMatrixBridgePairingCode,
   applyWslEnableSelection,
   EMPTY_MATRIX_BRIDGE_DRAFT,
+  matrixBridgeHydration,
   isQrShareableEndpoint,
   matrixBridgeDraftAfterConfigure,
   matrixBridgeConnectionMode,
@@ -140,6 +150,7 @@ import { useAtomCommand } from "../../state/use-atom-command";
 import {
   matrixBridgeEnvironment,
   matrixBridgeFailureMessage,
+  useMatrixBridgeSavedConfig,
   useMatrixBridgeStatusView,
 } from "~/state/matrixBridge";
 import { serverEnvironment } from "~/state/server";
@@ -1745,7 +1756,30 @@ function MatrixBridgeSection({
   const disconnectBridge = useAtomCommand(matrixBridgeEnvironment.disconnect, {
     reportFailure: false,
   });
+  const savedConfig = useMatrixBridgeSavedConfig(environmentId);
   const [draft, setDraft] = useState(EMPTY_MATRIX_BRIDGE_DRAFT);
+  // Repopulated from what the server has saved, so a reload shows the
+  // connection this environment is on rather than a blank form. Configure and
+  // disconnect refetch that answer, so a reconfigure repopulates too. This
+  // section is keyed by environment, so the marker below starts empty for each
+  // one without being reset here.
+  const hydratedKey = useRef<string | null>(null);
+  useEffect(() => {
+    // Computed from committed state and applied here, never inside the state
+    // updater: React replays updaters, which would consume the marker below
+    // while discarding the draft it goes with.
+    const hydration = matrixBridgeHydration({
+      saved: savedConfig,
+      draft,
+      hydratedKey: hydratedKey.current,
+    });
+    if (hydration === null) return;
+    // Seen either way: a connection skipped because the operator was typing
+    // must not come back and overwrite a form they have since cleared.
+    hydratedKey.current = hydration.key;
+    if (hydration.draft !== null) setDraft(hydration.draft);
+  }, [draft, savedConfig]);
+
   const [formError, setFormError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [pairingCode, setPairingCode] = useState<MatrixBridgePairingCode | null>(null);
@@ -1830,12 +1864,13 @@ function MatrixBridgeSection({
   const handleCreatePairingCode = useCallback(async () => {
     setIsCreatingPairingCode(true);
     try {
-      // The existing one-time pairing endpoint, with the smallest grant that
-      // still proves the sender holds this environment: the bridge consumes
-      // the code as proof and never opens a session with it.
+      // The existing one-time pairing endpoint, granting exactly what the
+      // bridge does for a paired account: read its thread and start turns in
+      // it. The bridge consumes the code as proof and never opens a session
+      // with it, but it will not accept a code that grants less than it uses.
       const credential = await createServerPairingCredential({
         label: "Matrix bridge",
-        scopes: [AuthOrchestrationReadScope],
+        scopes: [AuthOrchestrationReadScope, AuthOrchestrationOperateScope],
       });
       setPairingCode({
         credential: credential.credential,
@@ -1967,7 +2002,7 @@ function MatrixBridgeSection({
           </SettingsRow>
           <SettingsRow
             title="Matrix pairing code"
-            description="Send a code as a message in the Matrix room to unlock the bridge. It is one-time, carries only the view-environment scope, and is consumed as proof rather than as a sign-in."
+            description="Send a code as a message in the Matrix room to unlock the bridge. It is one-time and is consumed as proof rather than as a sign-in, and it grants what the bridge does for that room: viewing the environment and starting turns in the bridged thread. Treat it like any other credential until it is used."
             control={
               <Button
                 size="xs"

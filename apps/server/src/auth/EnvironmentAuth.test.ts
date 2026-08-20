@@ -1,6 +1,11 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { AuthAdministrativeScopes } from "@t3tools/contracts";
+import {
+  AuthAdministrativeScopes,
+  AuthOrchestrationOperateScope,
+  AuthOrchestrationReadScope,
+} from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -50,6 +55,12 @@ const makeCookieRequest = (
   }) as unknown as Parameters<
     EnvironmentAuth.EnvironmentAuth["Service"]["authenticateHttpRequest"]
   >[0];
+
+/** What the Matrix bridge asks a pairing code to prove. */
+const bridgeProof = {
+  audienceCeiling: "private",
+  scopes: [AuthOrchestrationReadScope, AuthOrchestrationOperateScope],
+} as const;
 
 const requestMetadata = {
   deviceType: "desktop" as const,
@@ -494,5 +505,134 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
           }),
         ),
       ),
+  );
+
+  it.effect("consumes a pairing credential as proof exactly once without a session", () =>
+    Effect.gen(function* () {
+      const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+
+      const pairingCredential = yield* serverAuth.issuePairingCredential({
+        audienceCeiling: "private",
+        label: "Matrix bridge",
+      });
+      yield* serverAuth.consumePairingCredentialForProof(pairingCredential.credential, bridgeProof);
+
+      const sessions = yield* serverAuth.listSessions();
+      const remainingPairingLinks = yield* serverAuth.listPairingLinks();
+      const reuse = yield* Effect.result(
+        serverAuth.consumePairingCredentialForProof(pairingCredential.credential, bridgeProof),
+      );
+
+      expect(sessions).toEqual([]);
+      expect(remainingPairingLinks.map((entry) => entry.id)).not.toContain(pairingCredential.id);
+      expect(reuse._tag).toBe("Failure");
+      if (reuse._tag === "Failure") {
+        expect(reuse.failure._tag).toBe("ServerAuthInvalidCredentialError");
+      }
+    }).pipe(Effect.provide(makeEnvironmentAuthLayer())),
+  );
+
+  it.effect("rejects unknown, expired, revoked, and consumed pairing proofs alike", () =>
+    Effect.gen(function* () {
+      const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+
+      const expired = yield* serverAuth.createPairingLink({
+        audienceCeiling: "private",
+        ttl: Duration.zero,
+      });
+      const revoked = yield* serverAuth.createPairingLink({ audienceCeiling: "private" });
+      yield* serverAuth.revokePairingLink(revoked.id);
+      const consumed = yield* serverAuth.createPairingLink({ audienceCeiling: "private" });
+      yield* serverAuth.consumePairingCredentialForProof(consumed.credential, bridgeProof);
+
+      const outcomes = yield* Effect.forEach(
+        ["definitely-invalid", expired.credential, revoked.credential, consumed.credential],
+        (credential) =>
+          Effect.result(serverAuth.consumePairingCredentialForProof(credential, bridgeProof)).pipe(
+            Effect.map((result) => (result._tag === "Failure" ? result.failure._tag : "Success")),
+          ),
+      );
+
+      // The bridge maps every one of these to the same rejection, so a sender
+      // cannot tell an unknown code from a revoked one.
+      expect(outcomes).toEqual([
+        "ServerAuthInvalidCredentialError",
+        "ServerAuthInvalidCredentialError",
+        "ServerAuthInvalidCredentialError",
+        "ServerAuthInvalidCredentialError",
+      ]);
+      expect(yield* serverAuth.listSessions()).toEqual([]);
+    }).pipe(Effect.provide(makeEnvironmentAuthLayer())),
+  );
+
+  it.effect("recognizes a live pairing credential and nothing else", () =>
+    Effect.gen(function* () {
+      const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+
+      const live = yield* serverAuth.createPairingLink({ audienceCeiling: "private" });
+      const revoked = yield* serverAuth.createPairingLink({ audienceCeiling: "private" });
+      yield* serverAuth.revokePairingLink(revoked.id);
+
+      expect(yield* serverAuth.isLivePairingCredential(live.credential)).toBe(true);
+      expect(yield* serverAuth.isLivePairingCredential(revoked.credential)).toBe(false);
+      expect(yield* serverAuth.isLivePairingCredential("just a sentence")).toBe(false);
+
+      // Redeeming it settles the question the other way.
+      yield* serverAuth.consumePairingCredentialForProof(live.credential, bridgeProof);
+      expect(yield* serverAuth.isLivePairingCredential(live.credential)).toBe(false);
+    }).pipe(Effect.provide(makeEnvironmentAuthLayer())),
+  );
+
+  it.effect("refuses a proof for scopes the credential was never granted", () =>
+    Effect.gen(function* () {
+      const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+
+      const readOnly = yield* serverAuth.createPairingLink({
+        audienceCeiling: "private",
+        scopes: [AuthOrchestrationReadScope],
+      });
+      const refused = yield* Effect.result(
+        serverAuth.consumePairingCredentialForProof(readOnly.credential, bridgeProof),
+      );
+
+      expect(refused._tag).toBe("Failure");
+      if (refused._tag === "Failure") {
+        expect(refused.failure._tag).toBe("ServerAuthScopeNotGrantedError");
+      }
+      // Refused before it is spent, so the narrower code keeps its own use.
+      expect((yield* serverAuth.listPairingLinks()).map((entry) => entry.id)).toContain(
+        readOnly.id,
+      );
+    }).pipe(Effect.provide(makeEnvironmentAuthLayer())),
+  );
+
+  it.effect("refuses a proof the credential does not authorize", () =>
+    Effect.gen(function* () {
+      const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+
+      const factoryCredential = yield* serverAuth.createPairingLink({
+        audienceCeiling: "factory",
+      });
+      const refused = yield* Effect.result(
+        serverAuth.consumePairingCredentialForProof(factoryCredential.credential, bridgeProof),
+      );
+
+      expect(refused._tag).toBe("Failure");
+      if (refused._tag === "Failure") {
+        expect(refused.failure._tag).toBe("ServerAuthAudienceNotGrantedError");
+      }
+      // Refused before it is spent, so the code stays usable for what it was
+      // actually minted for.
+      expect((yield* serverAuth.listPairingLinks()).map((entry) => entry.id)).toContain(
+        factoryCredential.id,
+      );
+      // The same credential still proves a factory-audience integration that
+      // asks only for what a factory ceiling can carry.
+      yield* serverAuth.consumePairingCredentialForProof(factoryCredential.credential, {
+        audienceCeiling: "factory",
+        scopes: [AuthOrchestrationReadScope],
+      });
+      expect(yield* serverAuth.listSessions()).toEqual([]);
+    }).pipe(Effect.provide(makeEnvironmentAuthLayer())),
   );
 });

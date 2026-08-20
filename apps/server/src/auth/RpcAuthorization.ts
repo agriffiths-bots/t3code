@@ -36,6 +36,11 @@ export const RPC_REQUIRED_SCOPES = {
   [WS_METHODS.serverProbe]: AuthOrchestrationReadScope,
   [WS_METHODS.serverGetConfig]: AuthOrchestrationReadScope,
   [WS_METHODS.matrixBridgeConfigure]: AuthAccessWriteScope,
+  // The saved connection names the homeserver, the room, and the Matrix
+  // accounts allowed to drive this environment. That is connection-management
+  // data like pairing links and authorized clients, not thread state, so it
+  // belongs to the access family rather than `orchestration:read`.
+  [WS_METHODS.matrixBridgeGetConfig]: AuthAccessReadScope,
   [WS_METHODS.matrixBridgeDisconnect]: AuthAccessWriteScope,
   [WS_METHODS.matrixBridgeSetOwner]: AuthOrchestrationOperateScope,
   [WS_METHODS.matrixBridgeSubscribeStatus]: AuthOrchestrationReadScope,

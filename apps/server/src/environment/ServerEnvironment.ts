@@ -192,6 +192,10 @@ export const make = Effect.gen(function* () {
       threadPinning: true,
       threadPinReorder: true,
       threadTitleRegeneration: true,
+      // The encrypted Matrix bridge is complete on this server: pairing gate,
+      // inbound dispatch, and membership guard included. Clients hide every
+      // bridge control when this is absent.
+      matrixBridge: true,
       ...(serverSelfUpdate === null ? {} : { serverSelfUpdate }),
       ...(serverSelfUpdate === "boot-service" ? { serverSelfUpdateProgress: true } : {}),
     },

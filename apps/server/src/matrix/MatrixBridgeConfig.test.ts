@@ -49,6 +49,7 @@ const persistedConfig = (overrides: Partial<MatrixBridgeConfigV1> = {}): MatrixB
   ownerThreadId: null,
   ownershipEpoch: NonNegativeInt.make(0),
   cryptoStoreGeneration: "generation-one",
+  configuredAt: "2026-08-19T00:00:00.000Z",
   lastDeliveredTurnId: null,
   deliveryBaselineSequence: NonNegativeInt.make(0),
   deliveryCheckpointInitialized: true,
@@ -414,6 +415,15 @@ it.layer(NodeServices.layer)("MatrixBridgeConfig", (it) => {
         new TextEncoder().encode(yield* encodeMatrixBridgeConfigJson(initial)),
       );
       const bridge = yield* makeService(memory.service);
+      yield* bridge.reportTransportStateIfMatches({
+        cryptoStoreGeneration: initial.cryptoStoreGeneration,
+        transport: { state: "ready" },
+      });
+      yield* bridge.reportRoomMembershipIfMatches({
+        cryptoStoreGeneration: initial.cryptoStoreGeneration,
+        allowedMemberPresent: true,
+        unexpectedMemberPresent: false,
+      });
 
       assert.isTrue(
         yield* bridge.reportPermanentSendFailureIfMatches({
@@ -426,7 +436,7 @@ it.layer(NodeServices.layer)("MatrixBridgeConfig", (it) => {
       assert.deepEqual(yield* bridge.status, {
         state: "degraded",
         ownerThreadId: ownerA,
-        encryptionReady: false,
+        encryptionReady: true,
         reason:
           "Matrix delivery is unavailable. Check the bridge credentials, room, and bot permissions.",
       });
@@ -439,6 +449,77 @@ it.layer(NodeServices.layer)("MatrixBridgeConfig", (it) => {
           roomId: "!room:matrix.example.test",
         }),
       );
+
+      // Repairing the room and reconnecting is a recovery signal; the failure
+      // must not outlive the connection that hit it.
+      yield* bridge.reportTransportStateIfMatches({
+        cryptoStoreGeneration: initial.cryptoStoreGeneration,
+        transport: { state: "ready" },
+      });
+      assert.equal((yield* bridge.status).state, "active");
+
+      yield* bridge.reportPermanentSendFailureIfMatches({
+        ownerThreadId: ownerA,
+        ownershipEpoch: initial.ownershipEpoch,
+        cryptoStoreGeneration: initial.cryptoStoreGeneration,
+        roomId: "!room:matrix.example.test",
+      });
+      assert.equal((yield* bridge.status).state, "degraded");
+
+      // So is a delivery that finally lands.
+      assert.isTrue(
+        yield* bridge.markDeliveredIfMatches({
+          ownerThreadId: ownerA,
+          ownershipEpoch: initial.ownershipEpoch,
+          cryptoStoreGeneration: initial.cryptoStoreGeneration,
+          roomId: "!room:matrix.example.test",
+          turnId: TurnId.make("turn-recovered"),
+          turnSequence: NonNegativeInt.make(9),
+        }),
+      );
+      assert.equal((yield* bridge.status).state, "active");
+
+      // Dropped inbound messages are a different fault: neither an unrelated
+      // delivery nor a reconnect recovers them, so the report stands.
+      yield* bridge.reportDegradedIfMatches({
+        cryptoStoreGeneration: initial.cryptoStoreGeneration,
+        cause: "inbound-overflow",
+      });
+      yield* bridge.markDeliveredIfMatches({
+        ownerThreadId: ownerA,
+        ownershipEpoch: initial.ownershipEpoch,
+        cryptoStoreGeneration: initial.cryptoStoreGeneration,
+        roomId: "!room:matrix.example.test",
+        turnId: TurnId.make("turn-after-overflow"),
+        turnSequence: NonNegativeInt.make(10),
+      });
+      yield* bridge.reportTransportStateIfMatches({
+        cryptoStoreGeneration: initial.cryptoStoreGeneration,
+        transport: { state: "ready" },
+      });
+      const overflowed = yield* bridge.status;
+      assert.equal(overflowed.state, "degraded");
+      assert.include(overflowed.reason ?? "", "faster than the bridge");
+
+      // Faults are independent: a later send failure and its recovery leave
+      // the unresolved one reported.
+      yield* bridge.reportPermanentSendFailureIfMatches({
+        ownerThreadId: ownerA,
+        ownershipEpoch: initial.ownershipEpoch,
+        cryptoStoreGeneration: initial.cryptoStoreGeneration,
+        roomId: "!room:matrix.example.test",
+      });
+      yield* bridge.markDeliveredIfMatches({
+        ownerThreadId: ownerA,
+        ownershipEpoch: initial.ownershipEpoch,
+        cryptoStoreGeneration: initial.cryptoStoreGeneration,
+        roomId: "!room:matrix.example.test",
+        turnId: TurnId.make("turn-after-both-faults"),
+        turnSequence: NonNegativeInt.make(11),
+      });
+      const stillOverflowed = yield* bridge.status;
+      assert.equal(stillOverflowed.state, "degraded");
+      assert.include(stillOverflowed.reason ?? "", "faster than the bridge");
     }),
   );
 
@@ -564,12 +645,292 @@ it.layer(NodeServices.layer)("MatrixBridgeConfig", (it) => {
       const bridge = yield* makeService(memory.service);
 
       const view = yield* bridge.configure(validInput);
+      const readBack = Option.getOrThrow(yield* bridge.configView);
       // @effect-diagnostics-next-line preferSchemaOverJson:off -- proves the RPC-safe shape cannot serialize the token.
-      const serialized = JSON.stringify({ view, status: yield* bridge.status });
+      const serialized = JSON.stringify({
+        view,
+        readBack,
+        status: yield* bridge.status,
+      });
 
       assert.notInclude(serialized, validInput.accessToken);
       assert.notProperty(view, "accessToken");
+      assert.notProperty(readBack, "accessToken");
       assert.deepEqual(view.allowedUserIds, ["@adam:beeper.com"]);
+      // The saved connection is readable after a reload, timestamp included.
+      assert.deepEqual(readBack, view);
+      assert.isString(readBack.configuredAt);
+      assert.isNull(readBack.roomId);
+    }),
+  );
+
+  it.effect("reports a saved connection only while one exists", () =>
+    Effect.gen(function* () {
+      const memory = makeMemorySecretStore(
+        new TextEncoder().encode(
+          yield* encodeMatrixBridgeConfigJson(
+            persistedConfig({ roomId: "!room:matrix.example.test", configuredAt: null }),
+          ),
+        ),
+      );
+      const bridge = yield* makeService(memory.service);
+
+      const stored = Option.getOrThrow(yield* bridge.configView);
+      assert.equal(stored.roomId, "!room:matrix.example.test");
+      // Connections saved before the server recorded a timestamp omit it
+      // rather than inventing one.
+      assert.notProperty(stored, "configuredAt");
+
+      yield* bridge.disconnect;
+      assert.isTrue(Option.isNone(yield* bridge.configView));
+    }),
+  );
+
+  it.effect("pairs only after the paired state is durably written", () =>
+    Effect.gen(function* () {
+      const memory = makeMemorySecretStore(
+        new TextEncoder().encode(
+          yield* encodeMatrixBridgeConfigJson(
+            persistedConfig({ roomId: "!room:matrix.example.test" }),
+          ),
+        ),
+      );
+      const bridge = yield* makeService(memory.service);
+      yield* bridge.reportTransportStateIfMatches({
+        cryptoStoreGeneration: "generation-one",
+        transport: { state: "ready" },
+      });
+      yield* bridge.reportRoomMembershipIfMatches({
+        cryptoStoreGeneration: "generation-one",
+        allowedMemberPresent: true,
+        unexpectedMemberPresent: false,
+      });
+
+      // A replaced connection, a different room, and an account outside the
+      // allowed list can never pair.
+      assert.isFalse(
+        yield* bridge.markPairedIfMatches({
+          cryptoStoreGeneration: "generation-two",
+          roomId: "!room:matrix.example.test",
+          userId: "@adam:beeper.com",
+          pairedAt: "2026-08-19T12:00:00.000Z",
+          eventId: "$pairing-reply",
+        }),
+      );
+      assert.isFalse(
+        yield* bridge.markPairedIfMatches({
+          cryptoStoreGeneration: "generation-one",
+          roomId: "!other:matrix.example.test",
+          userId: "@adam:beeper.com",
+          pairedAt: "2026-08-19T12:00:00.000Z",
+          eventId: "$pairing-reply",
+        }),
+      );
+      assert.isFalse(
+        yield* bridge.markPairedIfMatches({
+          cryptoStoreGeneration: "generation-one",
+          roomId: "!room:matrix.example.test",
+          userId: "@stranger:beeper.com",
+          pairedAt: "2026-08-19T12:00:00.000Z",
+          eventId: "$pairing-reply",
+        }),
+      );
+      assert.deepEqual(Option.getOrThrow(yield* bridge.currentConfig).pairing, {
+        state: "unpaired",
+      });
+
+      assert.isTrue(
+        yield* bridge.markPairedIfMatches({
+          cryptoStoreGeneration: "generation-one",
+          roomId: "!room:matrix.example.test",
+          userId: "@adam:beeper.com",
+          pairedAt: "2026-08-19T12:00:00.000Z",
+          eventId: "$pairing-reply",
+        }),
+      );
+      assert.deepEqual(
+        Option.getOrThrow(decodeMatrixBridgeConfigJson(new TextDecoder().decode(memory.read())))
+          .pairing,
+        {
+          state: "paired",
+          userId: "@adam:beeper.com",
+          pairedAt: "2026-08-19T12:00:00.000Z",
+          eventId: "$pairing-reply",
+        },
+      );
+      assert.equal((yield* bridge.status).state, "active");
+    }),
+  );
+
+  it.effect("stays locked and degraded when the paired state cannot be persisted", () =>
+    Effect.gen(function* () {
+      const memory = makeMemorySecretStore(
+        new TextEncoder().encode(
+          yield* encodeMatrixBridgeConfigJson(
+            persistedConfig({ roomId: "!room:matrix.example.test" }),
+          ),
+        ),
+      );
+      const bridge = yield* makeService(memory.service);
+      yield* bridge.reportTransportStateIfMatches({
+        cryptoStoreGeneration: "generation-one",
+        transport: { state: "ready" },
+      });
+      memory.failWrites();
+
+      const error = yield* Effect.flip(
+        bridge.markPairedIfMatches({
+          cryptoStoreGeneration: "generation-one",
+          roomId: "!room:matrix.example.test",
+          userId: "@adam:beeper.com",
+          pairedAt: "2026-08-19T12:00:00.000Z",
+          eventId: "$pairing-reply",
+        }),
+      );
+      assert.equal(error.reason, "persistenceFailed");
+      assert.deepEqual(Option.getOrThrow(yield* bridge.currentConfig).pairing, {
+        state: "unpaired",
+      });
+
+      assert.isTrue(
+        yield* bridge.reportDegradedIfMatches({
+          cryptoStoreGeneration: "generation-one",
+          cause: "pairing-persist-failure",
+        }),
+      );
+      const status = yield* bridge.status;
+      assert.equal(status.state, "degraded");
+      assert.include(status.reason ?? "", "stays locked");
+    }),
+  );
+
+  it.effect("pauses a paired connection while an unexpected member is joined", () =>
+    Effect.gen(function* () {
+      const memory = makeMemorySecretStore(
+        new TextEncoder().encode(
+          yield* encodeMatrixBridgeConfigJson(
+            persistedConfig({
+              roomId: "!room:matrix.example.test",
+              pairing: {
+                state: "paired",
+                userId: "@adam:beeper.com",
+                pairedAt: "2026-08-19T11:00:00.000Z",
+              },
+            }),
+          ),
+        ),
+      );
+      const bridge = yield* makeService(memory.service);
+
+      // Membership known before the transport connects is remembered, not
+      // published: an unconnected bridge is still `connecting`.
+      assert.isTrue(
+        yield* bridge.reportRoomMembershipIfMatches({
+          cryptoStoreGeneration: "generation-one",
+          allowedMemberPresent: true,
+          unexpectedMemberPresent: true,
+        }),
+      );
+      assert.equal((yield* bridge.status).state, "connecting");
+
+      yield* bridge.reportTransportStateIfMatches({
+        cryptoStoreGeneration: "generation-one",
+        transport: { state: "ready" },
+      });
+      const paused = yield* bridge.status;
+      assert.equal(paused.state, "degraded");
+      assert.include(paused.reason ?? "", "outside the allowed list");
+
+      assert.isTrue(
+        yield* bridge.reportRoomMembershipIfMatches({
+          cryptoStoreGeneration: "generation-one",
+          allowedMemberPresent: true,
+          unexpectedMemberPresent: false,
+        }),
+      );
+      assert.equal((yield* bridge.status).state, "active");
+
+      // A replaced connection cannot move the live status.
+      assert.isFalse(
+        yield* bridge.reportRoomMembershipIfMatches({
+          cryptoStoreGeneration: "generation-two",
+          allowedMemberPresent: true,
+          unexpectedMemberPresent: true,
+        }),
+      );
+      assert.equal((yield* bridge.status).state, "active");
+    }),
+  );
+
+  it.effect("keeps the membership reason ahead of another fault", () =>
+    Effect.gen(function* () {
+      const memory = makeMemorySecretStore(
+        new TextEncoder().encode(
+          yield* encodeMatrixBridgeConfigJson(
+            persistedConfig({
+              roomId: "!room:matrix.example.test",
+              pairing: {
+                state: "paired",
+                userId: "@adam:beeper.com",
+                pairedAt: "2026-08-19T11:00:00.000Z",
+              },
+            }),
+          ),
+        ),
+      );
+      const bridge = yield* makeService(memory.service);
+      yield* bridge.reportTransportStateIfMatches({
+        cryptoStoreGeneration: "generation-one",
+        transport: { state: "ready" },
+      });
+      yield* bridge.reportRoomMembershipIfMatches({
+        cryptoStoreGeneration: "generation-one",
+        allowedMemberPresent: true,
+        unexpectedMemberPresent: true,
+      });
+
+      yield* bridge.reportDegradedIfMatches({
+        cryptoStoreGeneration: "generation-one",
+        cause: "inbound-overflow",
+      });
+      // The account in the room is what is pausing delivery, so that is what
+      // the operator is told first.
+      assert.include((yield* bridge.status).reason ?? "", "outside the allowed list");
+
+      yield* bridge.reportRoomMembershipIfMatches({
+        cryptoStoreGeneration: "generation-one",
+        allowedMemberPresent: true,
+        unexpectedMemberPresent: false,
+      });
+      const remaining = yield* bridge.status;
+      assert.equal(remaining.state, "degraded");
+      assert.include(remaining.reason ?? "", "faster than the bridge");
+    }),
+  );
+
+  it.effect("waits for a member before it can wait for a pairing code", () =>
+    Effect.gen(function* () {
+      const memory = makeMemorySecretStore(
+        new TextEncoder().encode(
+          yield* encodeMatrixBridgeConfigJson(
+            persistedConfig({ roomId: "!room:matrix.example.test" }),
+          ),
+        ),
+      );
+      const bridge = yield* makeService(memory.service);
+
+      yield* bridge.reportTransportStateIfMatches({
+        cryptoStoreGeneration: "generation-one",
+        transport: { state: "ready" },
+      });
+      assert.equal((yield* bridge.status).state, "waiting-for-member");
+
+      yield* bridge.reportRoomMembershipIfMatches({
+        cryptoStoreGeneration: "generation-one",
+        allowedMemberPresent: true,
+        unexpectedMemberPresent: false,
+      });
+      assert.equal((yield* bridge.status).state, "awaiting-pairing");
     }),
   );
 

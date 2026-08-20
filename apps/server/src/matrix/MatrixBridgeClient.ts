@@ -15,19 +15,75 @@ export interface MatrixBridgeOutboundText {
     readonly msgtype: "m.text";
     readonly body: string;
   };
+  /**
+   * The bridge ownership epoch this message belongs to, checked again against
+   * the live configuration immediately before the send. Gate messages are not
+   * owner-scoped and carry null.
+   */
+  readonly ownershipEpoch: number | null;
 }
 
-/** Decrypted timeline shape that the production adapter will deliver in PR2b. */
+/** Decrypted timeline text from the bridged room. */
 export interface MatrixBridgeInboundText {
+  readonly kind: "text";
   readonly eventId: string;
   readonly roomId: string;
   readonly sender: string;
   readonly body: string;
   readonly isEdit: boolean;
+  /**
+   * Whether the room held only allowed accounts at the moment this event was
+   * handed over, read from the same membership the transport sends against.
+   * It travels with the event so a delayed membership report cannot let text
+   * be treated as safe.
+   */
+  readonly roomAllowedOnly: boolean;
+  /**
+   * The bridge ownership epoch when the transport took this event off its
+   * queue. A message belongs to the thread that was bridged then, so a move
+   * during the work that follows invalidates it rather than redirecting it.
+   */
+  readonly ownershipEpoch: number;
 }
 
+/**
+ * Active membership of the bridged room, joined and invited alike, published
+ * once per connection and again on every change. The bridge compares it
+ * against the allowed list to decide whether it may prompt for pairing or keep
+ * sending; an invitation counts because the room starts a member's view at
+ * their invitation.
+ */
+export interface MatrixBridgeRoomMembership {
+  readonly kind: "membership";
+  readonly roomId: string;
+  readonly botUserId: string;
+  /** Accounts in the room now. Only a joined account can read what is sent. */
+  readonly joined: ReadonlyArray<string>;
+  /**
+   * Accounts holding an outstanding invitation. They cannot read yet, but the
+   * room starts their view at the invitation, so they will once they join.
+   */
+  readonly invited: ReadonlyArray<string>;
+}
+
+/**
+ * Inbound text arrived faster than the bridge could dispatch it and was
+ * dropped. It is reported rather than swallowed, so the operator sees why a
+ * message never became a turn.
+ */
+export interface MatrixBridgeInboundOverflow {
+  readonly kind: "overflow";
+  readonly roomId: string;
+}
+
+export type MatrixBridgeInboundEvent =
+  | MatrixBridgeInboundText
+  | MatrixBridgeRoomMembership
+  | MatrixBridgeInboundOverflow;
+
+/** Inbound events are delivered one at a time so room order is preserved. */
 export type MatrixBridgeInboundHandler = (
-  event: MatrixBridgeInboundText,
+  event: MatrixBridgeInboundEvent,
 ) => Effect.Effect<void, never>;
 
 export class MatrixBridgeClientError extends Schema.TaggedErrorClass<MatrixBridgeClientError>()(
@@ -48,22 +104,31 @@ export class MatrixBridgeClient extends Context.Service<
     readonly sendText: (
       message: MatrixBridgeOutboundText,
     ) => Effect.Effect<void, MatrixBridgeClientError>;
+    /**
+     * Drops inbound text the transport is still holding. The bridge calls it
+     * when ownership moves: a message typed for the thread that was bridged
+     * then must not be started in the one bridged now.
+     */
+    readonly discardPendingInbound: Effect.Effect<void>;
   }
 >()("t3/matrix/MatrixBridgeClient") {}
 
 export interface FakeMatrixBridgeClient {
   readonly layer: Layer.Layer<MatrixBridgeClient>;
+  readonly discardedInbound: Effect.Effect<number>;
   readonly attempts: Effect.Effect<ReadonlyArray<MatrixBridgeOutboundText>>;
   readonly awaitAttemptCount: (
     count: number,
   ) => Effect.Effect<ReadonlyArray<MatrixBridgeOutboundText>>;
   readonly sent: Effect.Effect<ReadonlyArray<MatrixBridgeOutboundText>>;
   readonly isListening: Effect.Effect<boolean>;
+  /** Completes once a reactor is ready to receive inbound events. */
+  readonly awaitListening: Effect.Effect<void>;
   readonly failNextSends: (
     count: number,
     retryability?: MatrixBridgeClientError["retryability"],
   ) => Effect.Effect<void>;
-  readonly emitInbound: (event: MatrixBridgeInboundText) => Effect.Effect<boolean>;
+  readonly emitInbound: (event: MatrixBridgeInboundEvent) => Effect.Effect<boolean>;
   readonly awaitSentCount: (
     count: number,
   ) => Effect.Effect<ReadonlyArray<MatrixBridgeOutboundText>>;
@@ -77,13 +142,14 @@ export const makeFakeMatrixBridgeClient = Effect.gen(function* () {
     readonly remaining: number;
     readonly retryability: MatrixBridgeClientError["retryability"];
   }>({ remaining: 0, retryability: "transient" });
-  const inboundHandlerRef = yield* Ref.make<Option.Option<MatrixBridgeInboundHandler>>(
+  const inboundHandlerRef = yield* SubscriptionRef.make<Option.Option<MatrixBridgeInboundHandler>>(
     Option.none(),
   );
+  const discardedRef = yield* Ref.make(0);
 
   const listen: MatrixBridgeClient["Service"]["listen"] = (onInboundText) =>
-    Effect.acquireRelease(Ref.set(inboundHandlerRef, Option.some(onInboundText)), () =>
-      Ref.set(inboundHandlerRef, Option.none()),
+    Effect.acquireRelease(SubscriptionRef.set(inboundHandlerRef, Option.some(onInboundText)), () =>
+      SubscriptionRef.set(inboundHandlerRef, Option.none()),
     ).pipe(Effect.andThen(Effect.never));
 
   const sendText: MatrixBridgeClient["Service"]["sendText"] = Effect.fn(
@@ -122,15 +188,28 @@ export const makeFakeMatrixBridgeClient = Effect.gen(function* () {
     );
 
   return {
-    layer: Layer.succeed(MatrixBridgeClient, MatrixBridgeClient.of({ listen, sendText })),
+    layer: Layer.succeed(
+      MatrixBridgeClient,
+      MatrixBridgeClient.of({
+        listen,
+        sendText,
+        discardPendingInbound: Ref.update(discardedRef, (count) => count + 1),
+      }),
+    ),
+    discardedInbound: Ref.get(discardedRef),
     attempts: SubscriptionRef.get(attemptsRef),
     awaitAttemptCount: (count) => awaitCount(attemptsRef, count),
     sent: SubscriptionRef.get(sentRef),
-    isListening: Ref.get(inboundHandlerRef).pipe(Effect.map(Option.isSome)),
+    isListening: SubscriptionRef.get(inboundHandlerRef).pipe(Effect.map(Option.isSome)),
+    awaitListening: SubscriptionRef.changes(inboundHandlerRef).pipe(
+      Stream.filter(Option.isSome),
+      Stream.runHead,
+      Effect.asVoid,
+    ),
     failNextSends: (count, retryability = "transient") =>
       Ref.set(failureRef, { remaining: Math.max(0, count), retryability }),
     emitInbound: (event) =>
-      Ref.get(inboundHandlerRef).pipe(
+      SubscriptionRef.get(inboundHandlerRef).pipe(
         Effect.flatMap(
           Option.match({
             onNone: () => Effect.succeed(false),

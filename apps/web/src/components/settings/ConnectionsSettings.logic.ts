@@ -367,6 +367,47 @@ export function matrixBridgeDraftAfterConfigure(
   };
 }
 
+/**
+ * The form as a saved connection describes it. The token is never returned by
+ * the server and must be retyped to reconfigure, so it stays empty; a bridge
+ * that is not configured leaves the form blank.
+ */
+export function matrixBridgeDraftFromSavedConfig(
+  view: MatrixBridgeConfigView | null,
+): MatrixBridgeFormDraft {
+  if (view === null) return EMPTY_MATRIX_BRIDGE_DRAFT;
+  return {
+    homeserverUrl: view.homeserverUrl,
+    accessToken: "",
+    allowedUserIds: view.allowedUserIds.join("\n"),
+  };
+}
+
+/**
+ * What an arriving saved connection means for the form: the marker that says
+ * it has been seen, and the draft to take if there is one to take.
+ *
+ * Hydration is keyed by the saved connection itself, so a reconfigure produces
+ * a new key and repopulates, while the same answer arriving again does not
+ * fight the operator. Anything typed into the form wins outright: the draft is
+ * replaced only while it is still empty, and the answer counts as seen either
+ * way, so clearing the form later does not invite it back.
+ */
+export function matrixBridgeHydration(input: {
+  readonly saved: MatrixBridgeConfigView | null;
+  readonly draft: MatrixBridgeFormDraft;
+  readonly hydratedKey: string | null;
+}): { readonly key: string; readonly draft: MatrixBridgeFormDraft | null } | null {
+  if (input.saved === null) return null;
+  const key = `${input.saved.homeserverUrl}\u0000${input.saved.allowedUserIds.join("\u0000")}`;
+  if (key === input.hydratedKey) return null;
+  const untouched =
+    input.draft.homeserverUrl === "" &&
+    input.draft.accessToken === "" &&
+    input.draft.allowedUserIds === "";
+  return { key, draft: untouched ? matrixBridgeDraftFromSavedConfig(input.saved) : null };
+}
+
 export async function applyWslEnableSelection(input: {
   readonly bridge: WslEnableBridge;
   readonly mode: "both" | "wsl-only";

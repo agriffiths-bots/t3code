@@ -121,6 +121,7 @@ import {
 import {
   ServerConfigStreamEvent,
   ServerConfig,
+  MatrixBridgeConfigSnapshot,
   MatrixBridgeConfigView,
   MatrixBridgeConfigureInput,
   MatrixBridgeOperationError,
@@ -260,6 +261,7 @@ export const WS_METHODS = {
 
   // Matrix bridge methods
   matrixBridgeConfigure: "matrixBridge.configure",
+  matrixBridgeGetConfig: "matrixBridge.getConfig",
   matrixBridgeDisconnect: "matrixBridge.disconnect",
   matrixBridgeSetOwner: "matrixBridge.setOwner",
   matrixBridgeSubscribeStatus: "matrixBridge.subscribeStatus",
@@ -315,6 +317,12 @@ export const WsMatrixBridgeConfigureRpc = Rpc.make(WS_METHODS.matrixBridgeConfig
   payload: MatrixBridgeConfigureInput,
   success: MatrixBridgeConfigView,
   error: Schema.Union([MatrixBridgeOperationError, EnvironmentAuthorizationError]),
+});
+
+export const WsMatrixBridgeGetConfigRpc = Rpc.make(WS_METHODS.matrixBridgeGetConfig, {
+  payload: Schema.Struct({}),
+  success: MatrixBridgeConfigSnapshot,
+  error: EnvironmentAuthorizationError,
 });
 
 export const WsMatrixBridgeDisconnectRpc = Rpc.make(WS_METHODS.matrixBridgeDisconnect, {
@@ -914,6 +922,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerProbeRpc,
   WsServerGetConfigRpc,
   WsMatrixBridgeConfigureRpc,
+  WsMatrixBridgeGetConfigRpc,
   WsMatrixBridgeDisconnectRpc,
   WsMatrixBridgeSetOwnerRpc,
   WsMatrixBridgeSubscribeStatusRpc,

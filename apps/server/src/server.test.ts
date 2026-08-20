@@ -4334,11 +4334,26 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             const view = yield* client[WS_METHODS.matrixBridgeConfigure](
               matrixBridgeConfigureInput,
             );
-            assert.deepEqual(view, {
-              homeserverUrl: "https://matrix.example.test/",
-              allowedUserIds: ["@adam:beeper.com"],
-              roomId: null,
-            });
+            assert.deepEqual(
+              { ...view, configuredAt: undefined },
+              {
+                homeserverUrl: "https://matrix.example.test/",
+                allowedUserIds: ["@adam:beeper.com"],
+                roomId: null,
+                configuredAt: undefined,
+              },
+            );
+            assert.isString(view.configuredAt);
+
+            // The saved connection survives a reload, and the write-only token
+            // is not part of what a client can read back.
+            const snapshot = yield* client[WS_METHODS.matrixBridgeGetConfig]({});
+            assert.deepEqual(snapshot.config, view);
+            assert.notInclude(
+              // @effect-diagnostics-next-line preferSchemaOverJson:off -- proves the RPC payload cannot carry the token.
+              JSON.stringify(snapshot),
+              matrixBridgeConfigureInput.accessToken,
+            );
 
             const initialStatusSeen = yield* Deferred.make<void>();
             const statusesFiber = yield* client[WS_METHODS.matrixBridgeSubscribeStatus]({}).pipe(
@@ -4388,6 +4403,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
               encryptionReady: false,
               reason: null,
             });
+            assert.equal((yield* client[WS_METHODS.matrixBridgeGetConfig]({})).config, null);
           }),
         ),
       );
@@ -4450,6 +4466,16 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         assert.equal(disconnectError._tag, "EnvironmentAuthorizationError");
         if (disconnectError._tag === "EnvironmentAuthorizationError") {
           assert.equal(disconnectError.requiredScope, "access:write");
+        }
+
+        const configViewError = yield* Effect.flip(
+          Effect.scoped(
+            withWsRpcClient(readUrl, (client) => client[WS_METHODS.matrixBridgeGetConfig]({})),
+          ),
+        );
+        assert.equal(configViewError._tag, "EnvironmentAuthorizationError");
+        if (configViewError._tag === "EnvironmentAuthorizationError") {
+          assert.equal(configViewError.requiredScope, "access:read");
         }
       }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
