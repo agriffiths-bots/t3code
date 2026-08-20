@@ -1704,6 +1704,10 @@ it.layer(NodeServices.layer)("MatrixBotSdkClient", (it) => {
         sdk.requests.filter((request) => request.method === "PUT"),
         0,
       );
+      // The listener still has to prepare the replacement's store directory.
+      // Settle that filesystem work before this test's scoped temp root closes,
+      // while keeping the stale send itself in the replacement window above.
+      yield* awaitStatusState(configService, "waiting-for-member");
     }).pipe(Effect.provide(testLayer)),
   );
 
