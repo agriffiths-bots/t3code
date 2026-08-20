@@ -14,6 +14,7 @@ const NODE_PTY_KEEP_PREBUILD_FILE_NAMES = new Set([
 ]);
 const MATRIX_CRYPTO_PACKAGE_PATH = NodePath.join("@matrix-org", "matrix-sdk-crypto-nodejs");
 const MATRIX_CRYPTO_REMOVED_ENTRY_NAMES = [
+  ".node-version",
   "CHANGELOG.md",
   "README.md",
   "RELEASING.md",

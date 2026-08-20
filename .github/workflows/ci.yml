@@ -251,7 +251,7 @@ jobs:
           $unpackedRoot = Join-Path "${{ steps.install.outputs.install_dir }}" "resources/app.asar.unpacked"
           node scripts/desktop-unpacked-footprint.mjs `
             --root "$unpackedRoot" `
-            --max-files 250
+            --max-files 300
 
       - name: Assert launch smoke reports missing unpacked runtime file
         shell: pwsh

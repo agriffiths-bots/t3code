@@ -42,6 +42,8 @@ import {
   resolveStagedRuntimeDependencies,
   matrixCryptoBindingUrl,
   DESKTOP_STAGED_OPTIONAL_RUNTIME_DEPENDENCY_NAMES,
+  DESKTOP_STAGE_DISABLED_BUILD_SCRIPTS,
+  DESKTOP_STAGE_DROPPED_DEPENDENCIES,
   resolveMatrixCryptoBindingTargets,
   resolveStagedOptionalRuntimeDependencies,
   resolveFfiRsNativeDependencies,
@@ -302,6 +304,19 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
     );
   });
 
+  it("keeps the Matrix crypto package's install-time dependencies out of the stage", () => {
+    // Its postinstall downloads a binding, which the artifact stages itself, so
+    // the script and the two packages it needs are dropped: a Windows package
+    // unpacks its whole node_modules, where they would cost thirty files.
+    assert.deepStrictEqual(DESKTOP_STAGE_DISABLED_BUILD_SCRIPTS, {
+      "@matrix-org/matrix-sdk-crypto-nodejs": false,
+    });
+    assert.deepStrictEqual(DESKTOP_STAGE_DROPPED_DEPENDENCIES, {
+      "@matrix-org/matrix-sdk-crypto-nodejs>https-proxy-agent": "-",
+      "@matrix-org/matrix-sdk-crypto-nodejs>node-downloader-helper": "-",
+    });
+  });
+
   it("stages the Matrix crypto binding for the build target, not the build host", () => {
     assert.deepStrictEqual(resolveMatrixCryptoBindingTargets("linux", "arm64"), [
       { platform: "linux", arch: "arm64", fileName: "matrix-sdk-crypto.linux-arm64-gnu.node" },
@@ -436,7 +451,9 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
     assert.notInclude([...DESKTOP_NODE_PTY_ASAR_UNPACK_PATTERNS], "node-pty/**");
     assert.notInclude([...DESKTOP_ASAR_UNPACK], "node_modules/**");
     assert.notInclude([...DESKTOP_ASAR_UNPACK], "node_modules/node-pty/**");
-    assert.isAtMost(DESKTOP_UNPACKED_FILE_LIMIT, 250);
+    // A budget with headroom, not a security gate: it exists to catch an
+    // accidentally unpacked dependency tree, which is a four-figure mistake.
+    assert.isAtMost(DESKTOP_UNPACKED_FILE_LIMIT, 300);
   });
 
   it("marks artifact builds as compact desktop package builds", () => {

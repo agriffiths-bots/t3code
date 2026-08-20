@@ -711,7 +711,23 @@ const FFI_RS_VERSION = "1.3.2";
 export const DESKTOP_AFTER_PACK_HOOK_STAGE_PATH = "desktop-after-pack-prune.mjs";
 export const DESKTOP_ASAR_UNPACK_BASE = ["apps/server/dist/**"] as const;
 export const MOCK_UPDATE_SERVER_HOST = "127.0.0.1";
-export const DESKTOP_UNPACKED_FILE_LIMIT = 250;
+/**
+ * Budget for loose files beside the archive, not a security gate: it exists to
+ * catch a dependency tree being unpacked by accident, which is a four-figure
+ * mistake rather than a handful of files.
+ *
+ * Measured composition of a Windows package, which unpacks its whole
+ * `node_modules` for the WSL backend: playwright-core 107, @ff-labs/fff-node
+ * 26, node-pty 24, @anthropic-ai/claude-agent-sdk 16, @clerk/electron-passkeys
+ * 6, @matrix-org/matrix-sdk-crypto-nodejs 5, ffi-rs and fff-bin binaries 10,
+ * pnpm metadata 2, server bundle 53. That is about 251, of which the Matrix
+ * bridge accounts for six: a binding for the primary backend, a second for the
+ * Linux one WSL runs, the package's loader and manifest, its licence, and the
+ * packed SDK module beside the server bundle. Raised from 250, which the set
+ * above no longer fits, to 300 so the guard keeps its purpose with room for
+ * ordinary growth.
+ */
+export const DESKTOP_UNPACKED_FILE_LIMIT = 300;
 export const DESKTOP_NATIVE_ASAR_UNPACK_PACKAGE_PATTERNS = [
   "@anthropic-ai/claude-agent-sdk-*",
   "@clerk/electron-passkeys",
@@ -760,6 +776,21 @@ export const DESKTOP_STAGED_RUNTIME_DEPENDENCY_NAMES = [
  * dependency tree would otherwise put thousands of loose files into an
  * artifact that unpacks its whole `node_modules` for the WSL backend.
  */
+/**
+ * The Matrix crypto package fetches its binding from a postinstall script and
+ * depends on two packages solely for that download. The artifact stages the
+ * bindings itself, so the script is turned off here and those packages are
+ * dropped: a Windows package unpacks its whole `node_modules`, where they would
+ * cost thirty files and load nothing.
+ */
+export const DESKTOP_STAGE_DISABLED_BUILD_SCRIPTS: Record<string, boolean> = {
+  "@matrix-org/matrix-sdk-crypto-nodejs": false,
+};
+export const DESKTOP_STAGE_DROPPED_DEPENDENCIES: Record<string, string> = {
+  "@matrix-org/matrix-sdk-crypto-nodejs>https-proxy-agent": "-",
+  "@matrix-org/matrix-sdk-crypto-nodejs>node-downloader-helper": "-",
+};
+
 export const DESKTOP_STAGED_OPTIONAL_RUNTIME_DEPENDENCY_NAMES = [
   "@matrix-org/matrix-sdk-crypto-nodejs",
 ] as const;
@@ -2475,9 +2506,9 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
   const stageWorkspaceConfig = createStageWorkspaceConfig({
     platform: options.platform,
     arch: options.arch,
-    allowBuilds: workspaceAllowBuilds,
+    allowBuilds: { ...workspaceAllowBuilds, ...DESKTOP_STAGE_DISABLED_BUILD_SCRIPTS },
     patchedDependencies: stagePatchedDependencies,
-    overrides: resolvedOverrides,
+    overrides: { ...resolvedOverrides, ...DESKTOP_STAGE_DROPPED_DEPENDENCIES },
   });
   const stageWorkspaceConfigString = yield* encodeStageWorkspaceConfig(stageWorkspaceConfig);
   yield* fs.writeFileString(

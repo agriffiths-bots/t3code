@@ -140,6 +140,7 @@ describe("desktop-after-pack-prune", () => {
       touch(NodePath.join(cryptoDir, "index.d.ts")),
       touch(NodePath.join(cryptoDir, "download-lib.js")),
       touch(NodePath.join(cryptoDir, "README.md")),
+      touch(NodePath.join(cryptoDir, ".node-version")),
       touch(NodePath.join(cryptoDir, "node_modules/node-downloader-helper/package.json")),
       touch(NodePath.join(cryptoDir, "matrix-sdk-crypto.linux-x64-gnu.node")),
       touch(NodePath.join(cryptoDir, "matrix-sdk-crypto.darwin-arm64.node")),
@@ -166,6 +167,7 @@ describe("desktop-after-pack-prune", () => {
     await expect(exists(NodePath.join(cryptoDir, "download-lib.js"))).resolves.toBe(false);
     await expect(exists(NodePath.join(cryptoDir, "index.d.ts"))).resolves.toBe(false);
     await expect(exists(NodePath.join(cryptoDir, "README.md"))).resolves.toBe(false);
+    await expect(exists(NodePath.join(cryptoDir, ".node-version"))).resolves.toBe(false);
     await expect(exists(NodePath.join(cryptoDir, "node_modules"))).resolves.toBe(false);
 
     const manifestPath = NodePath.join(tempDir, "resources", PACKAGED_INTEGRITY_MANIFEST_FILE_NAME);
