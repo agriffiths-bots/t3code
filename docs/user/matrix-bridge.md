@@ -18,7 +18,7 @@ The bridge is one room and at most one owner thread per T3 environment. Mid-turn
 2. In **Matrix bridge**, enter the bot homeserver URL, the bot access token, and your Matrix user ID (for Beeper, that is your Beeper MXID).
 3. Connect. T3 creates a private invite-only encrypted room and invites you.
 4. Join the room from Beeper or another Matrix client.
-5. Create a Matrix pairing code from the same Connections subsection. The code is a one-time T3 credential with read-only orchestration access; the bridge consumes it as proof and does not create an authorized T3 client.
+5. Create a Matrix pairing code from the same Connections subsection. The code is a one-time T3 credential with `orchestration:read` and `orchestration:operate` access because the paired room can start and steer turns; the bridge consumes it as proof and does not create an authorized T3 client.
 6. Paste the raw code into the room. You should see a pairing-complete message. Invalid, expired, revoked, or already-used codes all get the same rejection, and the room stays locked.
 
 The bot token is write-only. T3 will not show it again after you save it.

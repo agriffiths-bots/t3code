@@ -48,4 +48,4 @@ On the deployment artifact:
 
 - `access:write` for configure, disconnect, and minting pairing codes. Do not grant this to the Matrix bot.
 - `orchestration:operate` to set, move, or unset the owner.
-- `orchestration:read` for status, and as the only scope on a Matrix pairing code.
+- `orchestration:read` for status; a Matrix pairing code has both `orchestration:read` and `orchestration:operate` because the paired room can start and steer turns.
